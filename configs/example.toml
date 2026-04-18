@@ -1,0 +1,15 @@
+# edge-agent bootstrap config. Values can also be set via EDGE_AGENT_* env vars.
+
+edge_id = "living-room"
+config_server_url = "ws://weave.lan:3001/ws/edge"
+
+[roon]
+# Roon Core is usually discovered via SOOD; set these to skip discovery.
+# host = "192.168.1.20"
+# port = 9330
+extension_id = "com.shin1ohno.edge-agent.living-room"
+display_name = "edge-agent (living-room)"
+
+[nuimo]
+# Optional: pin a specific Nuimo by BLE address. Otherwise the first one found is used.
+# ble_address = "C3:81:DF:4E:FF:6A"
