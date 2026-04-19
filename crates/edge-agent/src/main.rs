@@ -18,6 +18,7 @@ mod hue_token;
 #[cfg(feature = "hue")]
 mod pair_hue;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +28,8 @@ use adapter_hue::{HueAdapter, HueConfig};
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
 use edge_core::{
-    GlyphRegistry, InputPrimitive, RoutingEngine, ServiceAdapter, StateUpdate, WsClient,
+    GlyphRegistry, InputPrimitive, Intent, RoutedIntent, RoutingEngine, ServiceAdapter,
+    StateUpdate, WsClient,
 };
 use nuimo::{discover, DisplayOptions, DisplayTransition, NuimoDevice, NuimoEvent, RotationMode};
 use weave_contracts::EdgeToServer;
@@ -214,6 +216,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // State pump: adapter state → /ws/edge outbox + local glyph feedback.
+    //
+    // adapter-roon already suppresses unchanged values at the source, so
+    // here we only need to throttle BLE-bound writes. Feedback LED writes
+    // share the Nuimo's single BLE connection with rotate notifications —
+    // volume bar renders are limited to ~10 Hz so the gesture stays smooth.
     #[cfg(feature = "roon")]
     {
         let mut state_rx = roon_adapter.subscribe_state();
@@ -221,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         let dev = device.clone();
         let glyphs_for_feedback = glyphs.clone();
         tokio::spawn(async move {
+            let mut filter = FeedbackFilter::new();
             loop {
                 match state_rx.recv().await {
                     Ok(update) => {
@@ -232,7 +240,13 @@ async fn main() -> anyhow::Result<()> {
                             value: update.value.clone(),
                         };
                         let _ = outbox.send(frame).await;
-                        render_feedback(&dev, &update, &glyphs_for_feedback).await;
+
+                        if let Some(plan) = FeedbackPlan::from(&update) {
+                            let sig = plan.signature();
+                            if filter.should_render(&update, &sig) {
+                                plan.execute(&dev, &glyphs_for_feedback).await;
+                            }
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -250,35 +264,53 @@ async fn main() -> anyhow::Result<()> {
         spawn_state_pump(adapter.subscribe_state(), ws_outbox.clone());
     }
 
-    // Input pump: Nuimo BLE events → routing → adapter dispatch.
+    // Dispatch pipeline. Each (service_type, service_target) gets a dedicated
+    // worker task that serializes RPCs for that target: one RPC in flight at
+    // a time, with natural back-pressure driving the coalescing. While an
+    // RPC is awaited, incoming continuous deltas (volume_change etc.) queue
+    // and get merged on the next drain — so on a fast knob turn the service
+    // sees one large merged change instead of a race of many small ones.
+    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
+    tokio::spawn(run_dispatcher(
+        intent_rx,
+        #[cfg(feature = "roon")]
+        roon_adapter.clone(),
+        #[cfg(feature = "hue")]
+        hue_adapter.clone(),
+    ));
+
+    // Input pump: Nuimo BLE events → routing → coalescer.
+    //
+    // BLE connections to the Nuimo drop occasionally (peripheral side
+    // resets, host BlueZ hiccups). The `event_tx` broadcast inside the
+    // nuimo SDK is stable across reconnects, so we keep the same
+    // subscription and re-drive `device.connect()` with exponential
+    // backoff when a Disconnected event fires.
     let mut events = device.events();
     let device_type = "nuimo";
     loop {
         tokio::select! {
-            Ok(event) = events.recv() => {
-                let Some(primitive) = translate_nuimo_event(&event) else { continue; };
-                let routed = engine.route(device_type, &device_id, &primitive).await;
-                for r in routed {
-                    match r.service_type.as_str() {
-                        #[cfg(feature = "roon")]
-                        "roon" => {
-                            if let Err(e) = roon_adapter.send_intent(&r.service_target, &r.intent).await {
-                                tracing::warn!(error = %e, target = %r.service_target, "failed to send roon intent");
+            res = events.recv() => {
+                match res {
+                    Ok(NuimoEvent::Disconnected) => {
+                        tracing::warn!("nuimo BLE disconnected — reconnecting");
+                        reconnect_nuimo(&device).await;
+                    }
+                    Ok(event) => {
+                        let Some(primitive) = translate_nuimo_event(&event) else { continue; };
+                        let routed = engine.route(device_type, &device_id, &primitive).await;
+                        for r in routed {
+                            if let Err(e) = intent_tx.try_send(r) {
+                                tracing::warn!(error = %e, "intent channel full; dropping event");
                             }
                         }
-                        #[cfg(feature = "hue")]
-                        "hue" => {
-                            if let Some(adapter) = &hue_adapter {
-                                if let Err(e) = adapter.send_intent(&r.service_target, &r.intent).await {
-                                    tracing::warn!(error = %e, target = %r.service_target, "failed to send hue intent");
-                                }
-                            } else {
-                                tracing::debug!(target = %r.service_target, "hue intent dropped — adapter disabled");
-                            }
-                        }
-                        other => {
-                            tracing::warn!(service_type = %other, "no adapter registered for service_type");
-                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "nuimo event lag");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("nuimo event broadcast closed — cannot continue");
+                        return Ok(());
                     }
                 }
             }
@@ -287,6 +319,108 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Retry `device.connect()` with exponential backoff (1s → 30s cap) until
+/// it succeeds. Called when a `NuimoEvent::Disconnected` is observed.
+async fn reconnect_nuimo(device: &Arc<NuimoDevice>) {
+    let mut delay = Duration::from_secs(1);
+    let cap = Duration::from_secs(30);
+    let mut attempt: u32 = 0;
+    loop {
+        tokio::time::sleep(delay).await;
+        attempt += 1;
+        match device.connect().await {
+            Ok(()) => {
+                tracing::info!(attempt, "nuimo reconnected");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, delay_secs = delay.as_secs(), "reconnect failed");
+                delay = (delay * 2).min(cap);
+            }
+        }
+    }
+}
+
+/// Fan incoming `RoutedIntent`s out to per-target workers, spawning a new
+/// worker the first time we see a given `(service_type, target)` pair.
+async fn run_dispatcher(
+    mut rx: tokio::sync::mpsc::Receiver<RoutedIntent>,
+    #[cfg(feature = "roon")] roon: Arc<dyn ServiceAdapter>,
+    #[cfg(feature = "hue")] hue: Option<Arc<dyn ServiceAdapter>>,
+) {
+    let mut workers: HashMap<(String, String), tokio::sync::mpsc::Sender<Intent>> = HashMap::new();
+
+    while let Some(r) = rx.recv().await {
+        let key = (r.service_type.clone(), r.service_target.clone());
+
+        if !workers.contains_key(&key) {
+            let adapter: Option<Arc<dyn ServiceAdapter>> = match key.0.as_str() {
+                #[cfg(feature = "roon")]
+                "roon" => Some(roon.clone()),
+                #[cfg(feature = "hue")]
+                "hue" => hue.clone(),
+                _ => None,
+            };
+            let Some(adapter) = adapter else {
+                tracing::warn!(service_type = %key.0, "no adapter for service_type; dropping intent");
+                continue;
+            };
+            let (tx, worker_rx) = tokio::sync::mpsc::channel::<Intent>(64);
+            tokio::spawn(run_target_worker(key.clone(), worker_rx, adapter));
+            workers.insert(key.clone(), tx);
+        }
+
+        let tx = workers.get(&key).expect("worker inserted above");
+        if let Err(e) = tx.try_send(r.intent) {
+            tracing::warn!(error = %e, ?key, "target worker backlog; dropping intent");
+        }
+    }
+}
+
+/// One worker per `(service_type, target)`. Awaits RPCs serially so only a
+/// single request is in flight per target — a gesture's worth of continuous
+/// deltas that arrive during one in-flight RPC get merged into one RPC on
+/// the next drain. Discrete intents (play, pause, etc.) keep their arrival
+/// ordering relative to surrounding continuous intents.
+async fn run_target_worker(
+    key: (String, String),
+    mut rx: tokio::sync::mpsc::Receiver<Intent>,
+    adapter: Arc<dyn ServiceAdapter>,
+) {
+    let (service_type, target) = key;
+    while let Some(first) = rx.recv().await {
+        let mut pending: Vec<Intent> = Vec::new();
+        push_merged(&mut pending, first);
+        while let Ok(next) = rx.try_recv() {
+            push_merged(&mut pending, next);
+        }
+        for intent in pending {
+            if let Err(e) = adapter.send_intent(&target, &intent).await {
+                tracing::warn!(error = %e, %service_type, %target, ?intent, "intent failed");
+            }
+        }
+    }
+}
+
+/// Append `intent` to `pending`, merging with the tail when both are the
+/// same continuous-delta kind. Preserves ordering for discrete intents.
+fn push_merged(pending: &mut Vec<Intent>, intent: Intent) {
+    match (pending.last_mut(), &intent) {
+        (Some(Intent::VolumeChange { delta: a }), Intent::VolumeChange { delta: b }) => *a += *b,
+        (Some(Intent::BrightnessChange { delta: a }), Intent::BrightnessChange { delta: b }) => {
+            *a += *b
+        }
+        (
+            Some(Intent::ColorTemperatureChange { delta: a }),
+            Intent::ColorTemperatureChange { delta: b },
+        ) => *a += *b,
+        (Some(Intent::SeekRelative { seconds: a }), Intent::SeekRelative { seconds: b }) => {
+            *a += *b
+        }
+        _ => pending.push(intent),
     }
 }
 
@@ -344,52 +478,136 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
     })
 }
 
+/// Two-stage feedback: decide what to draw (`plan`), then check whether that
+/// specific frame differs from what's currently on the LED (`should_render`),
+/// and only if it does, actually push it over BLE.
+///
+/// Roon republishes volume during a gesture at a higher cadence than the bar
+/// count changes, and emits intermediate values during hardware ramping —
+/// dedup'ing on the *rendered* signature (e.g. `vol:5`) means the LED only
+/// gets a write when the visible frame actually differs. That eliminates the
+/// near-identical rewrites that were reading as "blinking".
 #[cfg(feature = "roon")]
-async fn render_feedback(device: &NuimoDevice, update: &StateUpdate, registry: &GlyphRegistry) {
-    // Resolve state → glyph name. Keep a minimal playback-state mapping here;
-    // richer FeedbackRule-driven dispatch is a future enhancement.
-    let (glyph_name, transition) = match (update.property.as_str(), &update.value) {
-        ("playback", serde_json::Value::String(s)) => match s.as_str() {
-            "playing" => ("play", DisplayTransition::CrossFade),
-            "paused" | "stopped" => ("pause", DisplayTransition::CrossFade),
-            _ => return,
-        },
-        ("volume", serde_json::Value::Object(_)) => ("volume_bar", DisplayTransition::Immediate),
-        _ => return,
-    };
+enum FeedbackPlan {
+    /// Volume bar, 0..=9 LEDs from the bottom.
+    VolumeBar(u8),
+    /// Named glyph from the registry (play / pause / ...).
+    NamedGlyph(&'static str),
+}
 
-    let glyph = if glyph_name == "volume_bar" {
-        let Some(obj) = update.value.as_object() else {
-            return;
-        };
-        let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let max = obj
-            .get("max")
-            .and_then(|v| v.as_f64())
-            .filter(|v| *v > 0.0)
-            .unwrap_or(100.0);
-        let pct = ((value / max) * 100.0).round().clamp(0.0, 100.0) as u8;
-        glyphs::volume(pct)
-    } else {
-        match registry.get(glyph_name).await {
-            Some(entry) if !entry.builtin => nuimo::Glyph::from_str(&entry.pattern),
-            _ => {
-                tracing::debug!(glyph_name, "glyph missing from registry; skipping feedback");
-                return;
-            }
-        }
-    };
-
-    let _ = device
-        .display_glyph(
-            &glyph,
-            &DisplayOptions {
-                brightness: 1.0,
-                timeout_ms: 1000,
-                transition,
+#[cfg(feature = "roon")]
+impl FeedbackPlan {
+    /// Project a StateUpdate into the visible frame it should produce, or
+    /// `None` if nothing on the device should change.
+    fn from(update: &StateUpdate) -> Option<Self> {
+        match (update.property.as_str(), &update.value) {
+            ("playback", serde_json::Value::String(s)) => match s.as_str() {
+                "playing" => Some(Self::NamedGlyph("play")),
+                "paused" | "stopped" => Some(Self::NamedGlyph("pause")),
+                _ => None,
             },
-        )
-        .await;
+            ("volume", serde_json::Value::Object(obj)) => {
+                let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let max = obj
+                    .get("max")
+                    .and_then(|v| v.as_f64())
+                    .filter(|v| *v > 0.0)
+                    .unwrap_or(100.0);
+                let pct = ((value / max) * 100.0).clamp(0.0, 100.0);
+                let bars = ((pct / 100.0) * 9.0).round() as u8;
+                Some(Self::VolumeBar(bars))
+            }
+            _ => None,
+        }
+    }
+
+    /// Stable identifier for "what's on the LED right now". Filter dedups
+    /// on this.
+    fn signature(&self) -> String {
+        match self {
+            Self::VolumeBar(bars) => format!("vol:{bars}"),
+            Self::NamedGlyph(name) => (*name).to_string(),
+        }
+    }
+
+    async fn execute(&self, device: &NuimoDevice, registry: &GlyphRegistry) {
+        let (glyph, transition, timeout_ms) = match self {
+            Self::VolumeBar(bars) => (
+                glyphs::volume_bars(*bars),
+                DisplayTransition::Immediate,
+                3000,
+            ),
+            Self::NamedGlyph(name) => {
+                let Some(entry) = registry.get(name).await else {
+                    tracing::debug!(name, "glyph missing from registry; skipping feedback");
+                    return;
+                };
+                if entry.builtin {
+                    tracing::debug!(name, "glyph is builtin; expected parametric render");
+                    return;
+                }
+                (
+                    nuimo::Glyph::from_str(&entry.pattern),
+                    DisplayTransition::CrossFade,
+                    1000,
+                )
+            }
+        };
+
+        let _ = device
+            .display_glyph(
+                &glyph,
+                &DisplayOptions {
+                    brightness: 1.0,
+                    timeout_ms,
+                    transition,
+                },
+            )
+            .await;
+    }
+}
+
+/// Gates BLE-bound feedback writes: time throttle for volume (so we don't
+/// saturate the single BLE connection), plus dedup on the rendered frame
+/// signature (so we skip writes that wouldn't change what's visible).
+#[cfg(feature = "roon")]
+struct FeedbackFilter {
+    last_at: HashMap<(String, String), std::time::Instant>,
+    last_sig: HashMap<String, String>,
+}
+
+#[cfg(feature = "roon")]
+impl FeedbackFilter {
+    const MIN_GAP: Duration = Duration::from_millis(100);
+
+    fn new() -> Self {
+        Self {
+            last_at: HashMap::new(),
+            last_sig: HashMap::new(),
+        }
+    }
+
+    fn should_render(&mut self, update: &StateUpdate, signature: &str) -> bool {
+        // Dedup: same visible frame as last write → skip.
+        if self.last_sig.get(&update.target).map(String::as_str) == Some(signature) {
+            return false;
+        }
+
+        // Throttle continuous volume writes to protect BLE bandwidth.
+        if matches!(update.property.as_str(), "volume") {
+            let key = (update.property.clone(), update.target.clone());
+            let now = std::time::Instant::now();
+            if let Some(last) = self.last_at.get(&key) {
+                if now.duration_since(*last) < Self::MIN_GAP {
+                    return false;
+                }
+            }
+            self.last_at.insert(key, now);
+        }
+
+        self.last_sig.insert(update.target.clone(), signature.to_string());
+        true
+    }
 }
 
 fn default_roon_token_path(edge_id: &str) -> PathBuf {
