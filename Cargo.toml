@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Shin'ichi Ohno <sh1@mercari.com>"]
 repository = "https://github.com/shin1ohno/edge-agent"
+homepage = "https://github.com/shin1ohno/edge-agent"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
