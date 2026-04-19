@@ -25,6 +25,8 @@ pub enum ServerToEdge {
         mapping_id: Uuid,
         service_target: String,
     },
+    /// Replace the edge's glyph set. Sent after any glyph CRUD on the server.
+    GlyphsUpdate { glyphs: Vec<Glyph> },
     /// Periodic keepalive to keep NAT/proxies open and detect half-open TCP.
     Ping,
 }
@@ -89,6 +91,89 @@ pub struct Glyph {
     pub pattern: String,
     #[serde(default)]
     pub builtin: bool,
+}
+
+/// Frames sent from `weave-server` to a Web UI client on `/ws/ui`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UiFrame {
+    /// Initial full snapshot, pushed once on connect.
+    Snapshot { snapshot: UiSnapshot },
+    /// An edge completed its `Hello` handshake or has otherwise come online.
+    EdgeOnline { edge: EdgeInfo },
+    /// An edge has disconnected (ws closed).
+    EdgeOffline { edge_id: String },
+    /// One service-state update from a connected edge.
+    ServiceState {
+        edge_id: String,
+        service_type: String,
+        target: String,
+        property: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+        value: serde_json::Value,
+    },
+    /// One device-state update from a connected edge (battery, RSSI, etc.).
+    DeviceState {
+        edge_id: String,
+        device_type: String,
+        device_id: String,
+        property: String,
+        value: serde_json::Value,
+    },
+    /// Mapping CRUD happened on the server. UIs replace their copy.
+    MappingChanged {
+        mapping_id: Uuid,
+        op: PatchOp,
+        mapping: Option<Mapping>,
+    },
+    /// The glyph set changed. UIs refresh their registry.
+    GlyphsChanged { glyphs: Vec<Glyph> },
+}
+
+/// Initial full state sent on `/ws/ui` connect. Subsequent changes arrive
+/// as `UiFrame` variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiSnapshot {
+    pub edges: Vec<EdgeInfo>,
+    pub service_states: Vec<ServiceStateEntry>,
+    pub device_states: Vec<DeviceStateEntry>,
+    pub mappings: Vec<Mapping>,
+    pub glyphs: Vec<Glyph>,
+}
+
+/// Identity + status for one connected (or previously-seen) edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeInfo {
+    pub edge_id: String,
+    pub online: bool,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    /// RFC3339 timestamp.
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceStateEntry {
+    pub edge_id: String,
+    pub service_type: String,
+    pub target: String,
+    pub property: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_id: Option<String>,
+    pub value: serde_json::Value,
+    /// RFC3339 timestamp of last update.
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceStateEntry {
+    pub edge_id: String,
+    pub device_type: String,
+    pub device_id: String,
+    pub property: String,
+    pub value: serde_json::Value,
+    pub updated_at: String,
 }
 
 /// A device-to-service mapping. Mirrors the structure already used by

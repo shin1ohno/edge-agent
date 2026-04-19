@@ -163,6 +163,10 @@ impl WsClient {
             } => {
                 tracing::info!(%mapping_id, %service_target, "target_switch (phase 3 will apply inline)");
             }
+            ServerToEdge::GlyphsUpdate { glyphs } => {
+                tracing::info!(count = glyphs.len(), "received glyphs_update");
+                self.glyphs.replace_all(glyphs).await;
+            }
             ServerToEdge::Ping => {
                 // Pong is handled via the outbox channel to avoid tx contention here;
                 // fire-and-forget.
