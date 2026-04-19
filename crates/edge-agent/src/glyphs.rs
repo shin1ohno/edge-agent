@@ -6,10 +6,13 @@
 
 use nuimo::Glyph;
 
-/// Volume bar glyph (0-100%). Matches weave's `volume_bar` registration
-/// (builtin = true, empty pattern).
-pub fn volume(percentage: u8) -> Glyph {
-    let bars = ((percentage as f64 / 100.0) * 9.0).round() as usize;
+/// Volume bar glyph, 0..=9 LEDs lit from the bottom row upward.
+///
+/// The bar count is the rendered unit of change: above this layer, feedback
+/// is dedup'd on `bars` so two Roon updates that round to the same bar count
+/// don't trigger a redraw.
+pub fn volume_bars(bars: u8) -> Glyph {
+    let bars = bars.min(9) as usize;
     let mut rows = String::new();
     for row in 0..9 {
         let from_bottom = 8 - row;
