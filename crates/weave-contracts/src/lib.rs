@@ -71,6 +71,24 @@ pub enum PatchOp {
 pub struct EdgeConfig {
     pub edge_id: String,
     pub mappings: Vec<Mapping>,
+    /// Named glyph patterns the edge should use when rendering feedback.
+    /// Consumers look up by `name`. Entries with `builtin == true` have an
+    /// empty `pattern` and are expected to be rendered programmatically by
+    /// the consumer (e.g. `volume_bar` scales with percentage).
+    #[serde(default)]
+    pub glyphs: Vec<Glyph>,
+}
+
+/// A named Nuimo LED glyph. `pattern` is a 9x9 ASCII grid compatible with
+/// `nuimo::Glyph::from_str` (`*` = LED on, anything else = off, rows
+/// separated by `\n`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Glyph {
+    pub name: String,
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 /// A device-to-service mapping. Mirrors the structure already used by
@@ -138,6 +156,11 @@ mod tests {
                     }],
                     feedback: vec![],
                     active: true,
+                }],
+                glyphs: vec![Glyph {
+                    name: "play".into(),
+                    pattern: "    *    \n     **  ".into(),
+                    builtin: false,
                 }],
             },
         };

@@ -20,7 +20,9 @@ use std::time::Duration;
 
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
-use edge_core::{InputPrimitive, RoutingEngine, ServiceAdapter, StateUpdate, WsClient};
+use edge_core::{
+    GlyphRegistry, InputPrimitive, RoutingEngine, ServiceAdapter, StateUpdate, WsClient,
+};
 use nuimo::{discover, DisplayOptions, DisplayTransition, NuimoDevice, NuimoEvent, RotationMode};
 use weave_contracts::EdgeToServer;
 
@@ -48,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let engine = Arc::new(RoutingEngine::new());
+    let glyphs = Arc::new(GlyphRegistry::new());
 
     let capabilities = {
         let mut caps = Vec::new();
@@ -62,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         VERSION.to_string(),
         capabilities,
         engine.clone(),
+        glyphs.clone(),
     );
     let ws_outbox = ws_client.outbox();
 
@@ -132,16 +136,20 @@ async fn main() -> anyhow::Result<()> {
     let device_id = device.id();
     tracing::info!(%device_id, "nuimo connected");
 
-    let _ = device
-        .display_glyph(
-            &glyphs::link(),
-            &DisplayOptions {
-                brightness: 1.0,
-                timeout_ms: 3000,
-                transition: DisplayTransition::CrossFade,
-            },
-        )
-        .await;
+    // Best-effort link glyph on connect — skipped if the registry isn't
+    // populated yet (first run with no cache and server unreachable).
+    if let Some(link) = glyphs.get("link").await {
+        let _ = device
+            .display_glyph(
+                &nuimo::Glyph::from_str(&link.pattern),
+                &DisplayOptions {
+                    brightness: 1.0,
+                    timeout_ms: 3000,
+                    transition: DisplayTransition::CrossFade,
+                },
+            )
+            .await;
+    }
 
     // State pump: adapter state → /ws/edge outbox + local glyph feedback.
     #[cfg(feature = "roon")]
@@ -149,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         let mut state_rx = roon_adapter.subscribe_state();
         let outbox = ws_outbox.clone();
         let dev = device.clone();
+        let glyphs_for_feedback = glyphs.clone();
         tokio::spawn(async move {
             loop {
                 match state_rx.recv().await {
@@ -161,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
                             value: update.value.clone(),
                         };
                         let _ = outbox.send(frame).await;
-                        render_feedback(&dev, &update).await;
+                        render_feedback(&dev, &update, &glyphs_for_feedback).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -231,31 +240,41 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
 }
 
 #[cfg(feature = "roon")]
-async fn render_feedback(device: &NuimoDevice, update: &StateUpdate) {
-    let glyph = match (update.property.as_str(), &update.value) {
+async fn render_feedback(device: &NuimoDevice, update: &StateUpdate, registry: &GlyphRegistry) {
+    // Resolve state → glyph name. Keep a minimal playback-state mapping here;
+    // richer FeedbackRule-driven dispatch is a future enhancement.
+    let (glyph_name, transition) = match (update.property.as_str(), &update.value) {
         ("playback", serde_json::Value::String(s)) => match s.as_str() {
-            "playing" => glyphs::play(),
-            "paused" | "stopped" => glyphs::pause(),
+            "playing" => ("play", DisplayTransition::CrossFade),
+            "paused" | "stopped" => ("pause", DisplayTransition::CrossFade),
             _ => return,
         },
-        ("volume", serde_json::Value::Object(obj)) => {
-            let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let max = obj
-                .get("max")
-                .and_then(|v| v.as_f64())
-                .filter(|v| *v > 0.0)
-                .unwrap_or(100.0);
-            let pct = ((value / max) * 100.0).round().clamp(0.0, 100.0) as u8;
-            glyphs::volume(pct)
-        }
+        ("volume", serde_json::Value::Object(_)) => ("volume_bar", DisplayTransition::Immediate),
         _ => return,
     };
 
-    let transition = if update.property == "volume" {
-        DisplayTransition::Immediate
+    let glyph = if glyph_name == "volume_bar" {
+        let Some(obj) = update.value.as_object() else {
+            return;
+        };
+        let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let max = obj
+            .get("max")
+            .and_then(|v| v.as_f64())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(100.0);
+        let pct = ((value / max) * 100.0).round().clamp(0.0, 100.0) as u8;
+        glyphs::volume(pct)
     } else {
-        DisplayTransition::CrossFade
+        match registry.get(glyph_name).await {
+            Some(entry) if !entry.builtin => nuimo::Glyph::from_str(&entry.pattern),
+            _ => {
+                tracing::debug!(glyph_name, "glyph missing from registry; skipping feedback");
+                return;
+            }
+        }
     };
+
     let _ = device
         .display_glyph(
             &glyph,

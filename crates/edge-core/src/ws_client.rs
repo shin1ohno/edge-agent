@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeConfig, EdgeToServer, ServerToEdge};
 
 use crate::cache;
+use crate::registry::GlyphRegistry;
 use crate::routing::RoutingEngine;
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(2);
@@ -29,6 +30,7 @@ pub struct WsClient {
     version: String,
     capabilities: Vec<String>,
     engine: Arc<RoutingEngine>,
+    glyphs: Arc<GlyphRegistry>,
     cache_path: PathBuf,
     outbox_rx: mpsc::Receiver<EdgeToServer>,
     outbox_tx: mpsc::Sender<EdgeToServer>,
@@ -41,6 +43,7 @@ impl WsClient {
         version: String,
         capabilities: Vec<String>,
         engine: Arc<RoutingEngine>,
+        glyphs: Arc<GlyphRegistry>,
     ) -> Self {
         let cache_path = cache::default_cache_path(&edge_id);
         let (outbox_tx, outbox_rx) = mpsc::channel(256);
@@ -50,6 +53,7 @@ impl WsClient {
             version,
             capabilities,
             engine,
+            glyphs,
             cache_path,
             outbox_rx,
             outbox_tx,
@@ -62,16 +66,18 @@ impl WsClient {
         self.outbox_tx.clone()
     }
 
-    /// Populate the routing engine from the local cache, if one exists.
-    /// Call this once at startup before entering `run()`.
+    /// Populate the routing engine + glyph registry from the local cache, if
+    /// one exists. Call this once at startup before entering `run()`.
     pub async fn prime_from_cache(&self) -> anyhow::Result<()> {
         if let Some(cfg) = cache::load(&self.cache_path).await? {
             tracing::info!(
                 mappings = cfg.mappings.len(),
+                glyphs = cfg.glyphs.len(),
                 path = %self.cache_path.display(),
                 "primed routing engine from cache",
             );
             self.engine.replace_all(cfg.mappings).await;
+            self.glyphs.replace_all(cfg.glyphs).await;
         }
         Ok(())
     }
@@ -135,6 +141,7 @@ impl WsClient {
             ServerToEdge::ConfigFull { config } => {
                 tracing::info!(
                     mappings = config.mappings.len(),
+                    glyphs = config.glyphs.len(),
                     edge_id = %config.edge_id,
                     "received config_full",
                 );
@@ -167,5 +174,6 @@ impl WsClient {
 
     async fn apply_full(&self, config: &EdgeConfig) {
         self.engine.replace_all(config.mappings.clone()).await;
+        self.glyphs.replace_all(config.glyphs.clone()).await;
     }
 }
