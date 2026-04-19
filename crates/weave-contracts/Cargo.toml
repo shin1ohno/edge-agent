@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["weave", "edge", "websocket", "protocol"]
+categories = ["api-bindings"]
 
 [dependencies]
 serde = { workspace = true }
