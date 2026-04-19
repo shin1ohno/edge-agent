@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 edge-core = { path = "../edge-core" }
 weave-contracts = { path = "../weave-contracts" }
-nuimo = { path = "../../../nuimo-rs/crates/nuimo" }
+nuimo = "0.1.0"
 adapter-roon = { path = "../adapter-roon", optional = true }
 adapter-hue = { path = "../adapter-hue", optional = true }
 tokio = { workspace = true }

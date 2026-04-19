@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 edge-core = { path = "../edge-core" }
 weave-contracts = { path = "../weave-contracts" }
-roon-api = { path = "../../../roon-rs/crates/roon-api" }
+roon-api = "0.5.1"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
