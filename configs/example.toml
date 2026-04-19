@@ -13,3 +13,9 @@ display_name = "edge-agent (living-room)"
 [nuimo]
 # Optional: pin a specific Nuimo by BLE address. Otherwise the first one found is used.
 # ble_address = "C3:81:DF:4E:FF:6A"
+
+[hue]
+# Point this at a JSON file written by `edge-agent pair-hue`
+# ({"host": "...", "app_key": "..."}). When missing or unreadable the Hue
+# adapter stays disabled even if the `hue` Cargo feature is built in.
+# token_path = "~/.local/state/edge-agent/hue-token.json"

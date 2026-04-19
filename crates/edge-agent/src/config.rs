@@ -13,6 +13,8 @@ pub struct Config {
     pub roon: RoonSection,
     #[serde(default)]
     pub nuimo: NuimoSection,
+    #[serde(default)]
+    pub hue: HueSection,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -34,6 +36,15 @@ pub struct NuimoSection {
     /// or to run as a dashboard-only witness for the weave hub.
     #[serde(default)]
     pub skip: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HueSection {
+    /// Path to the JSON token file written by `edge-agent pair-hue`.
+    /// Expected shape: `{"host": "...", "app_key": "...", "client_key": "..."}`.
+    /// If this file is missing, the Hue adapter stays disabled at runtime
+    /// even when the `hue` Cargo feature is on.
+    pub token_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -65,6 +76,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("EDGE_AGENT_NUIMO_SKIP") {
             self.nuimo.skip = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = std::env::var("EDGE_AGENT_HUE_TOKEN_PATH") {
+            self.hue.token_path = Some(PathBuf::from(v));
         }
     }
 }

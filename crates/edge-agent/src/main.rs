@@ -13,11 +13,17 @@
 
 mod config;
 mod glyphs;
+#[cfg(feature = "hue")]
+mod hue_token;
+#[cfg(feature = "hue")]
+mod pair_hue;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "hue")]
+use adapter_hue::{HueAdapter, HueConfig};
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
 use edge_core::{
@@ -37,8 +43,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+
+    #[cfg(feature = "hue")]
+    if first.as_deref() == Some("pair-hue") {
+        let remaining: Vec<String> = args.collect();
+        return pair_hue::run(&remaining).await;
+    }
+
+    let config_path = first
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("configs/example.toml"));
     let cfg = config::Config::load(&config_path)?;
@@ -56,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         let mut caps = Vec::new();
         if cfg!(feature = "roon") {
             caps.push("roon".to_string());
+        }
+        if cfg!(feature = "hue") {
+            caps.push("hue".to_string());
         }
         caps
     };
@@ -110,6 +127,32 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(adapter)
     };
 
+    #[cfg(feature = "hue")]
+    let hue_adapter: Option<Arc<dyn ServiceAdapter>> = match cfg.hue.token_path.as_ref() {
+        Some(path) => match hue_token::load(path) {
+            Ok(creds) => {
+                let adapter = HueAdapter::start(HueConfig {
+                    host: creds.host,
+                    app_key: creds.app_key,
+                })
+                .await?;
+                Some(Arc::new(adapter))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "hue token load failed — hue adapter disabled (run `edge-agent pair-hue` to create one)",
+                );
+                None
+            }
+        },
+        None => {
+            tracing::info!("no [hue] token_path configured — hue adapter disabled");
+            None
+        }
+    };
+
     // nuimo.skip lets an edge run as a WS-only witness (dashboard / hub
     // validation / multi-edge routing tests without requiring physical BLE
     // hardware on every host).
@@ -117,29 +160,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
 
         #[cfg(feature = "roon")]
-        {
-            let mut state_rx = roon_adapter.subscribe_state();
-            let outbox = ws_outbox.clone();
-            tokio::spawn(async move {
-                loop {
-                    match state_rx.recv().await {
-                        Ok(update) => {
-                            let frame = EdgeToServer::State {
-                                service_type: update.service_type,
-                                target: update.target,
-                                property: update.property,
-                                output_id: update.output_id,
-                                value: update.value,
-                            };
-                            let _ = outbox.send(frame).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "adapter state lag");
-                        }
-                    }
-                }
-            });
+        spawn_state_pump(roon_adapter.subscribe_state(), ws_outbox.clone());
+
+        #[cfg(feature = "hue")]
+        if let Some(adapter) = &hue_adapter {
+            spawn_state_pump(adapter.subscribe_state(), ws_outbox.clone());
         }
 
         tokio::signal::ctrl_c().await?;
@@ -218,6 +243,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(feature = "hue")]
+    if let Some(adapter) = &hue_adapter {
+        // Hue state flows straight to the WS outbox — no glyph feedback for
+        // now, the lights themselves carry the visible confirmation.
+        spawn_state_pump(adapter.subscribe_state(), ws_outbox.clone());
+    }
+
     // Input pump: Nuimo BLE events → routing → adapter dispatch.
     let mut events = device.events();
     let device_type = "nuimo";
@@ -234,6 +266,16 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::warn!(error = %e, target = %r.service_target, "failed to send roon intent");
                             }
                         }
+                        #[cfg(feature = "hue")]
+                        "hue" => {
+                            if let Some(adapter) = &hue_adapter {
+                                if let Err(e) = adapter.send_intent(&r.service_target, &r.intent).await {
+                                    tracing::warn!(error = %e, target = %r.service_target, "failed to send hue intent");
+                                }
+                            } else {
+                                tracing::debug!(target = %r.service_target, "hue intent dropped — adapter disabled");
+                            }
+                        }
                         other => {
                             tracing::warn!(service_type = %other, "no adapter registered for service_type");
                         }
@@ -246,6 +288,32 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn spawn_state_pump(
+    mut state_rx: tokio::sync::broadcast::Receiver<StateUpdate>,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match state_rx.recv().await {
+                Ok(update) => {
+                    let frame = EdgeToServer::State {
+                        service_type: update.service_type,
+                        target: update.target,
+                        property: update.property,
+                        output_id: update.output_id,
+                        value: update.value,
+                    };
+                    let _ = outbox.send(frame).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "adapter state lag");
+                }
+            }
+        }
+    });
 }
 
 fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {

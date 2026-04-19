@@ -193,6 +193,19 @@ async fn drive_zones(
 }
 
 fn publish_zone(tx: &broadcast::Sender<StateUpdate>, zone: &Zone) {
+    // Zone summary: Web UI reads display_name here to label cards.
+    let summary = serde_json::json!({
+        "display_name": zone.display_name,
+        "state": zone.state,
+    });
+    let _ = tx.send(StateUpdate {
+        service_type: SERVICE_TYPE.into(),
+        target: zone.zone_id.clone(),
+        property: "zone".into(),
+        output_id: None,
+        value: summary,
+    });
+
     let playback = serde_json::to_value(zone.state).unwrap_or(serde_json::Value::Null);
     let _ = tx.send(StateUpdate {
         service_type: SERVICE_TYPE.into(),

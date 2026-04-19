@@ -12,6 +12,7 @@ edge-core = { path = "../edge-core" }
 weave-contracts = { path = "../weave-contracts" }
 nuimo = { path = "../../../nuimo-rs/crates/nuimo" }
 adapter-roon = { path = "../adapter-roon", optional = true }
+adapter-hue = { path = "../adapter-hue", optional = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,3 +24,4 @@ toml = "0.8"
 [features]
 default = ["roon"]
 roon = ["dep:adapter-roon"]
+hue = ["dep:adapter-hue"]
