@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use weave_contracts::{EdgeConfig, EdgeToServer, ServerToEdge};
+use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
 use crate::cache;
 use crate::registry::GlyphRegistry;
@@ -151,17 +151,43 @@ impl WsClient {
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op,
-                mapping: _,
-            } => {
-                // Phase 1 scope: request a full reload on any patch. Fine-grained
-                // patching lands in Phase 3 once the routing engine exposes it.
-                tracing::info!(?op, %mapping_id, "config_patch received; full reload on next connect");
-            }
+                mapping,
+            } => match op {
+                PatchOp::Upsert => {
+                    if let Some(m) = mapping {
+                        tracing::info!(
+                            %mapping_id,
+                            device = %m.device_id,
+                            service = %m.service_type,
+                            "config_patch upsert",
+                        );
+                        self.engine.upsert_mapping(m).await;
+                        self.refresh_cache().await;
+                    } else {
+                        tracing::warn!(%mapping_id, "config_patch upsert without mapping payload; ignoring");
+                    }
+                }
+                PatchOp::Delete => {
+                    tracing::info!(%mapping_id, "config_patch delete");
+                    self.engine.remove_mapping(&mapping_id).await;
+                    self.refresh_cache().await;
+                }
+            },
             ServerToEdge::TargetSwitch {
                 mapping_id,
                 service_target,
             } => {
-                tracing::info!(%mapping_id, %service_target, "target_switch (phase 3 will apply inline)");
+                // Express as an upsert of the current mapping with the new
+                // service_target. Cheap since we already have it locally.
+                tracing::info!(%mapping_id, %service_target, "target_switch");
+                let mut current = self.engine.snapshot().await;
+                if let Some(idx) = current.iter().position(|m| m.mapping_id == mapping_id) {
+                    current[idx].service_target = service_target;
+                    self.engine.upsert_mapping(current.remove(idx)).await;
+                    self.refresh_cache().await;
+                } else {
+                    tracing::warn!(%mapping_id, "target_switch for unknown mapping");
+                }
             }
             ServerToEdge::GlyphsUpdate { glyphs } => {
                 tracing::info!(count = glyphs.len(), "received glyphs_update");
@@ -179,5 +205,28 @@ impl WsClient {
     async fn apply_full(&self, config: &EdgeConfig) {
         self.engine.replace_all(config.mappings.clone()).await;
         self.glyphs.replace_all(config.glyphs.clone()).await;
+    }
+
+    /// Persist a fresh cache after an incremental patch so the agent
+    /// comes back up with the latest config even if the server is
+    /// unreachable on the next boot.
+    async fn refresh_cache(&self) {
+        let mappings = self.engine.snapshot().await;
+        // The cache stores an EdgeConfig; we need edge_id + current glyphs.
+        // Glyphs aren't kept in a cheap-to-read form on the engine, so
+        // derive from the last saved cache if present.
+        let edge_id = self.edge_id.clone();
+        let glyphs = match cache::load(&self.cache_path).await {
+            Ok(Some(cfg)) => cfg.glyphs,
+            _ => Vec::new(),
+        };
+        let cfg = EdgeConfig {
+            edge_id,
+            mappings,
+            glyphs,
+        };
+        if let Err(e) = cache::save(&self.cache_path, &cfg).await {
+            tracing::warn!(error = %e, "failed to persist cache after patch");
+        }
     }
 }

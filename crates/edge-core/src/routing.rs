@@ -40,6 +40,44 @@ impl RoutingEngine {
         *self.by_device.write().await = by_device;
     }
 
+    /// Insert or replace one mapping, keyed by `mapping_id`. Used on
+    /// `config_patch` upsert.
+    pub async fn upsert_mapping(&self, mapping: Mapping) {
+        let mut guard = self.by_device.write().await;
+        // Remove any prior entry with the same mapping_id, regardless of
+        // device key (handles device reassignment).
+        for list in guard.values_mut() {
+            list.retain(|m| m.mapping_id != mapping.mapping_id);
+        }
+        guard
+            .entry((mapping.device_type.clone(), mapping.device_id.clone()))
+            .or_default()
+            .push(mapping);
+    }
+
+    /// Remove any mapping with the given `mapping_id`. Used on
+    /// `config_patch` delete.
+    pub async fn remove_mapping(&self, id: &uuid::Uuid) {
+        let mut guard = self.by_device.write().await;
+        for list in guard.values_mut() {
+            list.retain(|m| &m.mapping_id != id);
+        }
+        // Prune empty device buckets so route() stays tight.
+        guard.retain(|_, list| !list.is_empty());
+    }
+
+    /// Snapshot every mapping currently held, grouped or not. Used to
+    /// persist the local cache after an incremental patch.
+    pub async fn snapshot(&self) -> Vec<Mapping> {
+        self.by_device
+            .read()
+            .await
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     /// Apply the given input primitive from a specific device, returning every
     /// intent it produces across all matching mappings.
     pub async fn route(
