@@ -35,12 +35,12 @@ Each edge-agent registers as its own Roon Extension (unique `extension_id`) so m
 - `edge-agent` — binary. Loads TOML bootstrap config, discovers Nuimo, wires routing + adapters, renders feedback glyphs.
 - `adapter-roon` — `ServiceAdapter` backed by `roon-api`. Publishes zone state (playback, volume, now_playing).
 
-## Running
+## Running (Linux)
 
 Native — not Docker (BLE needs host bluez/D-Bus).
 
 ```sh
-cargo build --workspace --release
+cargo build --workspace --release --features hue  # drop --features hue to skip Hue adapter
 
 EDGE_AGENT_EDGE_ID=living-room \
   EDGE_AGENT_CONFIG_SERVER_URL=ws://weave-host:3101/ws/edge \
@@ -53,6 +53,48 @@ EDGE_AGENT_EDGE_ID=living-room \
 First-time: approve the extension in Roon → Settings → Extensions. The token is persisted at `~/.local/state/edge-agent/roon-token-${edge_id}.json` and survives restarts.
 
 weave-server ships in the [roon-rs](https://github.com/shin1ohno/roon-rs) `compose.yml` — `docker compose up -d` gets you weave-server (port 3101) + weave-web (port 3100) + mosquitto + roon-hub.
+
+## Running (macOS)
+
+`nuimo-rs` picks `btleplug` (CoreBluetooth) via `cfg(target_os = "macos")`, so the same `cargo build` works on a Mac — no extra flags.
+
+```sh
+# Prerequisites
+brew install rustup-init && rustup-init -y
+source "$HOME/.cargo/env"
+rustup default stable
+
+# Build
+git clone https://github.com/shin1ohno/edge-agent ~/ManagedProjects/edge-agent
+# (also clone nuimo-rs and roon-rs alongside — they're path deps)
+cd ~/ManagedProjects/edge-agent
+cargo build --release --features hue
+
+# Pair your Hue bridge (one-time)
+./target/release/edge-agent pair-hue
+
+# First interactive run — macOS will ask for Bluetooth permission
+EDGE_AGENT_EDGE_ID=mac-living \
+  EDGE_AGENT_CONFIG_SERVER_URL=ws://weave.lan:3101/ws/edge \
+  EDGE_AGENT_ROON_HOST=192.168.1.20 EDGE_AGENT_ROON_PORT=9330 \
+  EDGE_AGENT_HUE_TOKEN_PATH="$HOME/Library/Application Support/edge-agent/hue-token.json" \
+  ./target/release/edge-agent configs/example.toml
+# → macOS prompts "edge-agent would like to use Bluetooth" the first time.
+#   Approve in System Settings > Privacy & Security > Bluetooth.
+
+# After permission is granted, persist with launchd
+cp packaging/macos/com.shin1ohno.edge-agent.plist ~/Library/LaunchAgents/
+# Edit the copy: replace __USER__ with your short username, fill EnvironmentVariables
+launchctl load ~/Library/LaunchAgents/com.shin1ohno.edge-agent.plist
+
+# Logs
+tail -f /tmp/edge-agent.log /tmp/edge-agent.err.log
+```
+
+Notes:
+- On macOS, `DiscoveredNuimo.address` is a CoreBluetooth peripheral UUID, not a BLE MAC. The rest of the API is identical to Linux.
+- Roon Extension registration is per-machine. The Mac edge-agent registers with a different `extension_id` than your Linux edge, so approve it once in Roon Settings → Extensions.
+- Launchd will not surface the Bluetooth permission dialog; always do the first run interactively.
 
 ## Which path should I use?
 

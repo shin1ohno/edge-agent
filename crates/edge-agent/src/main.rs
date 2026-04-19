@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("nuimo discovery channel closed");
         };
         if let Some(wanted) = cfg.nuimo.ble_address.as_deref() {
-            if d.address.to_string() != wanted {
+            if d.address != wanted {
                 tracing::debug!(found = %d.address, wanted, "skipping non-matching Nuimo");
                 continue;
             }

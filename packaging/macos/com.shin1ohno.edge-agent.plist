@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for edge-agent on macOS.
+
+  Before using:
+    1. Replace every "__USER__" with your short Unix username.
+    2. Adjust __BINARY__ and __CONFIG__ paths if you installed elsewhere.
+    3. Fill in EDGE_AGENT_* env vars with real host / IDs.
+    4. First run should be interactive so macOS can raise the Bluetooth
+       permission prompt once; after that launchctl-loaded runs are allowed.
+
+  Usage:
+    cp com.shin1ohno.edge-agent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.shin1ohno.edge-agent.plist
+    # unload:
+    launchctl unload ~/Library/LaunchAgents/com.shin1ohno.edge-agent.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shin1ohno.edge-agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/__USER__/ManagedProjects/edge-agent/target/release/edge-agent</string>
+    <string>/Users/__USER__/ManagedProjects/edge-agent/configs/example.toml</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>EDGE_AGENT_EDGE_ID</key>
+    <string>mac-living</string>
+    <key>EDGE_AGENT_CONFIG_SERVER_URL</key>
+    <string>ws://weave.lan:3101/ws/edge</string>
+    <key>EDGE_AGENT_ROON_HOST</key>
+    <string>192.168.1.20</string>
+    <key>EDGE_AGENT_ROON_PORT</key>
+    <string>9330</string>
+    <key>EDGE_AGENT_HUE_TOKEN_PATH</key>
+    <string>/Users/__USER__/Library/Application Support/edge-agent/hue-token.json</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/edge-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/edge-agent.err.log</string>
+</dict>
+</plist>
