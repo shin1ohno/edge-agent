@@ -29,6 +29,11 @@ pub struct RoonSection {
 #[derive(Debug, Deserialize, Default)]
 pub struct NuimoSection {
     pub ble_address: Option<String>,
+    /// When true, skip BLE discovery/connection entirely. Useful for running
+    /// an edge on a host that has no devices attached, to verify WS routing
+    /// or to run as a dashboard-only witness for the weave hub.
+    #[serde(default)]
+    pub skip: bool,
 }
 
 impl Config {
@@ -57,6 +62,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("EDGE_AGENT_NUIMO_BLE_ADDRESS") {
             self.nuimo.ble_address = Some(v);
+        }
+        if let Ok(v) = std::env::var("EDGE_AGENT_NUIMO_SKIP") {
+            self.nuimo.skip = matches!(v.as_str(), "1" | "true" | "yes");
         }
     }
 }

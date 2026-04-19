@@ -110,6 +110,43 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(adapter)
     };
 
+    // nuimo.skip lets an edge run as a WS-only witness (dashboard / hub
+    // validation / multi-edge routing tests without requiring physical BLE
+    // hardware on every host).
+    if cfg.nuimo.skip {
+        tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
+
+        #[cfg(feature = "roon")]
+        {
+            let mut state_rx = roon_adapter.subscribe_state();
+            let outbox = ws_outbox.clone();
+            tokio::spawn(async move {
+                loop {
+                    match state_rx.recv().await {
+                        Ok(update) => {
+                            let frame = EdgeToServer::State {
+                                service_type: update.service_type,
+                                target: update.target,
+                                property: update.property,
+                                output_id: update.output_id,
+                                value: update.value,
+                            };
+                            let _ = outbox.send(frame).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "adapter state lag");
+                        }
+                    }
+                }
+            });
+        }
+
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("shutting down");
+        return Ok(());
+    }
+
     // Discover a Nuimo. Optionally pin to a specific BLE address.
     tracing::info!("scanning for Nuimo...");
     let (mut discovered_rx, _discovery_handle) = discover().await?;
