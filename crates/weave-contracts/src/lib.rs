@@ -234,10 +234,7 @@ mod tests {
                     routes: vec![Route {
                         input: "rotate".into(),
                         intent: "volume_change".into(),
-                        params: BTreeMap::from([(
-                            "damping".into(),
-                            serde_json::json!(80),
-                        )]),
+                        params: BTreeMap::from([("damping".into(), serde_json::json!(80))]),
                     }],
                     feedback: vec![],
                     active: true,
