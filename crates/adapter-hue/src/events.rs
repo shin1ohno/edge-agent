@@ -91,9 +91,7 @@ async fn apply_event(
     cache: &Arc<LightCache>,
     state_tx: &broadcast::Sender<StateUpdate>,
 ) {
-    let updated = cache
-        .merge_partial(light_id, data.on, data.dimming)
-        .await;
+    let updated = cache.merge_partial(light_id, data.on, data.dimming).await;
     if let Some(light) = updated {
         broadcast_light(&light, state_tx);
     }

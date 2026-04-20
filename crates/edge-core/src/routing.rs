@@ -134,9 +134,9 @@ fn build_intent(route: &Route, input: &InputPrimitive) -> Option<Intent> {
         "power_toggle" => Some(Intent::PowerToggle),
         "power_on" => Some(Intent::PowerOn),
         "power_off" => Some(Intent::PowerOff),
-        "volume_change" => input.continuous_value().map(|v| Intent::VolumeChange {
-            delta: v * damping,
-        }),
+        "volume_change" => input
+            .continuous_value()
+            .map(|v| Intent::VolumeChange { delta: v * damping }),
         "volume_set" => route
             .params
             .get("value")
@@ -145,16 +145,12 @@ fn build_intent(route: &Route, input: &InputPrimitive) -> Option<Intent> {
         "seek_relative" => input.continuous_value().map(|v| Intent::SeekRelative {
             seconds: v * damping,
         }),
-        "brightness_change" => input.continuous_value().map(|v| Intent::BrightnessChange {
-            delta: v * damping,
-        }),
-        "color_temperature_change" => {
-            input
-                .continuous_value()
-                .map(|v| Intent::ColorTemperatureChange {
-                    delta: v * damping,
-                })
-        }
+        "brightness_change" => input
+            .continuous_value()
+            .map(|v| Intent::BrightnessChange { delta: v * damping }),
+        "color_temperature_change" => input
+            .continuous_value()
+            .map(|v| Intent::ColorTemperatureChange { delta: v * damping }),
         _ => None,
     }
 }
@@ -190,7 +186,11 @@ mod tests {
         engine.replace_all(vec![rotate_mapping()]).await;
 
         let out = engine
-            .route("nuimo", "C3:81:DF:4E", &InputPrimitive::Rotate { delta: 0.03 })
+            .route(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate { delta: 0.03 },
+            )
             .await;
         assert_eq!(out.len(), 1);
         match &out[0].intent {
@@ -209,7 +209,11 @@ mod tests {
         engine.replace_all(vec![m]).await;
 
         let out = engine
-            .route("nuimo", "C3:81:DF:4E", &InputPrimitive::Rotate { delta: 0.03 })
+            .route(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate { delta: 0.03 },
+            )
             .await;
         assert!(out.is_empty());
     }

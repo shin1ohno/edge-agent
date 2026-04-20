@@ -21,8 +21,7 @@ impl GlyphRegistry {
     }
 
     pub async fn replace_all(&self, glyphs: Vec<Glyph>) {
-        let map: HashMap<String, Glyph> =
-            glyphs.into_iter().map(|g| (g.name.clone(), g)).collect();
+        let map: HashMap<String, Glyph> = glyphs.into_iter().map(|g| (g.name.clone(), g)).collect();
         *self.inner.write().await = map;
     }
 

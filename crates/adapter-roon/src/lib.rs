@@ -98,7 +98,9 @@ impl RoonAdapter {
     /// mappings still work.
     async fn output_for_volume(&self, target: &str) -> String {
         let map = self.zone_to_output.lock().await;
-        map.get(target).cloned().unwrap_or_else(|| target.to_string())
+        map.get(target)
+            .cloned()
+            .unwrap_or_else(|| target.to_string())
     }
 }
 
@@ -122,11 +124,13 @@ impl ServiceAdapter for RoonAdapter {
             Intent::Previous => t.control(target, ControlAction::Previous).await?,
             Intent::VolumeChange { delta } => {
                 let output = self.output_for_volume(target).await;
-                t.change_volume(&output, VolumeMode::Relative, *delta).await?
+                t.change_volume(&output, VolumeMode::Relative, *delta)
+                    .await?
             }
             Intent::VolumeSet { value } => {
                 let output = self.output_for_volume(target).await;
-                t.change_volume(&output, VolumeMode::Absolute, *value).await?
+                t.change_volume(&output, VolumeMode::Absolute, *value)
+                    .await?
             }
             Intent::Mute => {
                 let output = self.output_for_volume(target).await;
