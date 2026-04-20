@@ -32,7 +32,7 @@
     <key>EDGE_AGENT_EDGE_ID</key>
     <string>mac-living</string>
     <key>EDGE_AGENT_CONFIG_SERVER_URL</key>
-    <string>ws://weave.lan:3101/ws/edge</string>
+    <string>ws://pro.home.local:3101/ws/edge</string>
     <key>EDGE_AGENT_ROON_HOST</key>
     <string>192.168.1.20</string>
     <key>EDGE_AGENT_ROON_PORT</key>
