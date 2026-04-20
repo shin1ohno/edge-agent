@@ -177,6 +177,8 @@ mod tests {
             }],
             feedback: vec![],
             active: true,
+            target_candidates: vec![],
+            target_switch_on: None,
         }
     }
 
