@@ -17,9 +17,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
-use crate::cache;
-use crate::registry::GlyphRegistry;
-use crate::routing::RoutingEngine;
+use super::cache;
+use super::registry::GlyphRegistry;
+use super::routing::RoutingEngine;
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);

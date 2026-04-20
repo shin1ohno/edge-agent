@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 
-use crate::types::{Dimming, Light, OnState};
+use super::types::{Dimming, Light, OnState};
 
 #[derive(Default)]
 pub struct LightCache {

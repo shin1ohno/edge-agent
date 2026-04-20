@@ -2,32 +2,14 @@
 changelog_update = true
 pr_branch_prefix = "release-plz/"
 
-# weave-contracts is the only crate in this workspace meant for crates.io.
-# It carries the WebSocket protocol types that weave-server also depends on,
-# so its version must evolve via SemVer-disciplined releases.
+# weave-contracts is consumed off-repo by weave-server via crates.io;
+# edge-agent is the installable binary (`cargo install edge-agent`) and
+# inlines its former submodules (edge-core / adapter-roon / adapter-hue)
+# as internal modules so it has no private workspace dependencies.
 [[package]]
 name = "weave-contracts"
 publish = true
 
-# edge-agent is the deployed binary; edge-core, adapter-roon, adapter-hue are
-# workspace-internal libraries. None need to be on crates.io, and we don't
-# want release-plz opening release PRs for them.
 [[package]]
 name = "edge-agent"
-publish = false
-release = false
-
-[[package]]
-name = "edge-core"
-publish = false
-release = false
-
-[[package]]
-name = "adapter-roon"
-publish = false
-release = false
-
-[[package]]
-name = "adapter-hue"
-publish = false
-release = false
+publish = true

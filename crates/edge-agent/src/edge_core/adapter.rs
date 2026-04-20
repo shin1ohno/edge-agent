@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use crate::intent::Intent;
+use super::intent::Intent;
 
 /// State update from an external service. The edge-agent forwards these
 /// over WebSocket to the config-server for fan-out to the Web UI, and

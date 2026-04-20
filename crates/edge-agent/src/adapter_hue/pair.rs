@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::types::HueError;
+use super::types::HueError;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 

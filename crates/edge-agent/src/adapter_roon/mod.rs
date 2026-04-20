@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 //! Roon service adapter backed by `roon-api`.
 //!
 //! Registers as a Roon Extension, waits for `CorePaired`, subscribes to zone
@@ -8,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::edge_core::{Intent, ServiceAdapter, StateUpdate};
 use async_trait::async_trait;
-use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use roon_api::{
     ControlAction, FileTokenStore, MuteAction, RoonClient, RoonClientBuilder, RoonEvent, SeekMode,
     Transport, VolumeMode, Zone, ZoneEvent,
