@@ -59,6 +59,15 @@ pub enum EdgeToServer {
     },
     /// Reply to server `Ping`.
     Pong,
+    /// The edge committed a target switch via on-device selection mode.
+    /// Server replies by calling the same code path as `POST
+    /// /api/mappings/:id/target`: persist the new `service_target`, then
+    /// broadcast a `ConfigPatch` upsert back to all edges (including the
+    /// sender) and a `MappingChanged` to UI subscribers.
+    SwitchTarget {
+        mapping_id: Uuid,
+        service_target: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
