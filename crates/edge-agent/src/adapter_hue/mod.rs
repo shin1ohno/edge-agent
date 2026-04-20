@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 //! Philips Hue v2 service adapter for the direct edge-agent path.
 //!
 //! Exposes a `HueAdapter` that implements [`edge_core::ServiceAdapter`].

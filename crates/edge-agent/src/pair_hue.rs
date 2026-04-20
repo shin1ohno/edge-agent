@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use adapter_hue::{discover, pair, DiscoveredBridge};
+use crate::adapter_hue::{discover, pair, DiscoveredBridge};
 
 use crate::hue_token::{save, HueToken};
 

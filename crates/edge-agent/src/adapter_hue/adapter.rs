@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
+use crate::edge_core::{Intent, ServiceAdapter, StateUpdate};
 use async_trait::async_trait;
-use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use tokio::sync::broadcast;
 
-use crate::api::HueClient;
-use crate::cache::LightCache;
-use crate::events::{self, SERVICE_TYPE};
-use crate::types::{DimmingAction, DimmingDelta, LightUpdate, OnState};
+use super::api::HueClient;
+use super::cache::LightCache;
+use super::events::{self, SERVICE_TYPE};
+use super::types::{DimmingAction, DimmingDelta, LightUpdate, OnState};
 
 #[derive(Debug, Clone)]
 pub struct HueConfig {
@@ -97,7 +97,7 @@ impl ServiceAdapter for HueAdapter {
                 }
             }
             Intent::BrightnessSet { value } => LightUpdate {
-                dimming: Some(crate::types::Dimming {
+                dimming: Some(super::types::Dimming {
                     brightness: value.clamp(0.0, 100.0),
                 }),
                 ..Default::default()

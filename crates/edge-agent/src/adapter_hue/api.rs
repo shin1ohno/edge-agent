@@ -5,7 +5,7 @@
 
 use reqwest::{Client, ClientBuilder};
 
-use crate::types::{Light, LightUpdate, LightsResponse};
+use super::types::{Light, LightUpdate, LightsResponse};
 
 const TIMEOUT_SECS: u64 = 10;
 

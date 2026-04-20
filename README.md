@@ -30,24 +30,37 @@ Each edge-agent registers as its own Roon Extension (unique `extension_id`) so m
 
 ## Crates
 
-- `weave-contracts` — WS protocol types (ServerToEdge / EdgeToServer / UiFrame / Mapping / Glyph). Shared with `weave-server` via git/path dep — edge-agent owns the contract definition.
-- `edge-core` — routing engine, `ServiceAdapter` trait, WS client, `GlyphRegistry`, local config cache.
-- `edge-agent` — binary. Loads TOML bootstrap config, discovers Nuimo, wires routing + adapters, renders feedback glyphs.
-- `adapter-roon` — `ServiceAdapter` backed by `roon-api`. Publishes zone state (playback, volume, now_playing).
+- `weave-contracts` — WS protocol types (ServerToEdge / EdgeToServer / UiFrame / Mapping / Glyph), shared with `weave-server` via crates.io.
+- `edge-agent` — binary. Absorbs the former `edge-core` / `adapter-roon` / `adapter-hue` crates as internal modules (see `src/{edge_core,adapter_roon,adapter_hue}/`), so `cargo install edge-agent` pulls a single self-contained crate from crates.io.
+
+## Install
+
+From crates.io (Linux and macOS):
+
+```sh
+cargo install edge-agent                 # default: roon adapter only
+cargo install edge-agent --features hue  # + Philips Hue
+```
+
+**Linux prerequisites** (BLE needs system packages):
+
+```sh
+sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+```
+
+**macOS**: no extra packages. CoreBluetooth is system-provided. First interactive run will trigger the Bluetooth permission dialog — approve in System Settings → Privacy & Security → Bluetooth.
 
 ## Running (Linux)
 
 Native — not Docker (BLE needs host bluez/D-Bus).
 
 ```sh
-cargo build --workspace --release --features hue  # drop --features hue to skip Hue adapter
-
 EDGE_AGENT_EDGE_ID=living-room \
   EDGE_AGENT_CONFIG_SERVER_URL=ws://weave-host:3101/ws/edge \
   EDGE_AGENT_ROON_HOST=192.168.1.20 \
   EDGE_AGENT_ROON_PORT=9330 \
   RUST_LOG=info \
-  ./target/release/edge-agent configs/example.toml
+  edge-agent configs/example.toml
 ```
 
 First-time: approve the extension in Roon → Settings → Extensions. The token is persisted at `~/.local/state/edge-agent/roon-token-${edge_id}.json` and survives restarts.
@@ -64,21 +77,18 @@ brew install rustup-init && rustup-init -y
 source "$HOME/.cargo/env"
 rustup default stable
 
-# Build
-git clone https://github.com/shin1ohno/edge-agent ~/ManagedProjects/edge-agent
-# (also clone nuimo-rs and roon-rs alongside — they're path deps)
-cd ~/ManagedProjects/edge-agent
-cargo build --release --features hue
+# Install
+cargo install edge-agent --features hue
 
 # Pair your Hue bridge (one-time)
-./target/release/edge-agent pair-hue
+edge-agent pair-hue
 
 # First interactive run — macOS will ask for Bluetooth permission
 EDGE_AGENT_EDGE_ID=mac-living \
   EDGE_AGENT_CONFIG_SERVER_URL=ws://weave.lan:3101/ws/edge \
   EDGE_AGENT_ROON_HOST=192.168.1.20 EDGE_AGENT_ROON_PORT=9330 \
   EDGE_AGENT_HUE_TOKEN_PATH="$HOME/Library/Application Support/edge-agent/hue-token.json" \
-  ./target/release/edge-agent configs/example.toml
+  edge-agent configs/example.toml
 # → macOS prompts "edge-agent would like to use Bluetooth" the first time.
 #   Approve in System Settings > Privacy & Security > Bluetooth.
 

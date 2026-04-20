@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use edge_core::StateUpdate;
+use crate::edge_core::StateUpdate;
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
 
-use crate::api::HueClient;
-use crate::cache::LightCache;
-use crate::types::{Light, SseEvent};
+use super::api::HueClient;
+use super::cache::LightCache;
+use super::types::{Light, SseEvent};
 
 pub const SERVICE_TYPE: &str = "hue";
 
@@ -87,7 +87,7 @@ async fn stream_once(
 
 async fn apply_event(
     light_id: &str,
-    data: &crate::types::SseEventData,
+    data: &super::types::SseEventData,
     cache: &Arc<LightCache>,
     state_tx: &broadcast::Sender<StateUpdate>,
 ) {

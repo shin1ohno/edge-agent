@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 //! Routing engine, service-adapter trait, and WebSocket client for `edge-agent`.
 
 pub mod adapter;

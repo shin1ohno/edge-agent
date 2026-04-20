@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use weave_contracts::{Mapping, Route};
 
-use crate::intent::{InputPrimitive, Intent};
+use super::intent::{InputPrimitive, Intent};
 
 /// A concrete intent destined for a specific service target.
 #[derive(Debug, Clone)]
