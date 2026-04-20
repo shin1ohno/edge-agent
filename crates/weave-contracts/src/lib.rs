@@ -192,6 +192,34 @@ pub struct Mapping {
     pub feedback: Vec<FeedbackRule>,
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Ordered list of candidate `service_target` values the edge can cycle
+    /// through at runtime. Empty = switching disabled.
+    #[serde(default)]
+    pub target_candidates: Vec<TargetCandidate>,
+    /// Input primitive (snake-case `InputType` name, e.g. `"long_press"`)
+    /// that enters selection mode on the device. `None` = feature disabled
+    /// for this mapping, regardless of `target_candidates`.
+    ///
+    /// MVP constraint (not enforced in-schema): at most one mapping per
+    /// `(edge_id, device_id)` should set this; the edge router picks the
+    /// first encountered if multiple are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_switch_on: Option<String>,
+}
+
+/// One entry in `Mapping::target_candidates`. During selection mode the
+/// device displays `glyph` and, on confirm, the mapping's `service_target`
+/// is replaced with `target`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetCandidate {
+    /// The `service_target` value to switch to (e.g. a Roon zone ID).
+    pub target: String,
+    /// Human-readable label for the UI only — the edge does not need it.
+    #[serde(default)]
+    pub label: String,
+    /// Name of a glyph in the edge's glyph registry to display while this
+    /// candidate is highlighted in selection mode.
+    pub glyph: String,
 }
 
 fn default_true() -> bool {
