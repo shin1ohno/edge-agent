@@ -552,8 +552,10 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
 /// near-identical rewrites that were reading as "blinking".
 #[cfg(feature = "roon")]
 enum FeedbackPlan {
-    /// Volume bar, 0..=9 LEDs from the bottom.
-    VolumeBar(u8),
+    /// Volume bar. `bars` = 0..=9 lit LEDs; `direction` decides which end
+    /// of the column fills first (bottom-up for linear 0..=max zones,
+    /// top-down for dB zones whose max is 0).
+    VolumeBar(u8, glyphs::VolumeDirection),
     /// Named glyph from the registry (play / pause / ...).
     NamedGlyph(&'static str),
 }
@@ -571,14 +573,26 @@ impl FeedbackPlan {
             },
             ("volume", serde_json::Value::Object(obj)) => {
                 let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let max = obj
-                    .get("max")
-                    .and_then(|v| v.as_f64())
-                    .filter(|v| *v > 0.0)
-                    .unwrap_or(100.0);
-                let pct = ((value / max) * 100.0).clamp(0.0, 100.0);
-                let bars = ((pct / 100.0) * 9.0).round() as u8;
-                Some(Self::VolumeBar(bars))
+                let max = obj.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
+                let min = obj.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let vtype = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                // "db" zones publish a max of 0 and a negative min
+                // (e.g. -80..0). Linear zones publish 0..=100 (or
+                // similar) with a positive max.
+                let is_db = vtype.eq_ignore_ascii_case("db") || (max <= 0.0 && min < 0.0);
+                let span = max - min;
+                let ratio = if span > 0.0 {
+                    ((value - min) / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let bars = (ratio * 9.0).round() as u8;
+                let direction = if is_db {
+                    glyphs::VolumeDirection::TopDown
+                } else {
+                    glyphs::VolumeDirection::BottomUp
+                };
+                Some(Self::VolumeBar(bars, direction))
             }
             _ => None,
         }
@@ -588,15 +602,21 @@ impl FeedbackPlan {
     /// on this.
     fn signature(&self) -> String {
         match self {
-            Self::VolumeBar(bars) => format!("vol:{bars}"),
+            Self::VolumeBar(bars, direction) => {
+                let d = match direction {
+                    glyphs::VolumeDirection::BottomUp => "up",
+                    glyphs::VolumeDirection::TopDown => "down",
+                };
+                format!("vol:{bars}:{d}")
+            }
             Self::NamedGlyph(name) => (*name).to_string(),
         }
     }
 
     async fn execute(&self, device: &NuimoDevice, registry: &GlyphRegistry) {
         let (glyph, transition, timeout_ms) = match self {
-            Self::VolumeBar(bars) => (
-                glyphs::volume_bars(*bars),
+            Self::VolumeBar(bars, direction) => (
+                glyphs::volume_bars(*bars, *direction),
                 DisplayTransition::Immediate,
                 3000,
             ),
