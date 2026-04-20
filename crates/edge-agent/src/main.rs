@@ -115,7 +115,11 @@ async fn main() -> anyhow::Result<()> {
             extension_id,
             display_name,
             display_version: VERSION.to_string(),
-            publisher: cfg.roon.publisher.clone().unwrap_or_else(|| "shin1ohno".into()),
+            publisher: cfg
+                .roon
+                .publisher
+                .clone()
+                .unwrap_or_else(|| "shin1ohno".into()),
             email: cfg
                 .roon
                 .email
@@ -456,23 +460,45 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
         NuimoEvent::ButtonDown => InputPrimitive::Press,
         NuimoEvent::ButtonUp => InputPrimitive::Release,
         NuimoEvent::Rotate { delta, .. } => InputPrimitive::Rotate { delta: *delta },
-        NuimoEvent::SwipeUp => InputPrimitive::Swipe { direction: Direction::Up },
-        NuimoEvent::SwipeDown => InputPrimitive::Swipe { direction: Direction::Down },
-        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => {
-            InputPrimitive::Swipe { direction: Direction::Left }
-        }
-        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => {
-            InputPrimitive::Swipe { direction: Direction::Right }
-        }
-        NuimoEvent::TouchTop => InputPrimitive::Touch { area: TouchArea::Top },
-        NuimoEvent::TouchBottom => InputPrimitive::Touch { area: TouchArea::Bottom },
-        NuimoEvent::TouchLeft => InputPrimitive::Touch { area: TouchArea::Left },
-        NuimoEvent::TouchRight => InputPrimitive::Touch { area: TouchArea::Right },
-        NuimoEvent::LongTouchTop => InputPrimitive::LongTouch { area: TouchArea::Top },
-        NuimoEvent::LongTouchBottom => InputPrimitive::LongTouch { area: TouchArea::Bottom },
-        NuimoEvent::LongTouchLeft => InputPrimitive::LongTouch { area: TouchArea::Left },
-        NuimoEvent::LongTouchRight => InputPrimitive::LongTouch { area: TouchArea::Right },
-        NuimoEvent::Hover { proximity } => InputPrimitive::Hover { proximity: *proximity },
+        NuimoEvent::SwipeUp => InputPrimitive::Swipe {
+            direction: Direction::Up,
+        },
+        NuimoEvent::SwipeDown => InputPrimitive::Swipe {
+            direction: Direction::Down,
+        },
+        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => InputPrimitive::Swipe {
+            direction: Direction::Left,
+        },
+        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => InputPrimitive::Swipe {
+            direction: Direction::Right,
+        },
+        NuimoEvent::TouchTop => InputPrimitive::Touch {
+            area: TouchArea::Top,
+        },
+        NuimoEvent::TouchBottom => InputPrimitive::Touch {
+            area: TouchArea::Bottom,
+        },
+        NuimoEvent::TouchLeft => InputPrimitive::Touch {
+            area: TouchArea::Left,
+        },
+        NuimoEvent::TouchRight => InputPrimitive::Touch {
+            area: TouchArea::Right,
+        },
+        NuimoEvent::LongTouchTop => InputPrimitive::LongTouch {
+            area: TouchArea::Top,
+        },
+        NuimoEvent::LongTouchBottom => InputPrimitive::LongTouch {
+            area: TouchArea::Bottom,
+        },
+        NuimoEvent::LongTouchLeft => InputPrimitive::LongTouch {
+            area: TouchArea::Left,
+        },
+        NuimoEvent::LongTouchRight => InputPrimitive::LongTouch {
+            area: TouchArea::Right,
+        },
+        NuimoEvent::Hover { proximity } => InputPrimitive::Hover {
+            proximity: *proximity,
+        },
         // BatteryLevel, Rssi, Connected, Disconnected are handled elsewhere (or not yet).
         _ => return None,
     })
@@ -605,7 +631,8 @@ impl FeedbackFilter {
             self.last_at.insert(key, now);
         }
 
-        self.last_sig.insert(update.target.clone(), signature.to_string());
+        self.last_sig
+            .insert(update.target.clone(), signature.to_string());
         true
     }
 }

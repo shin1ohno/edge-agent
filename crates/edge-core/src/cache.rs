@@ -10,9 +10,7 @@ use weave_contracts::EdgeConfig;
 pub fn default_cache_path(edge_id: &str) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("edge-agent")
         .join(format!("config-cache-{}.json", edge_id))

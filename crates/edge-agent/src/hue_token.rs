@@ -15,8 +15,8 @@ pub struct HueToken {
 }
 
 pub fn load(path: &Path) -> anyhow::Result<HueToken> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
+    let text =
+        fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {}: {}", path.display(), e))?;
     Ok(serde_json::from_str(&text)?)
 }
 
