@@ -218,13 +218,17 @@ impl RoutingEngine {
             if !input.matches_route(switch_on) {
                 continue;
             }
-            // Enter mode. Cursor starts at the candidate matching the
-            // current service_target, or 0 if none matches.
-            let cursor = m
+            // Enter mode with cursor one step AFTER the current
+            // service_target — so swipe_up→press (no rotate) cycles to
+            // the next candidate. Rotate still browses from there.
+            let current_idx = m
                 .target_candidates
                 .iter()
-                .position(|c| c.target == m.service_target)
-                .unwrap_or(0);
+                .position(|c| c.target == m.service_target);
+            let cursor = match current_idx {
+                Some(i) => (i + 1) % m.target_candidates.len(),
+                None => 0,
+            };
             let mode = SelectionMode {
                 mapping_id: m.mapping_id,
                 edge_id: m.edge_id.clone(),
@@ -314,6 +318,7 @@ fn build_intent(route: &Route, input: &InputPrimitive) -> Option<Intent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge_core::Direction;
     use std::collections::BTreeMap;
     use uuid::Uuid;
     use weave_contracts::Route;
@@ -385,5 +390,95 @@ mod tests {
             .route("nuimo", "unknown", &InputPrimitive::Rotate { delta: 0.03 })
             .await;
         assert!(out.is_empty());
+    }
+
+    fn selection_mapping() -> Mapping {
+        let mut m = rotate_mapping();
+        m.service_target = "target-A".into();
+        m.target_switch_on = Some("swipe_up".into());
+        m.target_candidates = vec![
+            TargetCandidate {
+                target: "target-A".into(),
+                label: "A".into(),
+                glyph: "glyph-a".into(),
+            },
+            TargetCandidate {
+                target: "target-B".into(),
+                label: "B".into(),
+                glyph: "glyph-b".into(),
+            },
+        ];
+        m
+    }
+
+    #[tokio::test]
+    async fn swipe_up_press_cycles_to_next_target_without_rotate() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![selection_mapping()]).await;
+
+        match engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Swipe {
+                    direction: Direction::Up,
+                },
+            )
+            .await
+        {
+            RouteOutcome::EnterSelection { glyph, .. } => {
+                // Entering mode from target-A should point at target-B.
+                assert_eq!(glyph, "glyph-b");
+            }
+            other => panic!("expected EnterSelection, got {:?}", other),
+        }
+
+        match engine
+            .route_with_mode("nuimo", "C3:81:DF:4E", &InputPrimitive::Press)
+            .await
+        {
+            RouteOutcome::CommitSelection {
+                service_target, ..
+            } => assert_eq!(service_target, "target-B"),
+            other => panic!("expected CommitSelection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rotate_then_press_commits_advanced_candidate() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![selection_mapping()]).await;
+
+        // Enter: cursor jumps to target-B (position 1).
+        let _ = engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Swipe {
+                    direction: Direction::Up,
+                },
+            )
+            .await;
+        // Rotate forward: wraps from B back to A.
+        match engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate { delta: 0.1 },
+            )
+            .await
+        {
+            RouteOutcome::UpdateSelection { glyph, .. } => assert_eq!(glyph, "glyph-a"),
+            other => panic!("expected UpdateSelection, got {:?}", other),
+        }
+        match engine
+            .route_with_mode("nuimo", "C3:81:DF:4E", &InputPrimitive::Press)
+            .await
+        {
+            RouteOutcome::CommitSelection {
+                service_target, ..
+            } => assert_eq!(service_target, "target-A"),
+            other => panic!("expected CommitSelection, got {:?}", other),
+        }
     }
 }
