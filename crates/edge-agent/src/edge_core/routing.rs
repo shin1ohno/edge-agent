@@ -437,9 +437,9 @@ mod tests {
             .route_with_mode("nuimo", "C3:81:DF:4E", &InputPrimitive::Press)
             .await
         {
-            RouteOutcome::CommitSelection {
-                service_target, ..
-            } => assert_eq!(service_target, "target-B"),
+            RouteOutcome::CommitSelection { service_target, .. } => {
+                assert_eq!(service_target, "target-B")
+            }
             other => panic!("expected CommitSelection, got {:?}", other),
         }
     }
@@ -475,9 +475,9 @@ mod tests {
             .route_with_mode("nuimo", "C3:81:DF:4E", &InputPrimitive::Press)
             .await
         {
-            RouteOutcome::CommitSelection {
-                service_target, ..
-            } => assert_eq!(service_target, "target-A"),
+            RouteOutcome::CommitSelection { service_target, .. } => {
+                assert_eq!(service_target, "target-A")
+            }
             other => panic!("expected CommitSelection, got {:?}", other),
         }
     }
