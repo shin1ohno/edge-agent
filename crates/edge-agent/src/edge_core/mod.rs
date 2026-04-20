@@ -12,5 +12,5 @@ pub mod ws_client;
 pub use adapter::{ServiceAdapter, StateUpdate};
 pub use intent::{Direction, InputPrimitive, Intent, TouchArea};
 pub use registry::GlyphRegistry;
-pub use routing::{RoutedIntent, RoutingEngine};
+pub use routing::{RouteOutcome, RoutedIntent, RoutingEngine};
 pub use ws_client::WsClient;

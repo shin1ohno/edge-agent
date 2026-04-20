@@ -307,10 +307,42 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(event) => {
                         let Some(primitive) = translate_nuimo_event(&event) else { continue; };
-                        let routed = engine.route(device_type, &device_id, &primitive).await;
-                        for r in routed {
-                            if let Err(e) = intent_tx.try_send(r) {
-                                tracing::warn!(error = %e, "intent channel full; dropping event");
+                        use edge_core::RouteOutcome;
+                        match engine.route_with_mode(device_type, &device_id, &primitive).await {
+                            RouteOutcome::Normal(routed) => {
+                                for r in routed {
+                                    if let Err(e) = intent_tx.try_send(r) {
+                                        tracing::warn!(error = %e, "intent channel full; dropping event");
+                                    }
+                                }
+                            }
+                            RouteOutcome::EnterSelection { edge_id: _, mapping_id, glyph }
+                            | RouteOutcome::UpdateSelection { mapping_id, glyph } => {
+                                tracing::info!(%mapping_id, %glyph, "target selection: showing candidate");
+                                if let Some(entry) = glyphs.get(&glyph).await {
+                                    let n_glyph = nuimo::Glyph::from_str(&entry.pattern);
+                                    if let Err(e) = device
+                                        .display_glyph(&n_glyph, &DisplayOptions {
+                                            brightness: 1.0,
+                                            timeout_ms: 10_000,
+                                            transition: DisplayTransition::CrossFade,
+                                        })
+                                        .await
+                                    {
+                                        tracing::warn!(error = %e, "failed to push selection glyph");
+                                    }
+                                } else {
+                                    tracing::warn!(%glyph, "selection glyph not in registry — skipping LED push");
+                                }
+                            }
+                            RouteOutcome::CommitSelection { edge_id: _, mapping_id, service_target } => {
+                                tracing::info!(%mapping_id, %service_target, "target selection: committing");
+                                let _ = ws_outbox
+                                    .send(EdgeToServer::SwitchTarget { mapping_id, service_target })
+                                    .await;
+                            }
+                            RouteOutcome::CancelSelection { mapping_id } => {
+                                tracing::info!(%mapping_id, "target selection: cancelled");
                             }
                         }
                     }

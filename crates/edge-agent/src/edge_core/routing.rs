@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use tokio::sync::RwLock;
-use weave_contracts::{Mapping, Route};
+use uuid::Uuid;
+use weave_contracts::{Mapping, Route, TargetCandidate};
 
 use super::intent::{InputPrimitive, Intent};
 
@@ -16,11 +17,71 @@ pub struct RoutedIntent {
     pub intent: Intent,
 }
 
+/// Per-(device_type, device_id) transient state used by target-selection
+/// mode. Keyed off the mapping that declared `target_switch_on`. While
+/// this struct is in `RoutingEngine::selection`, the device has entered
+/// mode: `Rotate` browses `cursor`, `Press` commits, any other input
+/// cancels.
+#[derive(Debug, Clone)]
+pub struct SelectionMode {
+    pub mapping_id: Uuid,
+    pub edge_id: String,
+    pub candidates: Vec<TargetCandidate>,
+    pub cursor: usize,
+}
+
+impl SelectionMode {
+    fn current(&self) -> &TargetCandidate {
+        &self.candidates[self.cursor]
+    }
+    fn advance(&mut self, delta: f64) {
+        let n = self.candidates.len();
+        if n == 0 {
+            return;
+        }
+        let step = if delta >= 0.0 { 1 } else { n - 1 };
+        self.cursor = (self.cursor + step) % n;
+    }
+}
+
+/// One outcome of routing a single input primitive. `Normal` is the
+/// existing "route to zero or more intents" path; the other variants are
+/// target-selection side effects that the caller must translate into LED
+/// feedback or a server-bound `SwitchTarget` frame.
+#[derive(Debug, Clone)]
+pub enum RouteOutcome {
+    Normal(Vec<RoutedIntent>),
+    /// Device just entered selection mode; show `glyph` on the LED.
+    EnterSelection {
+        edge_id: String,
+        mapping_id: Uuid,
+        glyph: String,
+    },
+    /// Device still in selection mode, cursor moved; show `glyph`.
+    UpdateSelection {
+        mapping_id: Uuid,
+        glyph: String,
+    },
+    /// Device committed the selection; caller sends
+    /// `EdgeToServer::SwitchTarget` and optionally clears the LED.
+    CommitSelection {
+        edge_id: String,
+        mapping_id: Uuid,
+        service_target: String,
+    },
+    /// Device exited selection mode without committing (non-rotate/press
+    /// input). Caller should clear any lingering LED feedback.
+    CancelSelection {
+        mapping_id: Uuid,
+    },
+}
+
 /// Thread-safe registry of currently-active mappings, keyed by
 /// `(device_type, device_id)` for O(1) lookup per input event.
 #[derive(Default)]
 pub struct RoutingEngine {
     by_device: RwLock<HashMap<(String, String), Vec<Mapping>>>,
+    selection: RwLock<HashMap<(String, String), SelectionMode>>,
 }
 
 impl RoutingEngine {
@@ -90,29 +151,124 @@ impl RoutingEngine {
         let Some(mappings) = guard.get(&(device_type.to_string(), device_id.to_string())) else {
             return Vec::new();
         };
+        route_mappings(mappings, input)
+    }
 
-        let mut out = Vec::new();
+    /// Same dispatch as `route`, but also implements the target-selection
+    /// state machine (`Mapping.target_switch_on` + `target_candidates`).
+    /// Callers that want on-device target switching should use this
+    /// instead of `route`.
+    pub async fn route_with_mode(
+        &self,
+        device_type: &str,
+        device_id: &str,
+        input: &InputPrimitive,
+    ) -> RouteOutcome {
+        let key = (device_type.to_string(), device_id.to_string());
+
+        // Already in selection mode for this device: intercept rotate /
+        // press / cancel before dispatching to normal routing.
+        {
+            let mut sel = self.selection.write().await;
+            if let Some(mode) = sel.get_mut(&key) {
+                match input {
+                    InputPrimitive::Rotate { delta } => {
+                        mode.advance(*delta);
+                        let glyph = mode.current().glyph.clone();
+                        let mapping_id = mode.mapping_id;
+                        return RouteOutcome::UpdateSelection { mapping_id, glyph };
+                    }
+                    InputPrimitive::Press => {
+                        let mapping_id = mode.mapping_id;
+                        let service_target = mode.current().target.clone();
+                        let edge_id = mode.edge_id.clone();
+                        sel.remove(&key);
+                        return RouteOutcome::CommitSelection {
+                            edge_id,
+                            mapping_id,
+                            service_target,
+                        };
+                    }
+                    _ => {
+                        let mapping_id = mode.mapping_id;
+                        sel.remove(&key);
+                        return RouteOutcome::CancelSelection { mapping_id };
+                    }
+                }
+            }
+        }
+
+        // Not in mode yet: check whether this input should enter mode on
+        // any mapping for this device, else fall through to normal routing.
+        let guard = self.by_device.read().await;
+        let Some(mappings) = guard.get(&key) else {
+            return RouteOutcome::Normal(Vec::new());
+        };
+
         for m in mappings {
             if !m.active {
                 continue;
             }
-            for route in &m.routes {
-                if !input.matches_route(&route.input) {
-                    continue;
-                }
-                if let Some(intent) = build_intent(route, input) {
-                    out.push(RoutedIntent {
-                        service_type: m.service_type.clone(),
-                        service_target: m.service_target.clone(),
-                        intent,
-                    });
-                    // Only first matching route per mapping fires.
-                    break;
-                }
+            let Some(switch_on) = m.target_switch_on.as_deref() else {
+                continue;
+            };
+            if m.target_candidates.is_empty() {
+                continue;
+            }
+            if !input.matches_route(switch_on) {
+                continue;
+            }
+            // Enter mode. Cursor starts at the candidate matching the
+            // current service_target, or 0 if none matches.
+            let cursor = m
+                .target_candidates
+                .iter()
+                .position(|c| c.target == m.service_target)
+                .unwrap_or(0);
+            let mode = SelectionMode {
+                mapping_id: m.mapping_id,
+                edge_id: m.edge_id.clone(),
+                candidates: m.target_candidates.clone(),
+                cursor,
+            };
+            let glyph = mode.current().glyph.clone();
+            let mapping_id = mode.mapping_id;
+            let edge_id = mode.edge_id.clone();
+            drop(guard);
+            self.selection.write().await.insert(key, mode);
+            return RouteOutcome::EnterSelection {
+                edge_id,
+                mapping_id,
+                glyph,
+            };
+        }
+
+        RouteOutcome::Normal(route_mappings(mappings, input))
+    }
+}
+
+fn route_mappings(mappings: &[Mapping], input: &InputPrimitive) -> Vec<RoutedIntent> {
+    let mut out = Vec::new();
+    for m in mappings {
+        if !m.active {
+            continue;
+        }
+        for route in &m.routes {
+            if !input.matches_route(&route.input) {
+                continue;
+            }
+            if let Some(intent) = build_intent(route, input) {
+                out.push(RoutedIntent {
+                    service_type: m.service_type.clone(),
+                    service_target: m.service_target.clone(),
+                    intent,
+                });
+                // Only first matching route per mapping fires.
+                break;
             }
         }
-        out
     }
+    out
 }
 
 fn build_intent(route: &Route, input: &InputPrimitive) -> Option<Intent> {
