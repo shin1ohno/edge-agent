@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.3.1...edge-agent-v0.3.2) - 2026-04-21
+
+### Other
+
+- DHCP-resilient bridge resolution + non-fatal init ([#17](https://github.com/shin1ohno/edge-agent/pull/17))
+
 ## [0.3.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.3.0...edge-agent-v0.3.1) - 2026-04-21
 
 ### Other
