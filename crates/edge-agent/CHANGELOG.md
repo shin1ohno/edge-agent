@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.3.0...edge-agent-v0.3.1) - 2026-04-21
+
+### Other
+
+- move per-host config to XDG, drop committed configs/ ([#16](https://github.com/shin1ohno/edge-agent/pull/16))
+- replay cached state on weave-server reconnect ([#14](https://github.com/shin1ohno/edge-agent/pull/14))
+
 ## [0.3.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.2.0...edge-agent-v0.3.0) - 2026-04-21
 
 ### Other
