@@ -2,9 +2,18 @@
 //! `edge-agent pair-hue`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// `$XDG_STATE_HOME/edge-agent/hue-token.json` (falls back to `$HOME/.local/state`).
+pub fn default_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("edge-agent").join("hue-token.json")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HueToken {
