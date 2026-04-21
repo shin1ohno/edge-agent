@@ -137,36 +137,30 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(adapter)
     };
 
+    // Hue is brought up lazily in a background task so a transient
+    // bridge outage (DHCP lease rotation, bridge reboot, internet down)
+    // doesn't take the whole edge-agent with it. The watch channel lets
+    // the dispatcher see the adapter the moment it appears, and the
+    // bootstrap task owns state-pump spawning so Hue state forwards to
+    // `/ws/edge` as soon as the adapter is online.
     #[cfg(feature = "hue")]
-    let hue_adapter: Option<Arc<dyn ServiceAdapter>> = match cfg.hue.as_ref() {
-        Some(hue_cfg) => {
-            let path = hue_cfg
-                .token_path
-                .clone()
-                .unwrap_or_else(hue_token::default_path);
-            match hue_token::load(&path) {
-                Ok(creds) => {
-                    let adapter = HueAdapter::start(HueConfig {
-                        host: creds.host,
-                        app_key: creds.app_key,
-                    })
-                    .await?;
-                    Some(Arc::new(adapter))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        path = %path.display(),
-                        "hue token load failed — hue adapter disabled (run `edge-agent pair-hue` to create one)",
-                    );
-                    None
-                }
+    let hue_adapter_rx: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>> = {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        match cfg.hue.as_ref() {
+            Some(hue_cfg) => {
+                let path = hue_cfg
+                    .token_path
+                    .clone()
+                    .unwrap_or_else(hue_token::default_path);
+                let outbox = ws_outbox.clone();
+                let resync = ws_resync.clone();
+                tokio::spawn(run_hue_bootstrap(path, tx, outbox, resync));
+            }
+            None => {
+                tracing::info!("no [hue] section in config — hue adapter disabled");
             }
         }
-        None => {
-            tracing::info!("no [hue] section in config — hue adapter disabled");
-            None
-        }
+        rx
     };
 
     // nuimo.skip lets an edge run as a WS-only witness (dashboard / hub
@@ -182,14 +176,10 @@ async fn main() -> anyhow::Result<()> {
             ws_resync.subscribe(),
         );
 
+        // Hue state pump is spawned from inside `run_hue_bootstrap` when
+        // the adapter first comes online, so nothing to do here.
         #[cfg(feature = "hue")]
-        if let Some(adapter) = &hue_adapter {
-            spawn_state_pump(
-                adapter.subscribe_state(),
-                ws_outbox.clone(),
-                ws_resync.subscribe(),
-            );
-        }
+        let _ = &hue_adapter_rx;
 
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down");
@@ -281,16 +271,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    #[cfg(feature = "hue")]
-    if let Some(adapter) = &hue_adapter {
-        // Hue state flows straight to the WS outbox — no glyph feedback for
-        // now, the lights themselves carry the visible confirmation.
-        spawn_state_pump(
-            adapter.subscribe_state(),
-            ws_outbox.clone(),
-            ws_resync.subscribe(),
-        );
-    }
+    // Hue state pump is spawned from `run_hue_bootstrap` when the adapter
+    // first comes online; no glyph feedback for Hue — the lights
+    // themselves carry the visible confirmation.
 
     // Dispatch pipeline. Each (service_type, service_target) gets a dedicated
     // worker task that serializes RPCs for that target: one RPC in flight at
@@ -304,7 +287,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "roon")]
         roon_adapter.clone(),
         #[cfg(feature = "hue")]
-        hue_adapter.clone(),
+        hue_adapter_rx.clone(),
     ));
 
     // Input pump: Nuimo BLE events → routing → coalescer.
@@ -404,12 +387,68 @@ async fn reconnect_nuimo(device: &Arc<NuimoDevice>) {
     }
 }
 
+/// Resolve the Hue bridge and start its adapter, retrying indefinitely
+/// with exponential backoff if the bridge is unreachable. On success,
+/// publishes the adapter into the watch channel so the dispatcher picks
+/// it up, and spawns the state pump so Hue updates flow to `/ws/edge`.
+#[cfg(feature = "hue")]
+async fn run_hue_bootstrap(
+    token_path: PathBuf,
+    tx: tokio::sync::watch::Sender<Option<Arc<dyn ServiceAdapter>>>,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    resync: tokio::sync::broadcast::Sender<()>,
+) {
+    let mut delay = Duration::from_secs(0);
+    let cap = Duration::from_secs(300);
+    let mut attempt: u32 = 0;
+    loop {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        attempt += 1;
+        match try_hue_init(&token_path).await {
+            Ok(adapter) => {
+                let arc: Arc<dyn ServiceAdapter> = Arc::new(adapter);
+                tracing::info!(attempt, "hue adapter online");
+                spawn_state_pump(arc.subscribe_state(), outbox.clone(), resync.subscribe());
+                let _ = tx.send(Some(arc));
+                return;
+            }
+            Err(e) => {
+                delay = if delay.is_zero() {
+                    Duration::from_secs(30)
+                } else {
+                    (delay * 2).min(cap)
+                };
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    next_retry_secs = delay.as_secs(),
+                    "hue adapter init failed — retrying in background",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "hue")]
+async fn try_hue_init(token_path: &std::path::Path) -> anyhow::Result<HueAdapter> {
+    let mut token = hue_token::load(token_path)?;
+    let source = adapter_hue::resolve_bridge(&mut token, token_path).await?;
+    tracing::debug!(?source, host = %token.host, "hue bridge resolution complete");
+    HueAdapter::start(HueConfig {
+        host: token.host.clone(),
+        app_key: token.app_key.clone(),
+    })
+    .await
+}
+
 /// Fan incoming `RoutedIntent`s out to per-target workers, spawning a new
 /// worker the first time we see a given `(service_type, target)` pair.
 async fn run_dispatcher(
     mut rx: tokio::sync::mpsc::Receiver<RoutedIntent>,
     #[cfg(feature = "roon")] roon: Arc<dyn ServiceAdapter>,
-    #[cfg(feature = "hue")] hue: Option<Arc<dyn ServiceAdapter>>,
+    #[cfg(feature = "hue")] hue: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
 ) {
     let mut workers: HashMap<(String, String), tokio::sync::mpsc::Sender<Intent>> = HashMap::new();
 
@@ -421,7 +460,7 @@ async fn run_dispatcher(
                 #[cfg(feature = "roon")]
                 "roon" => Some(roon.clone()),
                 #[cfg(feature = "hue")]
-                "hue" => hue.clone(),
+                "hue" => hue.borrow().clone(),
                 _ => None,
             };
             let Some(adapter) = adapter else {

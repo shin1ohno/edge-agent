@@ -21,6 +21,12 @@ pub struct HueToken {
     pub app_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
+    /// Stable bridge identifier (MAC-derived, e.g. `001788fffe27334e`).
+    /// Persisted so we can re-resolve the bridge's current IP via mDNS or
+    /// cloud discovery after a DHCP lease change without re-pairing.
+    /// `None` on tokens written by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_id: Option<String>,
 }
 
 pub fn load(path: &Path) -> anyhow::Result<HueToken> {
