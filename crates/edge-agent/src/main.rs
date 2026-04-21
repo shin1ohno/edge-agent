@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
         glyphs.clone(),
     );
     let ws_outbox = ws_client.outbox();
+    let ws_resync = ws_client.resync_sender();
 
     if let Err(e) = ws_client.prime_from_cache().await {
         tracing::warn!(error = %e, "failed to prime from config cache");
@@ -171,11 +172,19 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
 
         #[cfg(feature = "roon")]
-        spawn_state_pump(roon_adapter.subscribe_state(), ws_outbox.clone());
+        spawn_state_pump(
+            roon_adapter.subscribe_state(),
+            ws_outbox.clone(),
+            ws_resync.subscribe(),
+        );
 
         #[cfg(feature = "hue")]
         if let Some(adapter) = &hue_adapter {
-            spawn_state_pump(adapter.subscribe_state(), ws_outbox.clone());
+            spawn_state_pump(
+                adapter.subscribe_state(),
+                ws_outbox.clone(),
+                ws_resync.subscribe(),
+            );
         }
 
         tokio::signal::ctrl_c().await?;
@@ -230,10 +239,21 @@ async fn main() -> anyhow::Result<()> {
     // here we only need to throttle BLE-bound writes. Feedback LED writes
     // share the Nuimo's single BLE connection with rotate notifications —
     // volume bar renders are limited to ~10 Hz so the gesture stays smooth.
+    //
+    // WS-forward and local glyph feedback subscribe to the same adapter
+    // broadcast independently: WS-forward goes through `spawn_state_pump`
+    // (which handles replay-on-reconnect so weave-server recovers its full
+    // snapshot after a restart), and feedback runs on its own task so a
+    // stall on the BLE write side can't block outbound WS frames.
     #[cfg(feature = "roon")]
     {
+        spawn_state_pump(
+            roon_adapter.subscribe_state(),
+            ws_outbox.clone(),
+            ws_resync.subscribe(),
+        );
+
         let mut state_rx = roon_adapter.subscribe_state();
-        let outbox = ws_outbox.clone();
         let dev = device.clone();
         let glyphs_for_feedback = glyphs.clone();
         tokio::spawn(async move {
@@ -241,15 +261,6 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 match state_rx.recv().await {
                     Ok(update) => {
-                        let frame = EdgeToServer::State {
-                            service_type: update.service_type.clone(),
-                            target: update.target.clone(),
-                            property: update.property.clone(),
-                            output_id: update.output_id.clone(),
-                            value: update.value.clone(),
-                        };
-                        let _ = outbox.send(frame).await;
-
                         if let Some(plan) = FeedbackPlan::from(&update) {
                             let sig = plan.signature();
                             if filter.should_render(&update, &sig) {
@@ -270,7 +281,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(adapter) = &hue_adapter {
         // Hue state flows straight to the WS outbox — no glyph feedback for
         // now, the lights themselves carry the visible confirmation.
-        spawn_state_pump(adapter.subscribe_state(), ws_outbox.clone());
+        spawn_state_pump(
+            adapter.subscribe_state(),
+            ws_outbox.clone(),
+            ws_resync.subscribe(),
+        );
     }
 
     // Dispatch pipeline. Each (service_type, service_target) gets a dedicated
@@ -468,23 +483,56 @@ fn push_merged(pending: &mut Vec<Intent>, intent: Intent) {
 fn spawn_state_pump(
     mut state_rx: tokio::sync::broadcast::Receiver<StateUpdate>,
     outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    mut resync_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     tokio::spawn(async move {
+        // Last-write-wins cache keyed by
+        // (service_type, target, property, output_id). Replayed on every
+        // ws reconnect so weave-server recovers its full snapshot after a
+        // restart even when the downstream adapter hasn't seen any state
+        // change since the last connection — otherwise idle zones / lights
+        // stay missing from the UI until they happen to change.
+        let mut last: std::collections::HashMap<
+            (String, String, String, Option<String>),
+            EdgeToServer,
+        > = std::collections::HashMap::new();
         loop {
-            match state_rx.recv().await {
-                Ok(update) => {
-                    let frame = EdgeToServer::State {
-                        service_type: update.service_type,
-                        target: update.target,
-                        property: update.property,
-                        output_id: update.output_id,
-                        value: update.value,
-                    };
-                    let _ = outbox.send(frame).await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(skipped = n, "adapter state lag");
+            tokio::select! {
+                res = state_rx.recv() => match res {
+                    Ok(update) => {
+                        let frame = EdgeToServer::State {
+                            service_type: update.service_type.clone(),
+                            target: update.target.clone(),
+                            property: update.property.clone(),
+                            output_id: update.output_id.clone(),
+                            value: update.value,
+                        };
+                        let key = (
+                            update.service_type,
+                            update.target,
+                            update.property,
+                            update.output_id,
+                        );
+                        last.insert(key, frame.clone());
+                        let _ = outbox.send(frame).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "adapter state lag");
+                    }
+                },
+                // Lagged/Closed on the resync channel are non-fatal — keep
+                // the state pump alive and keep forwarding fresh updates.
+                res = resync_rx.recv() => {
+                    if let Ok(()) = res {
+                        tracing::info!(
+                            n = last.len(),
+                            "ws reconnect — replaying cached state",
+                        );
+                        for frame in last.values() {
+                            let _ = outbox.send(frame.clone()).await;
+                        }
+                    }
                 }
             }
         }

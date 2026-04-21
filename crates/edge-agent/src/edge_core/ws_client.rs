@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
@@ -34,6 +34,7 @@ pub struct WsClient {
     cache_path: PathBuf,
     outbox_rx: mpsc::Receiver<EdgeToServer>,
     outbox_tx: mpsc::Sender<EdgeToServer>,
+    resync_tx: broadcast::Sender<()>,
 }
 
 impl WsClient {
@@ -47,6 +48,9 @@ impl WsClient {
     ) -> Self {
         let cache_path = cache::default_cache_path(&edge_id);
         let (outbox_tx, outbox_rx) = mpsc::channel(256);
+        // Small buffer is fine — subscribers only care about the latest
+        // reconnect event; lagged ones can be dropped silently.
+        let (resync_tx, _) = broadcast::channel(8);
         Self {
             url,
             edge_id,
@@ -57,6 +61,7 @@ impl WsClient {
             cache_path,
             outbox_rx,
             outbox_tx,
+            resync_tx,
         }
     }
 
@@ -64,6 +69,18 @@ impl WsClient {
     /// as needed; adapters publish state updates via this channel.
     pub fn outbox(&self) -> mpsc::Sender<EdgeToServer> {
         self.outbox_tx.clone()
+    }
+
+    /// Clone the `ws/edge` (re)connect broadcaster. Fires once per
+    /// successful connect + Hello exchange. State-pumps subscribe to this
+    /// and replay the most recent frame per
+    /// (service_type, target, property, output_id) key so weave-server
+    /// recovers its full snapshot after a restart — otherwise idle zones
+    /// / lights that haven't changed since the last connect disappear
+    /// from the UI because the adapter's source-side dedup suppresses
+    /// re-sends.
+    pub fn resync_sender(&self) -> broadcast::Sender<()> {
+        self.resync_tx.clone()
     }
 
     /// Populate the routing engine + glyph registry from the local cache, if
@@ -112,6 +129,11 @@ impl WsClient {
         };
         tx.send(Message::Text(serde_json::to_string(&hello)?))
             .await?;
+
+        // Fire after the Hello is on the wire so subscribers replay only
+        // once the server is ready to accept frames. `Err` here just means
+        // no live subscribers yet, which is fine.
+        let _ = self.resync_tx.send(());
 
         loop {
             tokio::select! {
