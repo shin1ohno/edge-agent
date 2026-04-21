@@ -53,6 +53,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         host: creds.host,
         app_key: creds.app_key,
         client_key: creds.client_key,
+        bridge_id: creds.bridge_id,
     };
     save(&out, &token)?;
     tracing::info!(path = %out.display(), "hue token saved");

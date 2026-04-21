@@ -26,13 +26,18 @@ struct PairSuccess {
 }
 
 /// Paired credentials returned by `pair()`. Persist as JSON alongside the
-/// bridge host so the caller can reconnect later.
+/// bridge host so the caller can reconnect later. `bridge_id` is fetched
+/// via the unauthenticated `/api/config` endpoint immediately after
+/// pairing so the token has a stable identifier for DHCP-resilient
+/// reconnect later.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PairedCredentials {
     pub host: String,
     pub app_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_id: Option<String>,
 }
 
 pub async fn pair(
@@ -57,10 +62,26 @@ pub async fn pair(
                 let entries: Vec<PairEntry> = res.json().await?;
                 if let Some(entry) = entries.into_iter().next() {
                     if let Some(s) = entry.success {
+                        let bridge_id = super::api::fetch_bridge_config(
+                            host,
+                            Duration::from_secs(5),
+                        )
+                        .await
+                        .map(|cfg| cfg.bridge_id.to_ascii_lowercase())
+                        .map_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                host,
+                                "paired but failed to fetch /api/config for bridge_id; token will be written without it",
+                            );
+                            e
+                        })
+                        .ok();
                         return Ok(PairedCredentials {
                             host: host.to_string(),
                             app_key: s.username,
                             client_key: s.clientkey,
+                            bridge_id,
                         });
                     }
                     if let Some(e) = entry.error {

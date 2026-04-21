@@ -31,8 +31,9 @@ roon-api = { version = "0.5.1", optional = true }
 # Feature-gated: hue adapter
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"], optional = true }
 bytes = { version = "1", optional = true }
+mdns-sd = { version = "0.11", optional = true }
 
 [features]
 default = ["roon"]
 roon = ["dep:roon-api"]
-hue = ["dep:reqwest", "dep:bytes"]
+hue = ["dep:reqwest", "dep:bytes", "dep:mdns-sd"]

@@ -3,11 +3,47 @@
 //! The bridge serves a self-signed cert — `danger_accept_invalid_certs(true)`
 //! is the Philips-accepted pattern for LAN clients.
 
+use std::time::Duration;
+
 use reqwest::{Client, ClientBuilder};
+use serde::Deserialize;
 
 use super::types::{Light, LightUpdate, LightsResponse};
 
 const TIMEOUT_SECS: u64 = 10;
+
+/// Minimal subset of the legacy `GET /api/config` response. Unauthenticated
+/// (the Hue bridge exposes `bridgeid` and a few other identifying fields
+/// to any LAN peer so clients can confirm which bridge they're talking to
+/// before pairing).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BridgeConfig {
+    #[serde(alias = "bridgeid")]
+    pub bridge_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub mac: Option<String>,
+}
+
+/// Fetch `/api/config` on `host` with a bounded timeout. Used as a
+/// reachability probe at startup and to learn the `bridgeid` for tokens
+/// written by older versions. Does not require an app key.
+pub async fn fetch_bridge_config(host: &str, timeout: Duration) -> anyhow::Result<BridgeConfig> {
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .timeout(timeout)
+        .build()?;
+    let url = format!("https://{host}/api/config");
+    let res = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<BridgeConfig>()
+        .await?;
+    Ok(res)
+}
 
 #[derive(Clone)]
 pub struct HueClient {
