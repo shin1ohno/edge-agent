@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.2.0...edge-agent-v0.3.0) - 2026-04-21
+
+### Other
+
+- mark digit_pair + DIGIT_3X5 as allow(dead_code) until wired
+- parametric digit_pair(n: u8) renderer for live number display
+- rustfmt collapse CommitSelection arms in tests
+- top-down fill for dB zones (max=0), fix clipping to 0
+- target selection: enter mode pointing at NEXT candidate, not current
+- target selection runtime: SelectionMode state machine + SwitchTarget uplink
+
 ## [0.2.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.1.0...edge-agent-v0.2.0) - 2026-04-20
 
 ### Other
