@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::adapter_hue::{discover, pair, DiscoveredBridge};
 
-use crate::hue_token::{save, HueToken};
+use crate::hue_token::{default_path as default_token_path, save, HueToken};
 
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut host: Option<String> = None;
@@ -79,14 +79,6 @@ async fn pick_bridge() -> anyhow::Result<String> {
             );
         }
     }
-}
-
-fn default_token_path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("edge-agent").join("hue-token.json")
 }
 
 fn print_help() {

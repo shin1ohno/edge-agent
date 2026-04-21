@@ -13,8 +13,10 @@ pub struct Config {
     pub roon: RoonSection,
     #[serde(default)]
     pub nuimo: NuimoSection,
-    #[serde(default)]
-    pub hue: HueSection,
+    /// `None` when the `[hue]` section is absent from TOML — Hue adapter stays
+    /// disabled. `Some(_)` with an empty body enables Hue with the default
+    /// XDG_STATE_HOME token path.
+    pub hue: Option<HueSection>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -42,8 +44,9 @@ pub struct NuimoSection {
 pub struct HueSection {
     /// Path to the JSON token file written by `edge-agent pair-hue`.
     /// Expected shape: `{"host": "...", "app_key": "...", "client_key": "..."}`.
-    /// If this file is missing, the Hue adapter stays disabled at runtime
-    /// even when the `hue` Cargo feature is on.
+    /// When omitted, defaults to `$XDG_STATE_HOME/edge-agent/hue-token.json`.
+    /// If the resolved file is missing or unreadable, the Hue adapter logs a
+    /// warning and stays disabled at runtime.
     pub token_path: Option<PathBuf>,
 }
 
@@ -78,7 +81,8 @@ impl Config {
             self.nuimo.skip = matches!(v.as_str(), "1" | "true" | "yes");
         }
         if let Ok(v) = std::env::var("EDGE_AGENT_HUE_TOKEN_PATH") {
-            self.hue.token_path = Some(PathBuf::from(v));
+            let hue = self.hue.get_or_insert_with(HueSection::default);
+            hue.token_path = Some(PathBuf::from(v));
         }
     }
 }

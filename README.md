@@ -50,17 +50,40 @@ sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
 
 **macOS**: no extra packages. CoreBluetooth is system-provided. First interactive run will trigger the Bluetooth permission dialog — approve in System Settings → Privacy & Security → Bluetooth.
 
+## Config locations
+
+edge-agent separates **code** (this repo) from **per-host config** (never committed here) from **runtime state** (tokens, caches).
+
+| Layer | Path | Managed by |
+|---|---|---|
+| Template | `docs/config-example.toml` in this repo | git |
+| Per-host config | `$XDG_CONFIG_HOME/edge-agent/config.toml` (default `~/.config/edge-agent/config.toml`), or `/etc/edge-agent/config.toml` | you (or a config-management tool like mitamae) |
+| Runtime state | `$XDG_STATE_HOME/edge-agent/` — Roon token, Hue token, offline config cache | agent at runtime |
+
+Config path precedence at startup:
+
+1. CLI positional argument: `edge-agent /path/to/config.toml`
+2. `EDGE_AGENT_CONFIG` environment variable
+3. `$XDG_CONFIG_HOME/edge-agent/config.toml` (falls back to `~/.config/edge-agent/config.toml`)
+4. `/etc/edge-agent/config.toml`
+
+If none exist, the agent exits with the list of paths it searched.
+
+Any field in the TOML can be overridden at runtime with `EDGE_AGENT_*` env vars (e.g. `EDGE_AGENT_EDGE_ID`, `EDGE_AGENT_ROON_HOST`).
+
 ## Running (Linux)
 
 Native — not Docker (BLE needs host bluez/D-Bus).
 
 ```sh
-EDGE_AGENT_EDGE_ID=living-room \
-  EDGE_AGENT_CONFIG_SERVER_URL=ws://weave-host:3101/ws/edge \
-  EDGE_AGENT_ROON_HOST=192.168.1.20 \
-  EDGE_AGENT_ROON_PORT=9330 \
-  RUST_LOG=info \
-  edge-agent configs/example.toml
+# One-time: drop the config template in the XDG location and edit it.
+mkdir -p ~/.config/edge-agent
+curl -L https://raw.githubusercontent.com/shin1ohno/edge-agent/main/docs/config-example.toml \
+  -o ~/.config/edge-agent/config.toml
+$EDITOR ~/.config/edge-agent/config.toml
+
+# Run.
+RUST_LOG=info edge-agent
 ```
 
 First-time: approve the extension in Roon → Settings → Extensions. The token is persisted at `~/.local/state/edge-agent/roon-token-${edge_id}.json` and survives restarts.
@@ -80,15 +103,18 @@ rustup default stable
 # Install
 cargo install edge-agent --features hue
 
-# Pair your Hue bridge (one-time)
+# Drop the config template in the XDG location and edit it.
+mkdir -p ~/.config/edge-agent
+curl -L https://raw.githubusercontent.com/shin1ohno/edge-agent/main/docs/config-example.toml \
+  -o ~/.config/edge-agent/config.toml
+$EDITOR ~/.config/edge-agent/config.toml   # enable [hue] if you want Philips Hue
+
+# Pair your Hue bridge (one-time). Token lands at
+# ~/.local/state/edge-agent/hue-token.json by default.
 edge-agent pair-hue
 
-# First interactive run — macOS will ask for Bluetooth permission
-EDGE_AGENT_EDGE_ID=mac-living \
-  EDGE_AGENT_CONFIG_SERVER_URL=ws://weave.lan:3101/ws/edge \
-  EDGE_AGENT_ROON_HOST=192.168.1.20 EDGE_AGENT_ROON_PORT=9330 \
-  EDGE_AGENT_HUE_TOKEN_PATH="$HOME/Library/Application Support/edge-agent/hue-token.json" \
-  edge-agent configs/example.toml
+# First interactive run — macOS will ask for Bluetooth permission.
+RUST_LOG=info edge-agent
 # → macOS prompts "edge-agent would like to use Bluetooth" the first time.
 #   Approve in System Settings > Privacy & Security > Bluetooth.
 

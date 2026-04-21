@@ -59,9 +59,7 @@ async fn main() -> anyhow::Result<()> {
         return pair_hue::run(&remaining).await;
     }
 
-    let config_path = first
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("configs/example.toml"));
+    let config_path = resolve_config_path(first.as_deref())?;
     let cfg = config::Config::load(&config_path)?;
     tracing::info!(
         edge_id = %cfg.edge_id,
@@ -140,27 +138,33 @@ async fn main() -> anyhow::Result<()> {
     };
 
     #[cfg(feature = "hue")]
-    let hue_adapter: Option<Arc<dyn ServiceAdapter>> = match cfg.hue.token_path.as_ref() {
-        Some(path) => match hue_token::load(path) {
-            Ok(creds) => {
-                let adapter = HueAdapter::start(HueConfig {
-                    host: creds.host,
-                    app_key: creds.app_key,
-                })
-                .await?;
-                Some(Arc::new(adapter))
+    let hue_adapter: Option<Arc<dyn ServiceAdapter>> = match cfg.hue.as_ref() {
+        Some(hue_cfg) => {
+            let path = hue_cfg
+                .token_path
+                .clone()
+                .unwrap_or_else(hue_token::default_path);
+            match hue_token::load(&path) {
+                Ok(creds) => {
+                    let adapter = HueAdapter::start(HueConfig {
+                        host: creds.host,
+                        app_key: creds.app_key,
+                    })
+                    .await?;
+                    Some(Arc::new(adapter))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "hue token load failed — hue adapter disabled (run `edge-agent pair-hue` to create one)",
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "hue token load failed — hue adapter disabled (run `edge-agent pair-hue` to create one)",
-                );
-                None
-            }
-        },
+        }
         None => {
-            tracing::info!("no [hue] token_path configured — hue adapter disabled");
+            tracing::info!("no [hue] section in config — hue adapter disabled");
             None
         }
     };
@@ -749,4 +753,47 @@ fn default_roon_token_path(edge_id: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("edge-agent")
         .join(format!("roon-token-{}.json", edge_id))
+}
+
+/// Resolve the bootstrap config path. Precedence:
+///   1. CLI positional argument
+///   2. `EDGE_AGENT_CONFIG` env var
+///   3. `$XDG_CONFIG_HOME/edge-agent/config.toml` (or `$HOME/.config/edge-agent/config.toml`)
+///   4. `/etc/edge-agent/config.toml`
+///
+/// If none of the candidate paths exist, returns an error listing what was searched.
+fn resolve_config_path(cli: Option<&str>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = cli {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(env_val) = std::env::var_os("EDGE_AGENT_CONFIG") {
+        return Ok(PathBuf::from(env_val));
+    }
+
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|base| base.join("edge-agent").join("config.toml"));
+    let etc = PathBuf::from("/etc/edge-agent/config.toml");
+
+    let mut searched: Vec<PathBuf> = Vec::new();
+    if let Some(ref p) = xdg {
+        if p.is_file() {
+            return Ok(p.clone());
+        }
+        searched.push(p.clone());
+    }
+    if etc.is_file() {
+        return Ok(etc);
+    }
+    searched.push(etc);
+
+    let lines: Vec<String> = searched
+        .iter()
+        .map(|p| format!("  - {}", p.display()))
+        .collect();
+    anyhow::bail!(
+        "no edge-agent config found. Searched:\n  - $EDGE_AGENT_CONFIG (unset)\n{}\nSee docs/config-example.toml in the edge-agent repository for a template.",
+        lines.join("\n")
+    );
 }

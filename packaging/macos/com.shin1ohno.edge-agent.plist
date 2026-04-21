@@ -5,12 +5,16 @@
 
   Before using:
     1. Replace every "__USER__" with your short Unix username.
-    2. Adjust __BINARY__ and __CONFIG__ paths if you installed elsewhere.
-    3. Fill in EDGE_AGENT_* env vars with real host / IDs.
-    4. First run should be interactive so macOS can raise the Bluetooth
+    2. Adjust the binary path if you installed elsewhere.
+    3. Place your config at ~/.config/edge-agent/config.toml
+       (copy docs/config-example.toml from the repo and edit).
+    4. Fill in EDGE_AGENT_* env vars to override config values at runtime.
+    5. First run should be interactive so macOS can raise the Bluetooth
        permission prompt once; after that launchctl-loaded runs are allowed.
 
   Usage:
+    mkdir -p ~/.config/edge-agent
+    cp docs/config-example.toml ~/.config/edge-agent/config.toml  # then edit
     cp com.shin1ohno.edge-agent.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/com.shin1ohno.edge-agent.plist
     # unload:
@@ -24,7 +28,6 @@
   <key>ProgramArguments</key>
   <array>
     <string>/Users/__USER__/ManagedProjects/edge-agent/target/release/edge-agent</string>
-    <string>/Users/__USER__/ManagedProjects/edge-agent/configs/example.toml</string>
   </array>
 
   <key>EnvironmentVariables</key>
