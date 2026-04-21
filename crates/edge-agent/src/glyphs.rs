@@ -10,6 +10,7 @@ use nuimo::Glyph;
 /// `*` = on, `.` = off. Kept in sync with `weave-server`'s font module so
 /// a programmatically-rendered digit pair looks identical to the seeded
 /// "00".."99" named glyphs on the LED.
+#[allow(dead_code)] // consumed by digit_pair() + tests; runtime caller landing in a follow-up FeedbackPlan wiring
 #[rustfmt::skip]
 const DIGIT_3X5: [[&str; 5]; 10] = [
     ["***", "*.*", "*.*", "*.*", "***"], // 0
@@ -29,6 +30,7 @@ const DIGIT_3X5: [[&str; 5]; 10] = [
 /// 9x9 grid. Use this to surface live numeric state on the LED — set
 /// temperature, timer value, etc. — without needing a dedicated named
 /// glyph per value.
+#[allow(dead_code)] // runtime caller lands with the upcoming FeedbackPlan::Number wiring
 pub fn digit_pair(n: u8) -> Glyph {
     let n = n.min(99);
     let hi = (n / 10) as usize;
