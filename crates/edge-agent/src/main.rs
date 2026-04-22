@@ -266,42 +266,50 @@ async fn main() -> anyhow::Result<()> {
             ws_resync.subscribe(),
         );
 
-        let mut state_rx = roon_adapter.subscribe_state();
+        tokio::spawn(run_feedback_pump(
+            roon_adapter.subscribe_state(),
+            device.clone(),
+            glyphs.clone(),
+            engine.clone(),
+        ));
+    }
+
+    // Hue feedback pump: `run_hue_bootstrap` flips the watch channel to
+    // `Some(adapter)` the first time the bridge becomes reachable. Until
+    // then the pump is idle; once the adapter appears, it subscribes to
+    // its state broadcast and runs the same feedback loop as Roon so
+    // e.g. a Hue brightness change renders on the Nuimo LED.
+    //
+    // Gated on both features: `run_feedback_pump` and `FeedbackPlan` live
+    // under `feature = "roon"` today because that was the original
+    // consumer. Default production builds enable `roon` + `hue`, so in
+    // practice this block is always active; a `--no-default-features
+    // --features hue` build intentionally loses the feedback pump (no
+    // cross-feature plumbing for a niche config).
+    #[cfg(all(feature = "roon", feature = "hue"))]
+    {
         let dev = device.clone();
         let glyphs_for_feedback = glyphs.clone();
         let engine_for_feedback = engine.clone();
+        let mut hue_rx_watch = hue_adapter_rx.clone();
         tokio::spawn(async move {
-            let mut filter = FeedbackFilter::new();
-            loop {
-                match state_rx.recv().await {
-                    Ok(update) => {
-                        // Consult mapping-level feedback rules first — they
-                        // let a user override e.g. the "paused" glyph per
-                        // target from the weave-web UI. Hardcoded defaults
-                        // apply when no rule matches (preserves behavior
-                        // for deployments that never populated `feedback`).
-                        let rules = engine_for_feedback
-                            .feedback_rules_for_target(&update.service_type, &update.target)
-                            .await;
-                        if let Some(plan) = FeedbackPlan::resolve(&update, &rules) {
-                            let sig = plan.signature();
-                            if filter.should_render(&update, &sig) {
-                                plan.execute(&dev, &glyphs_for_feedback).await;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "adapter state lag");
-                    }
+            let adapter = loop {
+                if let Some(a) = hue_rx_watch.borrow().clone() {
+                    break a;
                 }
-            }
+                if hue_rx_watch.changed().await.is_err() {
+                    return;
+                }
+            };
+            run_feedback_pump(
+                adapter.subscribe_state(),
+                dev,
+                glyphs_for_feedback,
+                engine_for_feedback,
+            )
+            .await;
         });
     }
-
-    // Hue state pump is spawned from `run_hue_bootstrap` when the adapter
-    // first comes online; no glyph feedback for Hue — the lights
-    // themselves carry the visible confirmation.
 
     // Dispatch pipeline. Each (service_type, service_target) gets a dedicated
     // worker task that serializes RPCs for that target: one RPC in flight at
@@ -576,6 +584,49 @@ fn push_merged(pending: &mut Vec<Intent>, intent: Intent) {
             *a += *b
         }
         _ => pending.push(intent),
+    }
+}
+
+/// Nuimo LED feedback loop. Subscribes to an adapter's state broadcast
+/// (Roon or Hue today), consults mapping-level `feedback` rules with
+/// hardcoded fallback, and pushes the resulting glyph/bar to the Nuimo
+/// — deduped by the rendered signature so identical frames don't
+/// monopolise the BLE write side.
+///
+/// Exits when the upstream broadcast closes. Lag events are logged and
+/// the pump keeps running — a transient spike shouldn't wedge feedback
+/// for the rest of the session.
+#[cfg(feature = "roon")]
+async fn run_feedback_pump(
+    mut state_rx: tokio::sync::broadcast::Receiver<StateUpdate>,
+    device: Arc<NuimoDevice>,
+    glyphs: Arc<GlyphRegistry>,
+    engine: Arc<RoutingEngine>,
+) {
+    let mut filter = FeedbackFilter::new();
+    loop {
+        match state_rx.recv().await {
+            Ok(update) => {
+                // Consult mapping-level feedback rules first — they let
+                // a user override e.g. the "paused" glyph per target
+                // from the weave-web UI. Hardcoded defaults apply when
+                // no rule matches (preserves behavior for deployments
+                // that never populated `feedback`).
+                let rules = engine
+                    .feedback_rules_for_target(&update.service_type, &update.target)
+                    .await;
+                if let Some(plan) = FeedbackPlan::resolve(&update, &rules) {
+                    let sig = plan.signature();
+                    if filter.should_render(&update, &sig) {
+                        plan.execute(&device, &glyphs).await;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "adapter state lag");
+            }
+        }
     }
 }
 
