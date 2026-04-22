@@ -10,7 +10,13 @@ use serde::Deserialize;
 
 use super::types::{Light, LightUpdate, LightsResponse};
 
-const TIMEOUT_SECS: u64 = 10;
+// Applies to REST calls *and* the SSE bytes stream (shared `Client`). The
+// Hue bridge emits SSE keepalive comments every ~9s; at 10s the stream was
+// timing out within one keepalive window on any brief network delay,
+// producing a perpetual 10s connect → "error decoding response body" →
+// reconnect loop. 20s gives ~2x the keepalive interval of slack while
+// still surfacing a genuinely dead connection in a bounded time.
+const TIMEOUT_SECS: u64 = 20;
 
 /// Minimal subset of the legacy `GET /api/config` response. Unauthenticated
 /// (the Hue bridge exposes `bridgeid` and a few other identifying fields

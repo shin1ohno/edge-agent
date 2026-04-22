@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use weave_contracts::{Mapping, Route, TargetCandidate};
+use weave_contracts::{FeedbackRule, Mapping, Route, TargetCandidate};
 
 use super::intent::{InputPrimitive, Intent};
 
@@ -137,6 +137,37 @@ impl RoutingEngine {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Feedback rules attached to whichever mapping covers the given
+    /// `(service_type, target)` — either as its primary target or as a
+    /// listed candidate (including candidates that override the mapping's
+    /// `service_type`). Returns an empty vec when no mapping covers the
+    /// target, letting the caller fall back to hardcoded defaults.
+    ///
+    /// Feedback is stored at the mapping level (all candidates share one
+    /// rule set), so a candidate match still returns the mapping's
+    /// `feedback`.
+    pub async fn feedback_rules_for_target(
+        &self,
+        service_type: &str,
+        target: &str,
+    ) -> Vec<FeedbackRule> {
+        let guard = self.by_device.read().await;
+        for list in guard.values() {
+            for m in list {
+                if m.service_type == service_type && m.service_target == target {
+                    return m.feedback.clone();
+                }
+                for c in &m.target_candidates {
+                    let c_service_type = c.service_type.as_deref().unwrap_or(&m.service_type);
+                    if c_service_type == service_type && c.target == target {
+                        return m.feedback.clone();
+                    }
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Apply the given input primitive from a specific device, returning every
@@ -564,5 +595,65 @@ mod tests {
             }
             other => panic!("expected CommitSelection, got {:?}", other),
         }
+    }
+
+    fn playback_glyph_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: serde_json::json!({
+                "playing": "play",
+                "paused": "pause",
+                "stopped": "pause",
+            }),
+        }
+    }
+
+    fn mapping_with_feedback() -> Mapping {
+        let mut m = rotate_mapping();
+        m.feedback = vec![playback_glyph_rule()];
+        m
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_match_primary_target() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![mapping_with_feedback()]).await;
+
+        let rules = engine.feedback_rules_for_target("roon", "zone-1").await;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].state, "playback");
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_match_candidate_override_service_type() {
+        let mut m = mapping_with_feedback();
+        m.target_candidates = vec![TargetCandidate {
+            target: "hue-light-1".into(),
+            label: "Living".into(),
+            glyph: "link".into(),
+            service_type: Some("hue".into()),
+            routes: None,
+        }];
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![m]).await;
+
+        let rules = engine.feedback_rules_for_target("hue", "hue-light-1").await;
+        assert_eq!(
+            rules.len(),
+            1,
+            "candidate with overridden service_type inherits mapping feedback",
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_empty_for_unknown_target() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![mapping_with_feedback()]).await;
+
+        let rules = engine
+            .feedback_rules_for_target("roon", "some-other-zone")
+            .await;
+        assert!(rules.is_empty());
     }
 }
