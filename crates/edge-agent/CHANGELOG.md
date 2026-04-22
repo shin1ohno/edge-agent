@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.1...edge-agent-v0.4.2) - 2026-04-22
+
+### Other
+
+- damp target-selection rotation so cursor steps per quarter turn
+- render VolumeBar feedback for Hue brightness + explicit volume_bar rule ([#25](https://github.com/shin1ohno/edge-agent/pull/25))
+
 ## [0.4.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.0...edge-agent-v0.4.1) - 2026-04-22
 
 ### Other
