@@ -801,6 +801,50 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
 /// dedup'ing on the *rendered* signature (e.g. `vol:5`) means the LED only
 /// gets a write when the visible frame actually differs. That eliminates the
 /// near-identical rewrites that were reading as "blinking".
+/// Project a state-update value into a 9-bar fill + direction.
+///
+/// Two inputs are recognised:
+///   * `Number` — a raw scalar assumed to be on the closed interval
+///     `0..=100` (Hue brightness). Rendered bottom-up.
+///   * `Object` — a Roon-style `{value, min, max, type?}` envelope. Reads
+///     the full range, treats `type="db"` (or an all-negative range) as a
+///     top-down dB meter, and otherwise renders bottom-up.
+///
+/// Returns `None` for other shapes so the caller can decide whether to
+/// skip or fall through to a named-glyph plan.
+#[cfg(feature = "roon")]
+fn volume_bar_from_value(value: &serde_json::Value) -> Option<(u8, glyphs::VolumeDirection)> {
+    match value {
+        serde_json::Value::Number(_) => {
+            let v = value.as_f64()?;
+            let ratio = (v / 100.0).clamp(0.0, 1.0);
+            let bars = (ratio * 9.0).round() as u8;
+            Some((bars, glyphs::VolumeDirection::BottomUp))
+        }
+        serde_json::Value::Object(obj) => {
+            let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max = obj.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
+            let min = obj.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let vtype = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let is_db = vtype.eq_ignore_ascii_case("db") || (max <= 0.0 && min < 0.0);
+            let span = max - min;
+            let ratio = if span > 0.0 {
+                ((value - min) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let bars = (ratio * 9.0).round() as u8;
+            let direction = if is_db {
+                glyphs::VolumeDirection::TopDown
+            } else {
+                glyphs::VolumeDirection::BottomUp
+            };
+            Some((bars, direction))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(feature = "roon")]
 enum FeedbackPlan {
     /// Volume bar. `bars` = 0..=9 lit LEDs; `direction` decides which end
@@ -820,15 +864,18 @@ impl FeedbackPlan {
     ///
     /// Rule semantics:
     ///   - `rule.state` must equal `update.property`.
-    ///   - For `feedback_type == "glyph"`, the `rule.mapping` dict is keyed
-    ///     by the stringified update value (for `playback`: `"playing"`,
-    ///     `"paused"`, …). The looked-up string is the glyph name.
-    ///     Special case: `"volume_bar"` as a glyph name means the hardcoded
-    ///     VolumeBar rendering — the dict entry is acting as a display-type
-    ///     hint rather than a literal glyph from the registry.
-    ///   - Non-matching / unknown feedback types fall through to the
-    ///     hardcoded path so existing deployments that never touched the
-    ///     field keep working.
+    ///   - `feedback_type == "glyph"`: the `rule.mapping` dict is keyed by
+    ///     the stringified update value (for `playback`: `"playing"`,
+    ///     `"paused"`, …). The looked-up string is the glyph name. If the
+    ///     glyph name is `"volume_bar"`, the update's numeric value drives
+    ///     a VolumeBar instead of a registry lookup — this lets a single
+    ///     "glyph" rule carry both named-glyph and bar-style targets.
+    ///   - `feedback_type == "volume_bar"`: the update's value drives a
+    ///     VolumeBar directly, with no `mapping` lookup. Works with either
+    ///     a raw number (Hue brightness, 0..=100) or a Roon-style object
+    ///     `{value, min, max, type}`.
+    ///   - Unknown feedback types fall through to the hardcoded path so
+    ///     existing deployments that never touched the field keep working.
     fn resolve(update: &StateUpdate, rules: &[weave_contracts::FeedbackRule]) -> Option<Self> {
         if let Some(plan) = Self::from_rules(update, rules) {
             return Some(plan);
@@ -844,24 +891,39 @@ impl FeedbackPlan {
             if rule.state != update.property {
                 continue;
             }
-            if rule.feedback_type != "glyph" {
-                continue;
-            }
-            let value_key = match &update.value {
-                serde_json::Value::String(s) => s.clone(),
+            match rule.feedback_type.as_str() {
+                "glyph" => {
+                    let value_key = match &update.value {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => continue,
+                    };
+                    let Some(glyph_name) = rule
+                        .mapping
+                        .as_object()
+                        .and_then(|m| m.get(&value_key))
+                        .and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    if glyph_name == "volume_bar" {
+                        // "volume_bar" as a glyph name is a display-type
+                        // hint, not a registry entry — render a bar from
+                        // the value if it's numeric. A string-valued
+                        // playback update cannot drive a bar, so skip.
+                        if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
+                            return Some(Self::VolumeBar(bars, dir));
+                        }
+                        continue;
+                    }
+                    return Some(Self::NamedGlyph(glyph_name.to_string()));
+                }
+                "volume_bar" => {
+                    if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
+                        return Some(Self::VolumeBar(bars, dir));
+                    }
+                }
                 _ => continue,
-            };
-            let glyph_name = rule
-                .mapping
-                .as_object()
-                .and_then(|m| m.get(&value_key))
-                .and_then(|v| v.as_str())?;
-            if glyph_name == "volume_bar" {
-                // Hardcoded VolumeBar rendering needs the object-shaped
-                // volume payload; a playback string update can't drive it.
-                continue;
             }
-            return Some(Self::NamedGlyph(glyph_name.to_string()));
         }
         None
     }
@@ -876,28 +938,12 @@ impl FeedbackPlan {
                 "paused" | "stopped" => Some(Self::NamedGlyph("pause".to_string())),
                 _ => None,
             },
-            ("volume", serde_json::Value::Object(obj)) => {
-                let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let max = obj.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
-                let min = obj.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let vtype = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                // "db" zones publish a max of 0 and a negative min
-                // (e.g. -80..0). Linear zones publish 0..=100 (or
-                // similar) with a positive max.
-                let is_db = vtype.eq_ignore_ascii_case("db") || (max <= 0.0 && min < 0.0);
-                let span = max - min;
-                let ratio = if span > 0.0 {
-                    ((value - min) / span).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let bars = (ratio * 9.0).round() as u8;
-                let direction = if is_db {
-                    glyphs::VolumeDirection::TopDown
-                } else {
-                    glyphs::VolumeDirection::BottomUp
-                };
-                Some(Self::VolumeBar(bars, direction))
+            ("volume", _) | ("brightness", _) => {
+                // Roon volumes arrive as `{value, min, max, type}` objects;
+                // Hue brightness arrives as a raw 0..=100 number. Both
+                // project onto the same 9-bar display — the helper picks
+                // the right parsing based on value shape.
+                volume_bar_from_value(&update.value).map(|(bars, dir)| Self::VolumeBar(bars, dir))
             }
             _ => None,
         }
@@ -1211,9 +1257,11 @@ mod tests {
 
     #[cfg(feature = "roon")]
     #[test]
-    fn feedback_plan_from_rules_skips_volume_bar_marker() {
-        // "volume_bar" as a glyph name requires the object-shaped volume
-        // payload; a string-valued playback update can't drive it.
+    fn feedback_plan_from_rules_volume_bar_marker_skips_string_value() {
+        // A "volume_bar" entry in a glyph mapping needs a numeric or
+        // object-shaped value to derive the bar count from. A string-valued
+        // playback update has no bar height to project, so the rule is
+        // skipped and the caller falls back to hardcoded.
         let rules = vec![weave_contracts::FeedbackRule {
             state: "playback".into(),
             feedback_type: "glyph".into(),
@@ -1221,6 +1269,60 @@ mod tests {
         }];
         let update = state_update("playback", json!("playing"));
         assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_from_rules_volume_bar_type_on_brightness() {
+        // Hue brightness arrives as a raw 0..=100 number. A
+        // `feedback_type: "volume_bar"` rule should render a bottom-up
+        // bar without needing a `mapping` dict.
+        let rules = vec![weave_contracts::FeedbackRule {
+            state: "brightness".into(),
+            feedback_type: "volume_bar".into(),
+            mapping: json!({}),
+        }];
+        let update = state_update("brightness", json!(75.0));
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("rule match");
+        match plan {
+            FeedbackPlan::VolumeBar(bars, glyphs::VolumeDirection::BottomUp) => {
+                // 75/100 * 9 = 6.75, rounds to 7
+                assert_eq!(bars, 7);
+            }
+            _ => panic!("expected VolumeBar BottomUp"),
+        }
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_from_hardcoded_renders_brightness_as_bar() {
+        let update = state_update("brightness", json!(0));
+        let plan = FeedbackPlan::from(&update).expect("hardcoded brightness");
+        match plan {
+            FeedbackPlan::VolumeBar(bars, glyphs::VolumeDirection::BottomUp) => {
+                assert_eq!(bars, 0, "0% brightness = 0 bars");
+            }
+            _ => panic!("expected VolumeBar BottomUp"),
+        }
+        let update = state_update("brightness", json!(100.0));
+        let plan = FeedbackPlan::from(&update).expect("hardcoded brightness");
+        match plan {
+            FeedbackPlan::VolumeBar(bars, _) => assert_eq!(bars, 9),
+            _ => panic!("expected VolumeBar"),
+        }
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn volume_bar_from_value_handles_db_object() {
+        // Roon dB zones publish max=0, min=-80 (or similar). The helper
+        // should flip to TopDown so a quieter setting reads as fewer bars
+        // on a top-filled bar.
+        let v = json!({"value": -20.0, "min": -80.0, "max": 0.0, "type": "db"});
+        let (bars, dir) = volume_bar_from_value(&v).expect("object parses");
+        assert!(matches!(dir, glyphs::VolumeDirection::TopDown));
+        // (-20 - -80) / (0 - -80) = 60/80 = 0.75 → 7 bars
+        assert_eq!(bars, 7);
     }
 
     #[cfg(feature = "roon")]
