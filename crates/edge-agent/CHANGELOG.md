@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.2...edge-agent-v0.4.3) - 2026-04-22
+
+### Other
+
+- route Hue state updates into the Nuimo LED feedback loop ([#28](https://github.com/shin1ohno/edge-agent/pull/28))
+
 ## [0.4.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.1...edge-agent-v0.4.2) - 2026-04-22
 
 ### Other
