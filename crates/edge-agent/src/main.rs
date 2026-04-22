@@ -320,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
     let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
     tokio::spawn(run_dispatcher(
         intent_rx,
+        ws_outbox.clone(),
         #[cfg(feature = "roon")]
         roon_adapter.clone(),
         #[cfg(feature = "hue")]
@@ -341,6 +342,13 @@ async fn main() -> anyhow::Result<()> {
                 match res {
                     Ok(NuimoEvent::Disconnected) => {
                         tracing::warn!("nuimo BLE disconnected — reconnecting");
+                        let _ = ws_outbox
+                            .send(EdgeToServer::Error {
+                                context: "nuimo.ble".into(),
+                                message: "disconnected — reconnecting".into(),
+                                severity: weave_contracts::ErrorSeverity::Warn,
+                            })
+                            .await;
                         let _ = device_state_tx
                             .send(("connected".into(), serde_json::json!(false)))
                             .await;
@@ -490,6 +498,16 @@ async fn run_hue_bootstrap(
                     next_retry_secs = delay.as_secs(),
                     "hue adapter init failed — retrying in background",
                 );
+                let _ = outbox
+                    .send(EdgeToServer::Error {
+                        context: "hue.bootstrap".into(),
+                        message: format!(
+                            "init failed (attempt {attempt}, next retry {}s): {e}",
+                            delay.as_secs()
+                        ),
+                        severity: weave_contracts::ErrorSeverity::Warn,
+                    })
+                    .await;
             }
         }
     }
@@ -511,6 +529,7 @@ async fn try_hue_init(token_path: &std::path::Path) -> anyhow::Result<HueAdapter
 /// worker the first time we see a given `(service_type, target)` pair.
 async fn run_dispatcher(
     mut rx: tokio::sync::mpsc::Receiver<RoutedIntent>,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     #[cfg(feature = "roon")] roon: Arc<dyn ServiceAdapter>,
     #[cfg(feature = "hue")] hue: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
 ) {
@@ -532,7 +551,12 @@ async fn run_dispatcher(
                 continue;
             };
             let (tx, worker_rx) = tokio::sync::mpsc::channel::<Intent>(64);
-            tokio::spawn(run_target_worker(key.clone(), worker_rx, adapter));
+            tokio::spawn(run_target_worker(
+                key.clone(),
+                worker_rx,
+                adapter,
+                outbox.clone(),
+            ));
             workers.insert(key.clone(), tx);
         }
 
@@ -552,6 +576,7 @@ async fn run_target_worker(
     key: (String, String),
     mut rx: tokio::sync::mpsc::Receiver<Intent>,
     adapter: Arc<dyn ServiceAdapter>,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
 ) {
     let (service_type, target) = key;
     while let Some(first) = rx.recv().await {
@@ -561,10 +586,47 @@ async fn run_target_worker(
             push_merged(&mut pending, next);
         }
         for intent in pending {
-            if let Err(e) = adapter.send_intent(&target, &intent).await {
+            let started = std::time::Instant::now();
+            let outcome = adapter.send_intent(&target, &intent).await;
+            let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
+            let (intent_name, params) = split_intent(&intent);
+            let result = match &outcome {
+                Ok(()) => weave_contracts::CommandResult::Ok,
+                Err(e) => weave_contracts::CommandResult::Err {
+                    message: e.to_string(),
+                },
+            };
+            let frame = EdgeToServer::Command {
+                service_type: service_type.clone(),
+                target: target.clone(),
+                intent: intent_name,
+                params,
+                result,
+                latency_ms,
+                output_id: None,
+            };
+            let _ = outbox.send(frame).await;
+            if let Err(e) = outcome {
                 tracing::warn!(error = %e, %service_type, %target, ?intent, "intent failed");
             }
         }
+    }
+}
+
+/// Serialize an `Intent` into its snake-case tag and the remaining params
+/// object. Relies on `#[serde(tag = "type")]` on `Intent`, so the output
+/// is always a JSON object with a `"type"` key that we lift out. Payload-
+/// less variants yield `{}`.
+fn split_intent(intent: &Intent) -> (String, serde_json::Value) {
+    match serde_json::to_value(intent) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            let name = map
+                .remove("type")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            (name, serde_json::Value::Object(map))
+        }
+        _ => ("unknown".to_string(), serde_json::json!({})),
     }
 }
 

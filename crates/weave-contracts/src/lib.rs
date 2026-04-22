@@ -68,6 +68,52 @@ pub enum EdgeToServer {
         mapping_id: Uuid,
         service_target: String,
     },
+    /// A command that the edge's adapter emitted to an external service
+    /// (Roon MOO RPC, Hue REST, …). One frame per `adapter.send_intent`
+    /// call, carrying the outcome and measured latency so the UI live
+    /// stream can show "sent → ok (42ms)" rows alongside input and
+    /// state-echo rows.
+    Command {
+        service_type: String,
+        target: String,
+        /// Snake-case intent name (`volume_change`, `play_pause`, …).
+        intent: String,
+        /// Intent parameters serialized as JSON. Shape matches the
+        /// `weave-engine::Intent` discriminant's payload.
+        #[serde(default)]
+        params: serde_json::Value,
+        result: CommandResult,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+    },
+    /// Adapter-level or routing-level error not tied to a specific
+    /// command (bridge disconnect, auth token expired, pairing lost).
+    /// Command-level failures use `Command { result: Err { .. } }`
+    /// instead — `Error` is for ambient conditions.
+    Error {
+        context: String,
+        message: String,
+        severity: ErrorSeverity,
+    },
+}
+
+/// Outcome of an `EdgeToServer::Command`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandResult {
+    Ok,
+    Err { message: String },
+}
+
+/// Severity classification for `EdgeToServer::Error` and `UiFrame::Error`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorSeverity {
+    Warn,
+    Error,
+    Fatal,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -138,6 +184,32 @@ pub enum UiFrame {
     },
     /// The glyph set changed. UIs refresh their registry.
     GlyphsChanged { glyphs: Vec<Glyph> },
+    /// Fan-out of an edge-emitted `Command`. Transient — never stored in
+    /// `UiSnapshot`; dashboards that open after the fact will not see it.
+    Command {
+        edge_id: String,
+        service_type: String,
+        target: String,
+        intent: String,
+        #[serde(default)]
+        params: serde_json::Value,
+        result: CommandResult,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+        /// RFC3339 timestamp assigned by the server on fan-out.
+        at: String,
+    },
+    /// Fan-out of an edge-emitted `Error`. Transient.
+    Error {
+        edge_id: String,
+        context: String,
+        message: String,
+        severity: ErrorSeverity,
+        /// RFC3339 timestamp assigned by the server on fan-out.
+        at: String,
+    },
 }
 
 /// Initial full state sent on `/ws/ui` connect. Subsequent changes arrive
@@ -334,6 +406,89 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn edge_to_server_command_roundtrip() {
+        let ok = EdgeToServer::Command {
+            service_type: "roon".into(),
+            target: "zone-1".into(),
+            intent: "volume_change".into(),
+            params: serde_json::json!({"delta": 3}),
+            result: CommandResult::Ok,
+            latency_ms: Some(42),
+            output_id: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains("\"type\":\"command\""));
+        assert!(json.contains("\"kind\":\"ok\""));
+        assert!(json.contains("\"latency_ms\":42"));
+        assert!(!json.contains("output_id"));
+        let parsed: EdgeToServer = serde_json::from_str(&json).unwrap();
+        match parsed {
+            EdgeToServer::Command { intent, result, .. } => {
+                assert_eq!(intent, "volume_change");
+                assert!(matches!(result, CommandResult::Ok));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let err = EdgeToServer::Command {
+            service_type: "hue".into(),
+            target: "light-1".into(),
+            intent: "on_off".into(),
+            params: serde_json::json!({"on": true}),
+            result: CommandResult::Err {
+                message: "bridge timeout".into(),
+            },
+            latency_ms: None,
+            output_id: None,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"kind\":\"err\""));
+        assert!(json.contains("\"message\":\"bridge timeout\""));
+    }
+
+    #[test]
+    fn edge_to_server_error_roundtrip() {
+        let msg = EdgeToServer::Error {
+            context: "hue.bridge".into(),
+            message: "connection refused".into(),
+            severity: ErrorSeverity::Error,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"severity\":\"error\""));
+    }
+
+    #[test]
+    fn ui_frame_command_and_error_roundtrip() {
+        let cmd = UiFrame::Command {
+            edge_id: "air".into(),
+            service_type: "roon".into(),
+            target: "zone-1".into(),
+            intent: "play_pause".into(),
+            params: serde_json::json!({}),
+            result: CommandResult::Ok,
+            latency_ms: Some(18),
+            output_id: None,
+            at: "2026-04-23T12:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"command\""));
+        let _: UiFrame = serde_json::from_str(&json).unwrap();
+
+        let err = UiFrame::Error {
+            edge_id: "air".into(),
+            context: "roon.client".into(),
+            message: "pair lost".into(),
+            severity: ErrorSeverity::Warn,
+            at: "2026-04-23T12:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"severity\":\"warn\""));
+        let _: UiFrame = serde_json::from_str(&json).unwrap();
     }
 
     #[test]
