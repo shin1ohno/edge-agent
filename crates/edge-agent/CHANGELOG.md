@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.0...edge-agent-v0.4.1) - 2026-04-22
+
+### Other
+
+- DeviceState emission + feedback rules + Hue SSE timeout ([#23](https://github.com/shin1ohno/edge-agent/pull/23))
+
 ## [0.4.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.3.3...edge-agent-v0.4.0) - 2026-04-22
 
 ### Other
