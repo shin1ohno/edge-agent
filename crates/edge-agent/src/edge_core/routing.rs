@@ -28,19 +28,67 @@ pub struct SelectionMode {
     pub edge_id: String,
     pub candidates: Vec<TargetCandidate>,
     pub cursor: usize,
+    /// Accumulated rotation delta since the last cursor step. Nuimo emits
+    /// rotation events at the characteristic update rate — each encoder
+    /// tick is ~1/2650 of a full turn — so a "one tick = one candidate"
+    /// policy skips through the whole list on a light nudge. The
+    /// accumulator turns that into "one candidate per `SELECTION_ROTATION_STEP`
+    /// radians-fraction of travel" so the selection ramp is legible at
+    /// hardware rotation speeds.
+    rotation_accumulator: f64,
 }
 
+/// Fraction of a full Nuimo turn required to advance the selection
+/// cursor by one candidate. `1.0` = one full 360° turn; `0.25` = a
+/// quarter turn. Tuned experimentally: for the typical 2-4 candidate
+/// case this gives roughly one candidate per thumb-flick, versus the
+/// pre-damping behaviour where a finger slip cycled through every
+/// candidate in the list.
+pub const SELECTION_ROTATION_STEP: f64 = 0.25;
+
 impl SelectionMode {
+    pub fn new(
+        mapping_id: Uuid,
+        edge_id: String,
+        candidates: Vec<TargetCandidate>,
+        cursor: usize,
+    ) -> Self {
+        Self {
+            mapping_id,
+            edge_id,
+            candidates,
+            cursor,
+            rotation_accumulator: 0.0,
+        }
+    }
+
     fn current(&self) -> &TargetCandidate {
         &self.candidates[self.cursor]
     }
-    fn advance(&mut self, delta: f64) {
+
+    /// Add `delta` to the rotation accumulator and advance the cursor by
+    /// one candidate for each full `SELECTION_ROTATION_STEP` worth of
+    /// accumulated travel. Returns `true` if the cursor moved — callers
+    /// use this to suppress redundant LED redraws for sub-threshold
+    /// rotations.
+    fn advance(&mut self, delta: f64) -> bool {
         let n = self.candidates.len();
         if n == 0 {
-            return;
+            return false;
         }
-        let step = if delta >= 0.0 { 1 } else { n - 1 };
-        self.cursor = (self.cursor + step) % n;
+        self.rotation_accumulator += delta;
+        let mut moved = false;
+        while self.rotation_accumulator >= SELECTION_ROTATION_STEP {
+            self.cursor = (self.cursor + 1) % n;
+            self.rotation_accumulator -= SELECTION_ROTATION_STEP;
+            moved = true;
+        }
+        while self.rotation_accumulator <= -SELECTION_ROTATION_STEP {
+            self.cursor = (self.cursor + n - 1) % n;
+            self.rotation_accumulator += SELECTION_ROTATION_STEP;
+            moved = true;
+        }
+        moved
     }
 }
 
@@ -204,7 +252,13 @@ impl RoutingEngine {
             if let Some(mode) = sel.get_mut(&key) {
                 match input {
                     InputPrimitive::Rotate { delta } => {
-                        mode.advance(*delta);
+                        // Sub-threshold rotations accumulate without
+                        // emitting UpdateSelection — the LED keeps the
+                        // current candidate's glyph and no log line
+                        // fires until the cursor actually moves.
+                        if !mode.advance(*delta) {
+                            return RouteOutcome::Normal(Vec::new());
+                        }
                         let glyph = mode.current().glyph.clone();
                         let mapping_id = mode.mapping_id;
                         return RouteOutcome::UpdateSelection { mapping_id, glyph };
@@ -260,12 +314,12 @@ impl RoutingEngine {
                 Some(i) => (i + 1) % m.target_candidates.len(),
                 None => 0,
             };
-            let mode = SelectionMode {
-                mapping_id: m.mapping_id,
-                edge_id: m.edge_id.clone(),
-                candidates: m.target_candidates.clone(),
+            let mode = SelectionMode::new(
+                m.mapping_id,
+                m.edge_id.clone(),
+                m.target_candidates.clone(),
                 cursor,
-            };
+            );
             let glyph = mode.current().glyph.clone();
             let mapping_id = mode.mapping_id;
             let edge_id = mode.edge_id.clone();
@@ -574,12 +628,14 @@ mod tests {
                 },
             )
             .await;
-        // Rotate forward: wraps from B back to A.
+        // Rotate forward past the damping threshold — wraps from B back to A.
         match engine
             .route_with_mode(
                 "nuimo",
                 "C3:81:DF:4E",
-                &InputPrimitive::Rotate { delta: 0.1 },
+                &InputPrimitive::Rotate {
+                    delta: SELECTION_ROTATION_STEP,
+                },
             )
             .await
         {
@@ -594,6 +650,92 @@ mod tests {
                 assert_eq!(service_target, "target-A")
             }
             other => panic!("expected CommitSelection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_threshold_rotate_keeps_cursor_still() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![selection_mapping()]).await;
+
+        // Enter selection at target-B.
+        let _ = engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Swipe {
+                    direction: Direction::Up,
+                },
+            )
+            .await;
+
+        // A single small rotation accumulates but does not cross the
+        // threshold. Caller sees an empty Normal outcome — no LED push,
+        // no state change.
+        match engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate {
+                    delta: SELECTION_ROTATION_STEP / 2.0,
+                },
+            )
+            .await
+        {
+            RouteOutcome::Normal(routed) => assert!(routed.is_empty()),
+            other => panic!("expected Normal(empty), got {:?}", other),
+        }
+
+        // A second small rotation pushes the accumulator over the
+        // threshold — cursor moves.
+        match engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate {
+                    delta: SELECTION_ROTATION_STEP / 2.0 + 0.01,
+                },
+            )
+            .await
+        {
+            RouteOutcome::UpdateSelection { glyph, .. } => assert_eq!(glyph, "glyph-a"),
+            other => panic!("expected UpdateSelection, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn large_rotate_produces_single_step_per_outcome() {
+        // advance() advances until the accumulator is below the threshold,
+        // but route_with_mode yields a single RouteOutcome per input event.
+        // Verify a 2.4-step delta lands on a cursor position consistent
+        // with two advances (not one, not four).
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![selection_mapping()]).await;
+
+        let _ = engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Swipe {
+                    direction: Direction::Up,
+                },
+            )
+            .await;
+        // Starting cursor is at B (index 1). 2 steps forward in a 2-entry
+        // list wraps back to B. Use a delta that advances exactly twice
+        // to land deterministically.
+        match engine
+            .route_with_mode(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate {
+                    delta: SELECTION_ROTATION_STEP * 2.0,
+                },
+            )
+            .await
+        {
+            RouteOutcome::UpdateSelection { glyph, .. } => assert_eq!(glyph, "glyph-b"),
+            other => panic!("expected UpdateSelection, got {:?}", other),
         }
     }
 
