@@ -257,13 +257,19 @@ fn route_mappings(mappings: &[Mapping], input: &InputPrimitive) -> Vec<RoutedInt
         if !m.active {
             continue;
         }
-        for route in &m.routes {
+        // Resolve the effective service_type + routes for the currently
+        // active target. When the active target is a cross-service
+        // candidate (e.g. Roon-flavoured mapping pointing at a Hue light),
+        // `effective_for` returns the candidate's overrides so the
+        // dispatcher sees the right adapter + intent set.
+        let (service_type, routes) = m.effective_for(&m.service_target);
+        for route in routes {
             if !input.matches_route(&route.input) {
                 continue;
             }
             if let Some(intent) = build_intent(route, input) {
                 out.push(RoutedIntent {
-                    service_type: m.service_type.clone(),
+                    service_type: service_type.to_string(),
                     service_target: m.service_target.clone(),
                     intent,
                 });
@@ -401,14 +407,92 @@ mod tests {
                 target: "target-A".into(),
                 label: "A".into(),
                 glyph: "glyph-a".into(),
+                service_type: None,
+                routes: None,
             },
             TargetCandidate {
                 target: "target-B".into(),
                 label: "B".into(),
                 glyph: "glyph-b".into(),
+                service_type: None,
+                routes: None,
             },
         ];
         m
+    }
+
+    /// A mapping whose primary target is a Roon zone and whose secondary
+    /// candidate is a Hue light with its own route table. Used to exercise
+    /// the `effective_for` cross-service override path.
+    fn cross_service_mapping() -> Mapping {
+        let mut m = rotate_mapping();
+        m.service_target = "roon-zone".into();
+        m.target_switch_on = Some("long_press".into());
+        m.target_candidates = vec![
+            TargetCandidate {
+                target: "roon-zone".into(),
+                label: "Roon".into(),
+                glyph: "roon".into(),
+                service_type: None,
+                routes: None,
+            },
+            TargetCandidate {
+                target: "hue-light".into(),
+                label: "Hue".into(),
+                glyph: "hue".into(),
+                service_type: Some("hue".into()),
+                routes: Some(vec![Route {
+                    input: "rotate".into(),
+                    intent: "brightness_change".into(),
+                    params: BTreeMap::from([("damping".into(), serde_json::json!(50.0))]),
+                }]),
+            },
+        ];
+        m
+    }
+
+    #[test]
+    fn effective_for_returns_mapping_defaults_when_target_not_overridden() {
+        let m = cross_service_mapping();
+        let (svc, routes) = m.effective_for("roon-zone");
+        assert_eq!(svc, "roon");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].intent, "volume_change");
+    }
+
+    #[test]
+    fn effective_for_returns_candidate_overrides_when_present() {
+        let m = cross_service_mapping();
+        let (svc, routes) = m.effective_for("hue-light");
+        assert_eq!(svc, "hue");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].intent, "brightness_change");
+    }
+
+    #[tokio::test]
+    async fn rotate_on_cross_service_candidate_produces_hue_intent() {
+        let mut m = cross_service_mapping();
+        // Simulate the user having switched the active target to the Hue
+        // candidate (as if selection mode had committed on it).
+        m.service_target = "hue-light".into();
+
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![m]).await;
+
+        let out = engine
+            .route(
+                "nuimo",
+                "C3:81:DF:4E",
+                &InputPrimitive::Rotate { delta: 0.1 },
+            )
+            .await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].service_type, "hue");
+        assert_eq!(out[0].service_target, "hue-light");
+        match &out[0].intent {
+            Intent::BrightnessChange { delta } => assert!((*delta - 5.0).abs() < 0.001),
+            other => panic!("expected BrightnessChange, got {:?}", other),
+        }
     }
 
     #[tokio::test]

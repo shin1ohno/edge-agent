@@ -219,6 +219,13 @@ pub struct Mapping {
 /// One entry in `Mapping::target_candidates`. During selection mode the
 /// device displays `glyph` and, on confirm, the mapping's `service_target`
 /// is replaced with `target`.
+///
+/// Optional `service_type` and `routes` overrides let a single mapping's
+/// candidates straddle services — e.g. `long_press` cycles between a Roon
+/// zone (rotate→volume_change) and a Hue light (rotate→brightness_change),
+/// each with its own route table. When absent, the candidate inherits the
+/// mapping's `service_type` / `routes`, which matches pre-override behavior
+/// so historical mappings deserialize unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetCandidate {
     /// The `service_target` value to switch to (e.g. a Roon zone ID).
@@ -229,6 +236,36 @@ pub struct TargetCandidate {
     /// Name of a glyph in the edge's glyph registry to display while this
     /// candidate is highlighted in selection mode.
     pub glyph: String,
+    /// Override the mapping's `service_type` when this candidate is active.
+    /// `None` = inherit from the parent `Mapping::service_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
+    /// Override the mapping's `routes` when this candidate is active. Required
+    /// in practice whenever `service_type` differs from the mapping's, because
+    /// intents are service-specific (Roon `volume_change` won't work against
+    /// a Hue target). `None` = inherit from the parent `Mapping::routes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<Route>>,
+}
+
+impl Mapping {
+    /// Resolve the effective `(service_type, routes)` for a given target.
+    /// If `target` matches a `target_candidates` entry with overrides,
+    /// those win; otherwise the mapping's own fields are returned.
+    ///
+    /// Callers on the routing hot path should pass the currently active
+    /// `service_target` to get the right adapter + intent table for the
+    /// next emitted `RoutedIntent`.
+    pub fn effective_for<'a>(&'a self, target: &str) -> (&'a str, &'a [Route]) {
+        let candidate = self.target_candidates.iter().find(|c| c.target == target);
+        let service_type = candidate
+            .and_then(|c| c.service_type.as_deref())
+            .unwrap_or(self.service_type.as_str());
+        let routes = candidate
+            .and_then(|c| c.routes.as_deref())
+            .unwrap_or(self.routes.as_slice());
+        (service_type, routes)
+    }
 }
 
 fn default_true() -> bool {
