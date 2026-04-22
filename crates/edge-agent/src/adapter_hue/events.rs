@@ -49,6 +49,18 @@ async fn stream_once(
 
     tracing::info!(%url, "hue SSE connected");
 
+    // Replay the cached snapshot now that state_pump subscribers are
+    // attached. `HueAdapter::start` also broadcasts each light right after
+    // `list_lights`, but that fires before any subscriber exists — the
+    // broadcast channel silently drops those messages. Without this replay,
+    // a light whose state never changes after edge-agent start (e.g. a bulb
+    // that stays `off`) would never reach weave-server, and the mapping UI
+    // couldn't list it as a target. Also handles the SSE-reconnect case
+    // after a bridge reboot.
+    for light in cache.values().await {
+        broadcast_light(&light, state_tx);
+    }
+
     let mut stream = res.bytes_stream();
     let mut buf = String::new();
     while let Some(chunk) = stream.next().await {
