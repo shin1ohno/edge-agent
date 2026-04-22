@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.3.3...weave-contracts-v0.4.0) - 2026-04-22
+
+### Other
+
+- weave-contracts + edge-agent: cross-service target candidates ([#21](https://github.com/shin1ohno/edge-agent/pull/21))
+
 ## [0.3.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.2.0...weave-contracts-v0.3.0) - 2026-04-21
 
 ### Other
