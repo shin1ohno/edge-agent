@@ -839,10 +839,7 @@ impl FeedbackPlan {
     /// Consult mapping-level feedback rules only. Returns `None` when no
     /// rule covers this update — the caller is expected to try the
     /// hardcoded fallback.
-    fn from_rules(
-        update: &StateUpdate,
-        rules: &[weave_contracts::FeedbackRule],
-    ) -> Option<Self> {
+    fn from_rules(update: &StateUpdate, rules: &[weave_contracts::FeedbackRule]) -> Option<Self> {
         for rule in rules {
             if rule.state != update.property {
                 continue;
@@ -1174,10 +1171,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let replayed = drain(&mut outbox_rx);
         assert_eq!(replayed.len(), 2, "both cached properties must replay");
-        let props: std::collections::HashSet<&str> = replayed
-            .iter()
-            .map(|f| unwrap_device_state(f).2)
-            .collect();
+        let props: std::collections::HashSet<&str> =
+            replayed.iter().map(|f| unwrap_device_state(f).2).collect();
         assert!(props.contains("connected"));
         assert!(props.contains("battery"));
     }
