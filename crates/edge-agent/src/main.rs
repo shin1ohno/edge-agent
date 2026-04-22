@@ -269,12 +269,21 @@ async fn main() -> anyhow::Result<()> {
         let mut state_rx = roon_adapter.subscribe_state();
         let dev = device.clone();
         let glyphs_for_feedback = glyphs.clone();
+        let engine_for_feedback = engine.clone();
         tokio::spawn(async move {
             let mut filter = FeedbackFilter::new();
             loop {
                 match state_rx.recv().await {
                     Ok(update) => {
-                        if let Some(plan) = FeedbackPlan::from(&update) {
+                        // Consult mapping-level feedback rules first — they
+                        // let a user override e.g. the "paused" glyph per
+                        // target from the weave-web UI. Hardcoded defaults
+                        // apply when no rule matches (preserves behavior
+                        // for deployments that never populated `feedback`).
+                        let rules = engine_for_feedback
+                            .feedback_rules_for_target(&update.service_type, &update.target)
+                            .await;
+                        if let Some(plan) = FeedbackPlan::resolve(&update, &rules) {
                             let sig = plan.signature();
                             if filter.should_render(&update, &sig) {
                                 plan.execute(&dev, &glyphs_for_feedback).await;
@@ -798,19 +807,76 @@ enum FeedbackPlan {
     /// of the column fills first (bottom-up for linear 0..=max zones,
     /// top-down for dB zones whose max is 0).
     VolumeBar(u8, glyphs::VolumeDirection),
-    /// Named glyph from the registry (play / pause / ...).
-    NamedGlyph(&'static str),
+    /// Named glyph from the registry (play / pause / ...). Holds an owned
+    /// String because rule-driven plans pull names from mapping JSON at
+    /// runtime — not a `&'static str` as in the hardcoded path.
+    NamedGlyph(String),
 }
 
 #[cfg(feature = "roon")]
 impl FeedbackPlan {
+    /// Resolve a StateUpdate against mapping-level `feedback` rules first;
+    /// fall back to the hardcoded defaults if no rule covers this update.
+    ///
+    /// Rule semantics:
+    ///   - `rule.state` must equal `update.property`.
+    ///   - For `feedback_type == "glyph"`, the `rule.mapping` dict is keyed
+    ///     by the stringified update value (for `playback`: `"playing"`,
+    ///     `"paused"`, …). The looked-up string is the glyph name.
+    ///     Special case: `"volume_bar"` as a glyph name means the hardcoded
+    ///     VolumeBar rendering — the dict entry is acting as a display-type
+    ///     hint rather than a literal glyph from the registry.
+    ///   - Non-matching / unknown feedback types fall through to the
+    ///     hardcoded path so existing deployments that never touched the
+    ///     field keep working.
+    fn resolve(update: &StateUpdate, rules: &[weave_contracts::FeedbackRule]) -> Option<Self> {
+        if let Some(plan) = Self::from_rules(update, rules) {
+            return Some(plan);
+        }
+        Self::from(update)
+    }
+
+    /// Consult mapping-level feedback rules only. Returns `None` when no
+    /// rule covers this update — the caller is expected to try the
+    /// hardcoded fallback.
+    fn from_rules(
+        update: &StateUpdate,
+        rules: &[weave_contracts::FeedbackRule],
+    ) -> Option<Self> {
+        for rule in rules {
+            if rule.state != update.property {
+                continue;
+            }
+            if rule.feedback_type != "glyph" {
+                continue;
+            }
+            let value_key = match &update.value {
+                serde_json::Value::String(s) => s.clone(),
+                _ => continue,
+            };
+            let glyph_name = rule
+                .mapping
+                .as_object()
+                .and_then(|m| m.get(&value_key))
+                .and_then(|v| v.as_str())?;
+            if glyph_name == "volume_bar" {
+                // Hardcoded VolumeBar rendering needs the object-shaped
+                // volume payload; a playback string update can't drive it.
+                continue;
+            }
+            return Some(Self::NamedGlyph(glyph_name.to_string()));
+        }
+        None
+    }
+
     /// Project a StateUpdate into the visible frame it should produce, or
-    /// `None` if nothing on the device should change.
+    /// `None` if nothing on the device should change. Hardcoded defaults
+    /// used when no mapping-level feedback rule matches.
     fn from(update: &StateUpdate) -> Option<Self> {
         match (update.property.as_str(), &update.value) {
             ("playback", serde_json::Value::String(s)) => match s.as_str() {
-                "playing" => Some(Self::NamedGlyph("play")),
-                "paused" | "stopped" => Some(Self::NamedGlyph("pause")),
+                "playing" => Some(Self::NamedGlyph("play".to_string())),
+                "paused" | "stopped" => Some(Self::NamedGlyph("pause".to_string())),
                 _ => None,
             },
             ("volume", serde_json::Value::Object(obj)) => {
@@ -851,7 +917,7 @@ impl FeedbackPlan {
                 };
                 format!("vol:{bars}:{d}")
             }
-            Self::NamedGlyph(name) => (*name).to_string(),
+            Self::NamedGlyph(name) => name.clone(),
         }
     }
 
@@ -864,11 +930,11 @@ impl FeedbackPlan {
             ),
             Self::NamedGlyph(name) => {
                 let Some(entry) = registry.get(name).await else {
-                    tracing::debug!(name, "glyph missing from registry; skipping feedback");
+                    tracing::debug!(%name, "glyph missing from registry; skipping feedback");
                     return;
                 };
                 if entry.builtin {
-                    tracing::debug!(name, "glyph is builtin; expected parametric render");
+                    tracing::debug!(%name, "glyph is builtin; expected parametric render");
                     return;
                 }
                 (
@@ -1114,6 +1180,85 @@ mod tests {
             .collect();
         assert!(props.contains("connected"));
         assert!(props.contains("battery"));
+    }
+
+    #[cfg(feature = "roon")]
+    fn state_update(property: &str, value: serde_json::Value) -> StateUpdate {
+        StateUpdate {
+            service_type: "roon".into(),
+            target: "zone-1".into(),
+            property: property.into(),
+            output_id: None,
+            value,
+        }
+    }
+
+    #[cfg(feature = "roon")]
+    fn named_glyph(plan: &FeedbackPlan) -> &str {
+        match plan {
+            FeedbackPlan::NamedGlyph(s) => s.as_str(),
+            _ => panic!("expected NamedGlyph"),
+        }
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_from_rules_picks_mapped_glyph() {
+        let rules = vec![weave_contracts::FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: json!({"playing": "custom_play", "paused": "custom_pause"}),
+        }];
+        let update = state_update("playback", json!("playing"));
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("rule match");
+        assert_eq!(named_glyph(&plan), "custom_play");
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_from_rules_skips_volume_bar_marker() {
+        // "volume_bar" as a glyph name requires the object-shaped volume
+        // payload; a string-valued playback update can't drive it.
+        let rules = vec![weave_contracts::FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: json!({"playing": "volume_bar"}),
+        }];
+        let update = state_update("playback", json!("playing"));
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_from_rules_ignores_unmatched_state() {
+        let rules = vec![weave_contracts::FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: json!({"playing": "play"}),
+        }];
+        let update = state_update("volume", json!({"value": 50.0, "max": 100.0, "min": 0.0}));
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_resolve_falls_back_to_hardcoded_when_rules_empty() {
+        let update = state_update("playback", json!("playing"));
+        let plan = FeedbackPlan::resolve(&update, &[]).expect("hardcoded fallback");
+        assert_eq!(named_glyph(&plan), "play");
+    }
+
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_plan_resolve_prefers_rule_over_hardcoded() {
+        let rules = vec![weave_contracts::FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: json!({"playing": "custom_play"}),
+        }];
+        let update = state_update("playback", json!("playing"));
+        let plan = FeedbackPlan::resolve(&update, &rules).expect("rule wins");
+        assert_eq!(named_glyph(&plan), "custom_play");
     }
 
     #[tokio::test]
