@@ -212,6 +212,25 @@ async fn main() -> anyhow::Result<()> {
     let device_id = device.id();
     tracing::info!(%device_id, "nuimo connected");
 
+    // Device-state pump for weave-web visibility. `spawn_device_state_pump`
+    // caches the last value per property and replays on every ws reconnect,
+    // so a weave-server restart does not leave the UI stuck on "offline".
+    // Input events bypass the cache (transient; see `emit_input_device_state`).
+    //
+    // The initial `connected: true` is sent explicitly here because the
+    // `NuimoEvent::Connected` emitted by `device.connect()` above fires
+    // before the event loop below subscribes, so relying on the event
+    // broadcast alone would miss the startup transition.
+    let device_state_tx = spawn_device_state_pump(
+        "nuimo",
+        device_id.clone(),
+        ws_outbox.clone(),
+        ws_resync.subscribe(),
+    );
+    let _ = device_state_tx
+        .send(("connected".into(), serde_json::json!(true)))
+        .await;
+
     // Best-effort link glyph on connect — skipped if the registry isn't
     // populated yet (first run with no cache and server unreachable).
     if let Some(link) = glyphs.get("link").await {
@@ -305,9 +324,37 @@ async fn main() -> anyhow::Result<()> {
                 match res {
                     Ok(NuimoEvent::Disconnected) => {
                         tracing::warn!("nuimo BLE disconnected — reconnecting");
+                        let _ = device_state_tx
+                            .send(("connected".into(), serde_json::json!(false)))
+                            .await;
                         reconnect_nuimo(&device).await;
+                        let _ = device_state_tx
+                            .send(("connected".into(), serde_json::json!(true)))
+                            .await;
+                    }
+                    Ok(NuimoEvent::Connected) => {
+                        // Idempotent: the Disconnected arm already re-sent
+                        // connected:true after reconnect. This catches any
+                        // SDK-initiated Connected emission we didn't trigger
+                        // explicitly (defensive, cache-deduped on server).
+                        let _ = device_state_tx
+                            .send(("connected".into(), serde_json::json!(true)))
+                            .await;
+                    }
+                    Ok(NuimoEvent::BatteryLevel(pct)) => {
+                        let _ = device_state_tx
+                            .send(("battery".into(), serde_json::json!(pct)))
+                            .await;
+                    }
+                    Ok(NuimoEvent::Rssi(_)) => {
+                        // Not surfaced today; skip without routing.
                     }
                     Ok(event) => {
+                        // Unconditional input-event forward for observability
+                        // (Try It Now, debug dashboards). Sent even when
+                        // routing has no mapping — the event itself is the
+                        // diagnostic signal.
+                        emit_input_device_state(&ws_outbox, &device_id, &event).await;
                         let Some(primitive) = translate_nuimo_event(&event) else { continue; };
                         use edge_core::RouteOutcome;
                         match engine.route_with_mode(device_type, &device_id, &primitive).await {
@@ -582,6 +629,110 @@ fn spawn_state_pump(
     });
 }
 
+/// Cache-and-replay pump for per-device state updates (connected, battery,
+/// …). Mirrors `spawn_state_pump` in intent, but keyed on `property` with
+/// `device_type` / `device_id` baked into every emitted frame.
+///
+/// The returned `Sender` is how the event loop enqueues updates; the
+/// spawned task forwards them to `outbox` and keeps a last-write-wins
+/// cache so every ws reconnect can replay the latest known state for each
+/// property. Input events are transient and bypass this pump — they are
+/// forwarded directly by `emit_input_device_state`.
+fn spawn_device_state_pump(
+    device_type: &'static str,
+    device_id: String,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    mut resync_rx: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::sync::mpsc::Sender<(String, serde_json::Value)> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, serde_json::Value)>(32);
+    tokio::spawn(async move {
+        let mut last: std::collections::HashMap<String, EdgeToServer> =
+            std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some((property, value)) => {
+                        let frame = EdgeToServer::DeviceState {
+                            device_type: device_type.to_string(),
+                            device_id: device_id.clone(),
+                            property: property.clone(),
+                            value,
+                        };
+                        tracing::debug!(%property, "device state update");
+                        last.insert(property, frame.clone());
+                        let _ = outbox.send(frame).await;
+                    }
+                    None => break,
+                },
+                // Lagged/Closed on the resync channel are non-fatal — keep
+                // the pump alive and keep forwarding fresh updates.
+                res = resync_rx.recv() => {
+                    if let Ok(()) = res {
+                        tracing::info!(
+                            n = last.len(),
+                            "ws reconnect — replaying cached device state",
+                        );
+                        for frame in last.values() {
+                            let _ = outbox.send(frame.clone()).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
+/// Forward a `NuimoEvent` as a `DeviceState { property: "input", ... }`
+/// frame. Non-input variants (battery, connection, rssi) return without
+/// sending — the caller handles those via the pump.
+async fn emit_input_device_state(
+    outbox: &tokio::sync::mpsc::Sender<EdgeToServer>,
+    device_id: &str,
+    event: &NuimoEvent,
+) {
+    let Some(value) = input_event_json(event) else {
+        return;
+    };
+    let frame = EdgeToServer::DeviceState {
+        device_type: "nuimo".to_string(),
+        device_id: device_id.to_string(),
+        property: "input".to_string(),
+        value,
+    };
+    let _ = outbox.send(frame).await;
+}
+
+/// Project a `NuimoEvent` into the JSON shape consumed by weave-web's
+/// `InputStreamPanel`. Names mirror the edge-core `InputPrimitive` /
+/// mapping-route naming (`press`, `rotate`, `swipe_<dir>`, …) so the
+/// panel can display them without translation.
+fn input_event_json(event: &NuimoEvent) -> Option<serde_json::Value> {
+    use serde_json::json;
+    Some(match event {
+        NuimoEvent::ButtonDown => json!({"input": "press"}),
+        NuimoEvent::ButtonUp => json!({"input": "release"}),
+        NuimoEvent::Rotate { delta, .. } => json!({"input": "rotate", "delta": delta}),
+        NuimoEvent::SwipeUp => json!({"input": "swipe_up"}),
+        NuimoEvent::SwipeDown => json!({"input": "swipe_down"}),
+        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => json!({"input": "swipe_left"}),
+        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => json!({"input": "swipe_right"}),
+        NuimoEvent::TouchTop => json!({"input": "touch_top"}),
+        NuimoEvent::TouchBottom => json!({"input": "touch_bottom"}),
+        NuimoEvent::TouchLeft => json!({"input": "touch_left"}),
+        NuimoEvent::TouchRight => json!({"input": "touch_right"}),
+        NuimoEvent::LongTouchTop => json!({"input": "long_touch_top"}),
+        NuimoEvent::LongTouchBottom => json!({"input": "long_touch_bottom"}),
+        NuimoEvent::LongTouchLeft => json!({"input": "long_touch_left"}),
+        NuimoEvent::LongTouchRight => json!({"input": "long_touch_right"}),
+        NuimoEvent::Hover { proximity } => json!({"input": "hover", "proximity": proximity}),
+        NuimoEvent::BatteryLevel(_)
+        | NuimoEvent::Rssi(_)
+        | NuimoEvent::Connected
+        | NuimoEvent::Disconnected => return None,
+    })
+}
+
 fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
     use edge_core::{Direction, TouchArea};
     Some(match event {
@@ -835,4 +986,155 @@ fn resolve_config_path(cli: Option<&str>) -> anyhow::Result<PathBuf> {
         "no edge-agent config found. Searched:\n  - $EDGE_AGENT_CONFIG (unset)\n{}\nSee docs/config-example.toml in the edge-agent repository for a template.",
         lines.join("\n")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::{broadcast, mpsc};
+
+    fn drain(outbox: &mut mpsc::Receiver<EdgeToServer>) -> Vec<EdgeToServer> {
+        let mut out = Vec::new();
+        while let Ok(frame) = outbox.try_recv() {
+            out.push(frame);
+        }
+        out
+    }
+
+    fn unwrap_device_state(frame: &EdgeToServer) -> (&str, &str, &str, &serde_json::Value) {
+        match frame {
+            EdgeToServer::DeviceState {
+                device_type,
+                device_id,
+                property,
+                value,
+            } => (device_type, device_id, property, value),
+            _ => panic!("expected DeviceState, got {:?}", frame),
+        }
+    }
+
+    #[test]
+    fn input_event_json_projects_core_variants() {
+        assert_eq!(
+            input_event_json(&NuimoEvent::ButtonDown),
+            Some(json!({"input": "press"})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::ButtonUp),
+            Some(json!({"input": "release"})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::Rotate {
+                delta: 0.25,
+                rotation: 0.0
+            }),
+            Some(json!({"input": "rotate", "delta": 0.25})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::SwipeLeft),
+            Some(json!({"input": "swipe_left"})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::FlyRight),
+            Some(json!({"input": "swipe_right"})),
+            "FlyRight collapses onto swipe_right to mirror translate_nuimo_event",
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::TouchTop),
+            Some(json!({"input": "touch_top"})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::LongTouchLeft),
+            Some(json!({"input": "long_touch_left"})),
+        );
+        assert_eq!(
+            input_event_json(&NuimoEvent::Hover { proximity: 0.8 }),
+            Some(json!({"input": "hover", "proximity": 0.8})),
+        );
+    }
+
+    #[test]
+    fn input_event_json_skips_non_input() {
+        assert!(input_event_json(&NuimoEvent::BatteryLevel(87)).is_none());
+        assert!(input_event_json(&NuimoEvent::Rssi(-40)).is_none());
+        assert!(input_event_json(&NuimoEvent::Connected).is_none());
+        assert!(input_event_json(&NuimoEvent::Disconnected).is_none());
+    }
+
+    #[tokio::test]
+    async fn emit_input_device_state_sends_property_input() {
+        let (tx, mut rx) = mpsc::channel::<EdgeToServer>(8);
+        emit_input_device_state(&tx, "dev-123", &NuimoEvent::ButtonDown).await;
+        let frame = rx.try_recv().expect("frame enqueued");
+        let (device_type, device_id, property, value) = unwrap_device_state(&frame);
+        assert_eq!(device_type, "nuimo");
+        assert_eq!(device_id, "dev-123");
+        assert_eq!(property, "input");
+        assert_eq!(value, &json!({"input": "press"}));
+    }
+
+    #[tokio::test]
+    async fn emit_input_device_state_drops_non_input_silently() {
+        let (tx, mut rx) = mpsc::channel::<EdgeToServer>(8);
+        emit_input_device_state(&tx, "dev-123", &NuimoEvent::BatteryLevel(80)).await;
+        emit_input_device_state(&tx, "dev-123", &NuimoEvent::Connected).await;
+        emit_input_device_state(&tx, "dev-123", &NuimoEvent::Disconnected).await;
+        assert!(rx.try_recv().is_err(), "non-input events must not forward");
+    }
+
+    #[tokio::test]
+    async fn device_state_pump_forwards_and_caches_updates() {
+        let (outbox_tx, mut outbox_rx) = mpsc::channel::<EdgeToServer>(16);
+        let (resync_tx, resync_rx) = broadcast::channel::<()>(4);
+        let tx = spawn_device_state_pump("nuimo", "dev-1".to_string(), outbox_tx, resync_rx);
+
+        tx.send(("connected".into(), json!(true))).await.unwrap();
+        tx.send(("battery".into(), json!(87))).await.unwrap();
+
+        // Allow the pump task to drain both messages.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let live = drain(&mut outbox_rx);
+        assert_eq!(live.len(), 2);
+        let connected = unwrap_device_state(&live[0]);
+        assert_eq!(connected.2, "connected");
+        assert_eq!(connected.3, &json!(true));
+        let battery = unwrap_device_state(&live[1]);
+        assert_eq!(battery.2, "battery");
+        assert_eq!(battery.3, &json!(87));
+
+        // Fire a resync and assert both cached values are replayed.
+        resync_tx.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let replayed = drain(&mut outbox_rx);
+        assert_eq!(replayed.len(), 2, "both cached properties must replay");
+        let props: std::collections::HashSet<&str> = replayed
+            .iter()
+            .map(|f| unwrap_device_state(f).2)
+            .collect();
+        assert!(props.contains("connected"));
+        assert!(props.contains("battery"));
+    }
+
+    #[tokio::test]
+    async fn device_state_pump_replays_only_latest_per_property() {
+        let (outbox_tx, mut outbox_rx) = mpsc::channel::<EdgeToServer>(16);
+        let (resync_tx, resync_rx) = broadcast::channel::<()>(4);
+        let tx = spawn_device_state_pump("nuimo", "dev-1".to_string(), outbox_tx, resync_rx);
+
+        tx.send(("battery".into(), json!(80))).await.unwrap();
+        tx.send(("battery".into(), json!(60))).await.unwrap();
+        tx.send(("battery".into(), json!(55))).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drain(&mut outbox_rx); // consume the live stream
+
+        resync_tx.send(()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let replayed = drain(&mut outbox_rx);
+        assert_eq!(replayed.len(), 1, "cache is keyed by property");
+        let (_, _, property, value) = unwrap_device_state(&replayed[0]);
+        assert_eq!(property, "battery");
+        assert_eq!(value, &json!(55), "latest value wins");
+    }
 }
