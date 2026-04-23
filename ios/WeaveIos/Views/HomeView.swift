@@ -1,5 +1,4 @@
 @preconcurrency import SwiftUI
-@preconcurrency import WeaveIosCore
 
 /// Minimal Phase 3 surface: scan/connect controls, a recent-event feed, and
 /// an LED test button. Roon control, mappings, glyph editor come in later

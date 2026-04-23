@@ -1,7 +1,6 @@
 @preconcurrency import CoreBluetooth
 import Foundation
 import Observation
-@preconcurrency import WeaveIosCore
 
 /// A single paired Nuimo peripheral. Observed by views for connection state
 /// and battery.
