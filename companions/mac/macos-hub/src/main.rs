@@ -64,9 +64,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut mute_restore: Option<u8> = None;
         while let Some((topic, payload)) = command_rx.recv().await {
-            tracing::debug!("cmd topic={} payload={}", topic, payload);
+            tracing::info!("handling command: topic={} payload={}", topic, payload);
             match command_handler::handle_command(&topic, &payload, &mut mute_restore).await {
                 Ok(fx) => {
+                    tracing::info!(
+                        "command handled: volume_changed={} output_changed={}",
+                        fx.volume_changed,
+                        fx.output_changed
+                    );
                     if fx.volume_changed {
                         if let Err(e) = republish_volume(&cmd_client, &cmd_edge_id).await {
                             tracing::warn!("republish volume error: {}", e);
@@ -81,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => tracing::warn!("command error on {}: {}", topic, e),
             }
         }
+        tracing::warn!("command_rx closed; handler task exiting");
     });
 
     // Periodic re-publish of volume + output_device. Catches external changes

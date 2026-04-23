@@ -43,6 +43,7 @@ impl MqttBridge {
         self.client
             .subscribe("service/macos/+/command/+", QoS::AtLeastOnce)
             .await?;
+        tracing::info!("subscribed to service/macos/+/command/+ (queued; will be sent on ConnAck)");
 
         let command_tx = self.command_tx.clone();
         let client = self.client.clone();
@@ -50,13 +51,32 @@ impl MqttBridge {
         tokio::spawn(async move {
             loop {
                 match self.event_loop.poll().await {
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(ack))) => {
+                        tracing::info!("MQTT ConnAck: code={:?}, session_present={}", ack.code, ack.session_present);
+                    }
+                    Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(ack))) => {
+                        tracing::info!("MQTT SubAck: pkid={}, return_codes={:?}", ack.pkid, ack.return_codes);
+                    }
                     Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(msg))) => {
+                        tracing::info!(
+                            "MQTT Publish received: topic={} qos={:?} payload_len={}",
+                            msg.topic,
+                            msg.qos,
+                            msg.payload.len()
+                        );
                         let topic = msg.topic.clone();
                         if let Ok(payload) = String::from_utf8(msg.payload.to_vec()) {
-                            let _ = command_tx.send((topic, payload)).await;
+                            match command_tx.send((topic, payload)).await {
+                                Ok(()) => tracing::debug!("forwarded to command_rx"),
+                                Err(e) => tracing::error!("command_tx.send failed: {}", e),
+                            }
+                        } else {
+                            tracing::warn!("Publish payload is not valid UTF-8, dropping");
                         }
                     }
-                    Ok(_) => {}
+                    Ok(other) => {
+                        tracing::trace!("MQTT other event: {:?}", other);
+                    }
                     Err(e) => {
                         tracing::warn!("MQTT error: {}", e);
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
