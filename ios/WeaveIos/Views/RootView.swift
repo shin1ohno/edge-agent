@@ -6,6 +6,9 @@ struct RootView: View {
             ConnectionsView()
                 .tabItem { Label("Connections", systemImage: "network") }
 
+            MappingsListView()
+                .tabItem { Label("Mappings", systemImage: "arrow.left.arrow.right.square") }
+
             HomeView()
                 .tabItem { Label("Nuimo", systemImage: "dot.radiowaves.left.and.right") }
 
