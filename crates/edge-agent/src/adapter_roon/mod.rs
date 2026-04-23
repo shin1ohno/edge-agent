@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use async_trait::async_trait;
+use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use roon_api::{
     ControlAction, FileTokenStore, MuteAction, RoonClient, RoonClientBuilder, RoonEvent, SeekMode,
     Transport, VolumeMode, Zone, ZoneEvent,

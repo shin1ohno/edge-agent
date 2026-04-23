@@ -26,7 +26,14 @@ fn button_up_parses_as_button_up() {
 #[test]
 fn button_empty_payload_is_error() {
     let err = parse_notification(&BUTTON_CLICK, &[]).unwrap_err();
-    assert!(matches!(err, ParseError::TooShort { kind: "button_click", got: 0, need: 1 }));
+    assert!(matches!(
+        err,
+        ParseError::TooShort {
+            kind: "button_click",
+            got: 0,
+            need: 1
+        }
+    ));
 }
 
 // --- Rotation -------------------------------------------------------------
@@ -34,7 +41,9 @@ fn button_empty_payload_is_error() {
 #[test]
 fn rotation_positive_100_produces_expected_delta() {
     // 100 points / 2650 points-per-cycle
-    let ev = parse_notification(&ROTATION, &[0x64, 0x00]).unwrap().unwrap();
+    let ev = parse_notification(&ROTATION, &[0x64, 0x00])
+        .unwrap()
+        .unwrap();
     match ev {
         NuimoEvent::Rotate { delta, rotation } => {
             assert!((delta - 100.0 / 2650.0).abs() < 1e-9, "delta was {delta}");
@@ -47,7 +56,9 @@ fn rotation_positive_100_produces_expected_delta() {
 #[test]
 fn rotation_negative_100_produces_negative_delta() {
     // i16::from_le_bytes([0x9C, 0xFF]) = -100
-    let ev = parse_notification(&ROTATION, &[0x9C, 0xFF]).unwrap().unwrap();
+    let ev = parse_notification(&ROTATION, &[0x9C, 0xFF])
+        .unwrap()
+        .unwrap();
     match ev {
         NuimoEvent::Rotate { delta, .. } => {
             assert!((delta + 100.0 / 2650.0).abs() < 1e-9, "delta was {delta}");
@@ -59,7 +70,14 @@ fn rotation_negative_100_produces_negative_delta() {
 #[test]
 fn rotation_single_byte_is_too_short() {
     let err = parse_notification(&ROTATION, &[0x64]).unwrap_err();
-    assert!(matches!(err, ParseError::TooShort { kind: "rotation", got: 1, need: 2 }));
+    assert!(matches!(
+        err,
+        ParseError::TooShort {
+            kind: "rotation",
+            got: 1,
+            need: 2
+        }
+    ));
 }
 
 // --- Swipe / Touch --------------------------------------------------------
@@ -156,7 +174,10 @@ fn fly_hover_returns_clamped_proximity() {
     let ev = parse_notification(&FLY, &[0x04, 125]).unwrap().unwrap();
     match ev {
         NuimoEvent::Hover { proximity } => {
-            assert!(proximity > 0.49 && proximity < 0.51, "proximity was {proximity}");
+            assert!(
+                proximity > 0.49 && proximity < 0.51,
+                "proximity was {proximity}"
+            );
         }
         other => panic!("expected Hover, got {other:?}"),
     }

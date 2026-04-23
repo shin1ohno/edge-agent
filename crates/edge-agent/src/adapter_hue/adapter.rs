@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use async_trait::async_trait;
+use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use tokio::sync::broadcast;
 
 use super::api::HueClient;
