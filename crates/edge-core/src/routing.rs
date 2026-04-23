@@ -409,7 +409,7 @@ fn build_intent(route: &Route, input: &InputPrimitive) -> Option<Intent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge_core::Direction;
+    use crate::Direction;
     use std::collections::BTreeMap;
     use uuid::Uuid;
     use weave_contracts::Route;

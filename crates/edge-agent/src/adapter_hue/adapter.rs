@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::edge_core::{Intent, ServiceAdapter, StateUpdate};
+use edge_core::{Intent, ServiceAdapter, StateUpdate};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::edge_core::StateUpdate;
+use edge_core::StateUpdate;
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
 

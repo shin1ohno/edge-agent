@@ -16,7 +16,6 @@ mod adapter_hue;
 #[cfg(feature = "roon")]
 mod adapter_roon;
 mod config;
-mod edge_core;
 mod glyphs;
 #[cfg(feature = "hue")]
 mod hue_token;

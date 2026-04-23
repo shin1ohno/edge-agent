@@ -1,0 +1,22 @@
+[package]
+name = "edge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Transport-agnostic routing, service-adapter trait, and WebSocket client shared between the native edge-agent binary and other device hosts (iOS, future targets)."
+
+[dependencies]
+weave-contracts = { version = "0.5", path = "../weave-contracts" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
