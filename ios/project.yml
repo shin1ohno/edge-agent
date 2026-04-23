@@ -1,0 +1,65 @@
+# XcodeGen spec for WeaveIos. Generate the Xcode project with:
+#   brew install xcodegen   # one-time
+#   cd ios && xcodegen       # re-run whenever this file or sources change
+name: WeaveIos
+options:
+  bundleIdPrefix: com.shin1ohno.weave
+  deploymentTarget:
+    iOS: "18.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    # Personal Team signing — let Xcode pick the team automatically.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+
+targets:
+  WeaveIos:
+    type: application
+    platform: iOS
+    sources:
+      - path: WeaveIos
+        excludes:
+          - "Bundle/*"            # UniFFI-generated Swift lives here (.gitignored)
+      - path: WeaveIos/Bundle
+        optional: true             # present only after build-xcframework.sh runs
+    resources:
+      - WeaveIos/Info.plist
+    dependencies:
+      - framework: Frameworks/WeaveIosCore.xcframework
+        embed: true
+    info:
+      path: WeaveIos/Info.plist
+      properties:
+        CFBundleDisplayName: Weave
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: ""
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - bluetooth-central
+        NSBluetoothAlwaysUsageDescription: >
+          Weave connects to Nuimo controllers over Bluetooth Low Energy to
+          bridge gestures (rotate, press, swipe) to Roon playback and Hue
+          lights.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shin1ohno.weave.WeaveIos
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"       # iPhone + iPad
+        SUPPORTS_MACCATALYST: "NO"
