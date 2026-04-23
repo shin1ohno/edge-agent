@@ -32,8 +32,12 @@ toml = "0.8"
 # simpler and avoids a heavy build-dep.
 #
 # `core-foundation-sys` handles the CFString boilerplate (CFRelease, CFStringGetCString).
+# `objc2` + `objc2-foundation` gives us NSEvent for injecting media-key events —
+# the CGEvent-only path was unreliable (field indices vary across macOS releases).
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8"
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
 
 [[bin]]
 name = "macos-hub"

@@ -1,49 +1,41 @@
-//! CGEvent media-key injection.
+//! Media-key injection via AppKit's NSEvent.
 //!
-//! Media keys (play/pause, next, previous) are NX system-defined events
-//! (NSEvent.type == NSSystemDefined == 14), subtype 8. They cannot be sent
-//! via `CGEventCreateKeyboardEvent` (which is for Unicode keyboard keys).
+//! Media keys on macOS are `NSEventType::SystemDefined` (14) events with
+//! subtype 8 and a data1 payload encoding `(keyCode << 16) | (keyState << 8)`.
+//! The previous CGEvent-only path (CGEventCreate + CGEventSetType(14) +
+//! CGEventSetIntegerValueField(..., 155, data1)) did NOT reach Music.app on
+//! macOS 15 — the integer field index is not part of public API and the
+//! NSEvent wrapper is the canonical bridge.
 //!
-//! The pattern used below is the classic "NSEvent otherEventWithType:14
-//! subtype:8 data1:((keyCode << 16) | (keyState << 8))" + `cgEvent` + post.
-//! We avoid depending on AppKit by constructing the CGEvent directly with
-//! the private system-defined event type 14 and setting integer field 42
-//! (`kCGEventSourceUserData`-adjacent index used by the NX subtype encoding).
+//! This implementation constructs the NSEvent via
+//! `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:]`,
+//! extracts its CGEvent ref, and posts via `CGEventPost(kCGHIDEventTap, ...)`.
 //!
-//! Key states:
-//!   0xA (= NX_KEYDOWN = 10) key-down
-//!   0xB (= NX_KEYUP   = 11) key-up
+//! `CGEventPost` silently drops events if the process lacks Accessibility
+//! permission (System Settings → Privacy & Security → Accessibility →
+//! enable the app / terminal from which macos-hub was launched). An
+//! explicit `AXIsProcessTrusted()` check at startup is provided.
 //!
-//! NX key codes:
+//! Key codes (from IOKit/hidsystem/ev_keymap.h):
 //!   16 NX_KEYTYPE_PLAY
 //!   17 NX_KEYTYPE_NEXT
 //!   18 NX_KEYTYPE_PREVIOUS
 //!   19 NX_KEYTYPE_FAST
 //!   20 NX_KEYTYPE_REWIND
+//!
+//! Key states:
+//!   0xA (= 10) NX key-down
+//!   0xB (= 11) NX key-up
 
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
 
 use anyhow::{bail, Result};
-
-// CGEventType::NSSystemDefined is 14. CGEvent wraps NSEvent, so we set this
-// type then use CGEventSetIntegerValueField with field index 155
-// (= kCGEventSourceStateID on some SDKs) — but the stable way is to create
-// the event via NSEvent.otherEventWithType. Without AppKit linkage, we use
-// a widely-used workaround: call CGEventCreate(NULL) to get a blank event,
-// set its type to 14 via CGEventSetType, then write data1 into the event
-// source's integer field 99 (subtype/data encoding used by the NX HID path).
-//
-// If this lower-level path does not register with Music/QuickTime on the
-// target macOS version, the fallback is to link AppKit and use:
-//   NSEvent *e = [NSEvent otherEventWithType:NSEventTypeSystemDefined
-//                                   location:NSZeroPoint
-//                              modifierFlags:0xa00 timestamp:0 windowNumber:0
-//                                    context:nil subtype:8 data1:data1 data2:-1];
-//   CGEventPost(kCGHIDEventTap, e.CGEvent);
-//
-// See README "Media keys troubleshooting" for operator notes.
+use objc2::rc::autoreleasepool;
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send};
+use objc2_foundation::NSPoint;
 
 pub const NX_KEYTYPE_PLAY: u8 = 16;
 pub const NX_KEYTYPE_NEXT: u8 = 17;
@@ -52,52 +44,63 @@ pub const NX_KEYTYPE_PREVIOUS: u8 = 18;
 const NX_KEY_DOWN: u8 = 0x0A;
 const NX_KEY_UP: u8 = 0x0B;
 
-// CGEventTapLocation values.
+// NSEventType::SystemDefined
+const NS_SYSTEM_DEFINED: u64 = 14;
+// NSSystemDefined subtype for media/HID keys.
+const MEDIA_KEY_SUBTYPE: i16 = 8;
+
+// CGEventTapLocation::kCGHIDEventTap
 const K_CG_HID_EVENT_TAP: u32 = 0;
 
-// NSSystemDefined event type.
-const NS_SYSTEM_DEFINED: u32 = 14;
-
-// Integer-value field index for subtype+data1 encoding on NSSystemDefined
-// events. This matches what AppKit emits when you call
-// -[NSEvent otherEventWithType:NSSystemDefined subtype:8 data1:(...)].
-//
-// IMPORTANT OPERATOR VERIFICATION FLAG: this field index is not covered by
-// public Apple documentation. Values that have been observed to work on
-// macOS 12-15 for this route include 155 and 99; common reference
-// implementations (Apple engineering samples, remote-media-keys tools) use
-// the AppKit bridge instead. If CGEvent posting does not reach Music.app
-// on your target macOS, switch to the AppKit-linked path noted at the top
-// of this file.
-const NS_SYSTEM_DEFINED_DATA1_FIELD: u32 = 155;
-
-// Opaque CGEventRef pointer.
 type CGEventRef = *mut c_void;
+
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGEventCreate(source: *const c_void) -> CGEventRef;
-    fn CGEventSetType(event: CGEventRef, event_type: u32);
-    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: CGEventRef);
-    fn CFRelease(cf: *const c_void);
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
+/// Returns true if the process has Accessibility permission.
+/// `CGEventPost` silently no-ops without it — calling this at startup lets
+/// us warn loudly instead of puzzling over why play/pause does nothing.
+pub fn is_accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 fn post_media_key(key_code: u8, key_state: u8) -> Result<()> {
-    unsafe {
-        let event = CGEventCreate(std::ptr::null());
+    let data1: isize = ((key_code as isize) << 16) | ((key_state as isize) << 8);
+
+    autoreleasepool(|_| unsafe {
+        let cls = class!(NSEvent);
+        let event: *mut AnyObject = msg_send![
+            cls,
+            otherEventWithType: NS_SYSTEM_DEFINED,
+            location: NSPoint::new(0.0, 0.0),
+            modifierFlags: 0xa00u64,
+            timestamp: 0f64,
+            windowNumber: 0isize,
+            context: std::ptr::null::<AnyObject>(),
+            subtype: MEDIA_KEY_SUBTYPE,
+            data1: data1,
+            data2: -1isize,
+        ];
         if event.is_null() {
-            bail!("CGEventCreate returned null");
+            bail!("NSEvent otherEventWithType: returned nil");
         }
-        CGEventSetType(event, NS_SYSTEM_DEFINED);
-        // subtype 8 is implicit for system-defined HID events emitted by
-        // NSEvent; the data1 payload is (keyCode << 16) | (keyState << 8).
-        let data1: i64 = ((key_code as i64) << 16) | ((key_state as i64) << 8);
-        CGEventSetIntegerValueField(event, NS_SYSTEM_DEFINED_DATA1_FIELD, data1);
-        CGEventPost(K_CG_HID_EVENT_TAP, event);
-        CFRelease(event as *const c_void);
-    }
-    Ok(())
+        let cg_event: CGEventRef = msg_send![event, CGEvent];
+        if cg_event.is_null() {
+            bail!("NSEvent.CGEvent returned null");
+        }
+        CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
+        Ok(())
+    })
 }
 
 fn tap_media_key(key_code: u8) -> Result<()> {

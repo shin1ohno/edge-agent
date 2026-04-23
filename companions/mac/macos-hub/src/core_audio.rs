@@ -349,40 +349,89 @@ pub fn set_default_output(id: u32) -> Result<()> {
     }
 }
 
-/// Read system volume (0.0..=1.0) of the current default output device via
-/// `kAudioDevicePropertyVolumeScalar` on scope Output, element main.
+/// Read volume scalar at a specific element. Returns the raw `f32` in
+/// the Core Audio convention (0.0..=1.0), NOT clamped. Caller clamps.
+unsafe fn get_volume_scalar_at(device: AudioObjectID, element: u32) -> Result<f32> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        mScope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        mElement: element,
+    };
+    let mut size: u32 = std::mem::size_of::<f32>() as u32;
+    let mut value: f32 = 0.0;
+    check(
+        AudioObjectGetPropertyData(
+            device,
+            &addr,
+            0,
+            ptr::null(),
+            &mut size,
+            &mut value as *mut f32 as *mut c_void,
+        ),
+        &format!("get volume scalar element={}", element),
+    )?;
+    Ok(value)
+}
+
+/// Write volume scalar at a specific element.
+unsafe fn set_volume_scalar_at(device: AudioObjectID, element: u32, level: f32) -> Result<()> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        mScope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        mElement: element,
+    };
+    let size = std::mem::size_of::<f32>() as u32;
+    check(
+        AudioObjectSetPropertyData(
+            device,
+            &addr,
+            0,
+            ptr::null(),
+            size,
+            &level as *const f32 as *const c_void,
+        ),
+        &format!("set volume scalar element={}", element),
+    )
+}
+
+/// Read system volume (0.0..=1.0) of the current default output device.
 ///
-/// Devices that don't expose a main volume element return an error; per-channel
-/// iteration fallback is a TODO.
+/// Strategy: try the main element (0) first — fastest path for devices
+/// that aggregate channel volumes. On `kAudioHardwareIllegalOperationError`
+/// (OSStatus 'what' = 2003332927), fall back to iterating per-channel
+/// elements (1, 2, ...) and averaging. Built-in Mac outputs typically
+/// require the per-channel path.
 pub fn get_system_volume() -> Result<f32> {
     unsafe {
         let device = get_default_output()?;
         if device == 0 {
             bail!("no default output device");
         }
-        let addr = prop_addr(
-            K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
-            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
-        );
-        let mut size: u32 = std::mem::size_of::<f32>() as u32;
-        let mut value: f32 = 0.0;
-        check(
-            AudioObjectGetPropertyData(
-                device,
-                &addr,
-                0,
-                ptr::null(),
-                &mut size,
-                &mut value as *mut f32 as *mut c_void,
-            ),
-            "get volume scalar",
-        )?;
-        Ok(value.clamp(0.0, 1.0))
+        if let Ok(v) = get_volume_scalar_at(device, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN) {
+            return Ok(v.clamp(0.0, 1.0));
+        }
+        // Per-channel fallback: accumulate readable elements, average them.
+        let mut sum = 0.0f32;
+        let mut count = 0u32;
+        for element in 1..=8u32 {
+            if let Ok(v) = get_volume_scalar_at(device, element) {
+                sum += v;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            bail!("no readable volume elements on default output device");
+        }
+        Ok((sum / count as f32).clamp(0.0, 1.0))
     }
 }
 
-/// Set system volume (0.0..=1.0) on the current default output device via
-/// `kAudioDevicePropertyVolumeScalar`. Out-of-range inputs are clamped.
+/// Set system volume (0.0..=1.0) on the current default output device.
+/// Out-of-range inputs are clamped.
+///
+/// Strategy: try the main element first; on failure, iterate per-channel
+/// elements (1..=8) and set every element that accepts the write. At
+/// least one write must succeed or the call errors.
 pub fn set_system_volume(level: f32) -> Result<()> {
     unsafe {
         let device = get_default_output()?;
@@ -390,22 +439,21 @@ pub fn set_system_volume(level: f32) -> Result<()> {
             bail!("no default output device");
         }
         let clamped = level.clamp(0.0, 1.0);
-        let addr = prop_addr(
-            K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
-            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
-        );
-        let size = std::mem::size_of::<f32>() as u32;
-        check(
-            AudioObjectSetPropertyData(
-                device,
-                &addr,
-                0,
-                ptr::null(),
-                size,
-                &clamped as *const f32 as *const c_void,
-            ),
-            "set volume scalar",
-        )
+        if set_volume_scalar_at(device, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN, clamped).is_ok() {
+            return Ok(());
+        }
+        // Per-channel fallback.
+        let mut any_ok = false;
+        for element in 1..=8u32 {
+            if set_volume_scalar_at(device, element, clamped).is_ok() {
+                any_ok = true;
+            }
+        }
+        if any_ok {
+            Ok(())
+        } else {
+            bail!("no writable volume elements on default output device")
+        }
     }
 }
 

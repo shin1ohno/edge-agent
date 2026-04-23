@@ -11,10 +11,10 @@ mod media_keys_stub;
 mod mqtt;
 
 #[cfg(target_os = "macos")]
-use crate::core_audio as audio;
+use crate::{core_audio as audio, media_keys};
 
 #[cfg(not(target_os = "macos"))]
-use crate::core_audio_stub as audio;
+use crate::{core_audio_stub as audio, media_keys_stub as media_keys};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,6 +42,17 @@ async fn main() -> anyhow::Result<()> {
         config.mqtt.host,
         config.mqtt.port,
     );
+
+    if !media_keys::is_accessibility_trusted() {
+        tracing::warn!(
+            "Accessibility permission NOT granted — CGEventPost will silently drop \
+             media-key events. Grant permission in System Settings → Privacy & \
+             Security → Accessibility (add the binary or the terminal running it). \
+             Volume and output switching do not require this; media keys do."
+        );
+    } else {
+        tracing::info!("Accessibility permission OK");
+    }
 
     // MQTT bridge
     let bridge = mqtt::MqttBridge::new(&config.mqtt);

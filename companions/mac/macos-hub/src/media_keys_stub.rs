@@ -4,6 +4,10 @@
 
 use anyhow::{bail, Result};
 
+pub fn is_accessibility_trusted() -> bool {
+    true // stub: pretend trusted so Linux CI path doesn't complain
+}
+
 pub fn play_pause() -> Result<()> {
     bail!("media keys are only available on macOS")
 }
