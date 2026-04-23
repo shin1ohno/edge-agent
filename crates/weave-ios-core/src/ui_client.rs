@@ -1,10 +1,15 @@
-//! `UiClient` — WebSocket `/ws/ui` + REST `/api/*` client for the iOS app.
+//! `UiClient` — WebSocket `/ws/ui` + REST `/api/...` client for the iOS app.
 //!
 //! Frames arrive from `/ws/ui` as JSON and are forwarded to Swift verbatim
 //! via [`UiEventSink::on_frame_json`]. Swift side decodes with `Codable`.
 //! REST calls return JSON strings Swift also decodes with `Codable`. This
 //! avoids mirroring the entire `weave-contracts` type surface through
 //! UniFFI records.
+//!
+//! Note: avoid writing `/api/*` (with a literal asterisk) in doc comments —
+//! when UniFFI copies the doc text into the generated Swift `/** ... */`
+//! block, Swift's nested-comment rules see `/*` and open an inner block
+//! that never closes, producing a compile error.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +43,7 @@ pub struct UiClient {
 impl UiClient {
     /// Connect to weave-server. `server_url` must include scheme + port,
     /// e.g. `"http://pro.home.local:3100"`. The same origin serves
-    /// `/ws/ui` and `/api/*`; we derive `ws://` / `wss://` variants.
+    /// `/ws/ui` and the REST API; we derive `ws://` / `wss://` variants.
     ///
     /// The WebSocket loop is spawned on the tokio runtime UniFFI hosts for
     /// this crate; callers hold the returned `Arc` and invoke
