@@ -127,11 +127,7 @@ impl UiClient {
         self.get_text("/api/glyphs").await
     }
 
-    pub async fn upsert_glyph(
-        &self,
-        name: String,
-        glyph_json: String,
-    ) -> Result<String, WeaveError> {
+    pub async fn upsert_glyph(&self, name: String, glyph_json: String) -> Result<String, WeaveError> {
         self.put_json(&format!("/api/glyphs/{name}"), &glyph_json)
             .await
     }
@@ -238,7 +234,11 @@ fn derive_ws_url(http_base: &str) -> Result<String, WeaveError> {
 
 // ----- WebSocket loop -----------------------------------------------------
 
-async fn run_ws_loop(url: String, sink: Arc<dyn UiEventSink>, mut shutdown_rx: mpsc::Receiver<()>) {
+async fn run_ws_loop(
+    url: String,
+    sink: Arc<dyn UiEventSink>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
 
@@ -321,7 +321,10 @@ mod tests {
             normalize_base("ws://host:3100").unwrap(),
             "http://host:3100"
         );
-        assert_eq!(normalize_base("wss://host/").unwrap(), "https://host");
+        assert_eq!(
+            normalize_base("wss://host/").unwrap(),
+            "https://host"
+        );
     }
 
     #[test]
@@ -338,6 +341,9 @@ mod tests {
             derive_ws_url("http://host:3100").unwrap(),
             "ws://host:3100/ws/ui"
         );
-        assert_eq!(derive_ws_url("https://host").unwrap(), "wss://host/ws/ui");
+        assert_eq!(
+            derive_ws_url("https://host").unwrap(),
+            "wss://host/ws/ui"
+        );
     }
 }
