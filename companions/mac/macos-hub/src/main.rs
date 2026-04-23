@@ -57,6 +57,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Accessibility permission OK");
     }
 
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        "Default audio output at startup: {}",
+        audio::describe_default_output()
+    );
+    #[cfg(target_os = "macos")]
+    match audio::list_outputs() {
+        Ok(devs) => {
+            tracing::info!("All output devices ({}):", devs.len());
+            for d in &devs {
+                tracing::info!(
+                    "  id={} uid={:?} name={:?} transport=0x{:08x} is_airplay={}",
+                    d.id, d.uid, d.name, d.transport_type, d.is_airplay
+                );
+            }
+        }
+        Err(e) => tracing::warn!("list_outputs error: {}", e),
+    }
+
     // MQTT bridge
     let bridge = mqtt::MqttBridge::new(&config.mqtt);
     let (client, mut command_rx) = bridge.start().await?;

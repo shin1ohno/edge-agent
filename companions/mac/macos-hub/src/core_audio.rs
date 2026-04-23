@@ -431,7 +431,7 @@ fn volume_candidates() -> Vec<(AudioObjectPropertySelector, u32)> {
 }
 
 /// Describe the current default output device for diagnostic logs.
-fn describe_default_output() -> String {
+pub fn describe_default_output() -> String {
     match get_default_output() {
         Err(e) => format!("<error: {}>", e),
         Ok(0) => "<none>".to_string(),
@@ -439,7 +439,7 @@ fn describe_default_output() -> String {
             Err(e) => format!("id={} <list error: {}>", id, e),
             Ok(devices) => match devices.iter().find(|d| d.id == id) {
                 Some(d) => format!(
-                    "id={} uid={:?} name={:?} transport={:08x} is_airplay={}",
+                    "id={} uid={:?} name={:?} transport=0x{:08x} is_airplay={}",
                     d.id, d.uid, d.name, d.transport_type, d.is_airplay
                 ),
                 None => format!("id={} (not in list_outputs output)", id),
@@ -488,27 +488,30 @@ pub fn set_system_volume(level: f32) -> Result<()> {
         let clamped = level.clamp(0.0, 1.0);
 
         // First try vmvc main + volu main — single-shot writes.
-        for (selector, element) in [
+        for (selector, element, label) in [
             (
                 K_AUDIO_HW_SERVICE_VIRTUAL_MAIN_VOLUME,
                 K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+                "vmvc main",
             ),
             (
                 K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
                 K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+                "volu main",
             ),
         ] {
             if set_f32_at(device, selector, element, clamped).is_ok() {
-                tracing::debug!(
-                    "volume set via selector={:08x} element={}",
-                    selector, element
+                tracing::info!(
+                    "volume set via {} on device ({})",
+                    label,
+                    describe_default_output()
                 );
                 return Ok(());
             }
         }
 
         // Per-channel volu fallback — write every channel that accepts it.
-        let mut any_ok = false;
+        let mut channels_written = Vec::new();
         for element in 1..=8u32 {
             if set_f32_at(
                 device,
@@ -518,11 +521,15 @@ pub fn set_system_volume(level: f32) -> Result<()> {
             )
             .is_ok()
             {
-                any_ok = true;
+                channels_written.push(element);
             }
         }
-        if any_ok {
-            tracing::debug!("volume set via per-channel volu fallback");
+        if !channels_written.is_empty() {
+            tracing::info!(
+                "volume set via per-channel volu on elements {:?} on device ({})",
+                channels_written,
+                describe_default_output()
+            );
             return Ok(());
         }
 
