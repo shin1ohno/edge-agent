@@ -10,8 +10,9 @@
 //! - `kAudioDevicePropertyDeviceUID` (global scope) — stable UID (CFString)
 //! - `kAudioDevicePropertyTransportType` (output scope) — FourCC, `airp` = AirPlay
 //! - `kAudioHardwarePropertyDefaultOutputDevice` (global scope) — get/set default
-//! - `kAudioHardwareServiceDeviceProperty_VirtualMainVolume` (output scope,
-//!   element main) — system volume 0.0..=1.0 via `AudioHardwareServiceGetPropertyData`
+//! - `kAudioDevicePropertyVolumeScalar` (output scope, element main) —
+//!   system volume 0.0..=1.0 read/written via `AudioObjectGetPropertyData`
+//!   on the current default output device
 //!
 //! We implement raw FFI rather than pulling `coreaudio-sys` (RustAudio). The
 //! surface is narrow: 4 AudioObject property functions + 2 HardwareService
@@ -39,8 +40,10 @@ pub type AudioObjectPropertyScope = u32;
 pub type AudioObjectPropertyElement = u32;
 pub type OSStatus = i32;
 
+// Apple's C struct uses `mSelector` / `mScope` / `mElement` naming. Keep as-is.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct AudioObjectPropertyAddress {
     pub mSelector: AudioObjectPropertySelector,
     pub mScope: AudioObjectPropertyScope,
@@ -64,8 +67,12 @@ pub const K_AUDIO_DEVICE_PROPERTY_STREAMS: AudioObjectPropertySelector = four_cc
 pub const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: AudioObjectPropertySelector = four_cc(b"uid ");
 pub const K_AUDIO_OBJECT_PROPERTY_NAME: AudioObjectPropertySelector = four_cc(b"lnam");
 pub const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: AudioObjectPropertySelector = four_cc(b"tran");
-pub const K_AUDIO_HW_SERVICE_DEVICE_PROPERTY_VIRTUAL_MAIN_VOLUME: AudioObjectPropertySelector =
-    four_cc(b"vmvc");
+/// `kAudioDevicePropertyVolumeScalar` — per-channel scalar volume [0.0..=1.0].
+/// Used with scope Output and element main for the aggregate main volume on
+/// devices that expose it. Replaces the deprecated
+/// `AudioHardwareServiceGetPropertyData` + `kAudioHardwareServiceDeviceProperty_VirtualMainVolume`
+/// pair which was removed from the CoreAudio framework in modern macOS SDKs.
+pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR: AudioObjectPropertySelector = four_cc(b"volu");
 
 // Scopes.
 pub const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: AudioObjectPropertyScope = four_cc(b"glob");
@@ -104,25 +111,6 @@ extern "C" {
     ) -> OSStatus;
 
     fn AudioObjectSetPropertyData(
-        in_object_id: AudioObjectID,
-        in_address: *const AudioObjectPropertyAddress,
-        in_qualifier_data_size: u32,
-        in_qualifier_data: *const c_void,
-        in_data_size: u32,
-        in_data: *const c_void,
-    ) -> OSStatus;
-
-    // AudioHardwareService* — in the CoreAudio framework since macOS 10.5.
-    fn AudioHardwareServiceGetPropertyData(
-        in_object_id: AudioObjectID,
-        in_address: *const AudioObjectPropertyAddress,
-        in_qualifier_data_size: u32,
-        in_qualifier_data: *const c_void,
-        io_data_size: *mut u32,
-        out_data: *mut c_void,
-    ) -> OSStatus;
-
-    fn AudioHardwareServiceSetPropertyData(
         in_object_id: AudioObjectID,
         in_address: *const AudioObjectPropertyAddress,
         in_qualifier_data_size: u32,
@@ -362,8 +350,10 @@ pub fn set_default_output(id: u32) -> Result<()> {
 }
 
 /// Read system volume (0.0..=1.0) of the current default output device via
-/// `AudioHardwareServiceGetPropertyData` — the selector that controls the
-/// menubar slider.
+/// `kAudioDevicePropertyVolumeScalar` on scope Output, element main.
+///
+/// Devices that don't expose a main volume element return an error; per-channel
+/// iteration fallback is a TODO.
 pub fn get_system_volume() -> Result<f32> {
     unsafe {
         let device = get_default_output()?;
@@ -371,13 +361,13 @@ pub fn get_system_volume() -> Result<f32> {
             bail!("no default output device");
         }
         let addr = prop_addr(
-            K_AUDIO_HW_SERVICE_DEVICE_PROPERTY_VIRTUAL_MAIN_VOLUME,
+            K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
             K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
         );
         let mut size: u32 = std::mem::size_of::<f32>() as u32;
         let mut value: f32 = 0.0;
         check(
-            AudioHardwareServiceGetPropertyData(
+            AudioObjectGetPropertyData(
                 device,
                 &addr,
                 0,
@@ -385,13 +375,14 @@ pub fn get_system_volume() -> Result<f32> {
                 &mut size,
                 &mut value as *mut f32 as *mut c_void,
             ),
-            "get virtual main volume",
+            "get volume scalar",
         )?;
         Ok(value.clamp(0.0, 1.0))
     }
 }
 
-/// Set system volume (0.0..=1.0). Out-of-range inputs are clamped.
+/// Set system volume (0.0..=1.0) on the current default output device via
+/// `kAudioDevicePropertyVolumeScalar`. Out-of-range inputs are clamped.
 pub fn set_system_volume(level: f32) -> Result<()> {
     unsafe {
         let device = get_default_output()?;
@@ -400,12 +391,12 @@ pub fn set_system_volume(level: f32) -> Result<()> {
         }
         let clamped = level.clamp(0.0, 1.0);
         let addr = prop_addr(
-            K_AUDIO_HW_SERVICE_DEVICE_PROPERTY_VIRTUAL_MAIN_VOLUME,
+            K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
             K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
         );
         let size = std::mem::size_of::<f32>() as u32;
         check(
-            AudioHardwareServiceSetPropertyData(
+            AudioObjectSetPropertyData(
                 device,
                 &addr,
                 0,
@@ -413,7 +404,7 @@ pub fn set_system_volume(level: f32) -> Result<()> {
                 size,
                 &clamped as *const f32 as *const c_void,
             ),
-            "set virtual main volume",
+            "set volume scalar",
         )
     }
 }
