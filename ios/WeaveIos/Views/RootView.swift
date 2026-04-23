@@ -3,8 +3,11 @@
 struct RootView: View {
     var body: some View {
         TabView {
+            ConnectionsView()
+                .tabItem { Label("Connections", systemImage: "network") }
+
             HomeView()
-                .tabItem { Label("Home", systemImage: "house") }
+                .tabItem { Label("Nuimo", systemImage: "dot.radiowaves.left.and.right") }
 
             GlyphListView()
                 .tabItem { Label("Glyphs", systemImage: "square.grid.3x3.square") }
