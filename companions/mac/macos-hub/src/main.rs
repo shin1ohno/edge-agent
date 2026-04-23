@@ -46,15 +46,15 @@ async fn main() -> anyhow::Result<()> {
         config.mqtt.port,
     );
 
-    if !media_keys::is_accessibility_trusted() {
-        tracing::warn!(
-            "Accessibility permission NOT granted — CGEventPost will silently drop \
-             media-key events. Grant permission in System Settings → Privacy & \
-             Security → Accessibility (add the binary or the terminal running it). \
-             Volume and output switching do not require this; media keys do."
-        );
+    if media_keys::is_media_remote_available() {
+        tracing::info!("MediaRemote framework loaded; play/pause/next/previous are ready");
     } else {
-        tracing::info!("Accessibility permission OK");
+        tracing::warn!(
+            "MediaRemote framework could NOT be loaded — media key commands \
+             (play_pause, next, previous) will fail. Check that \
+             /System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote \
+             exists on this macOS version."
+        );
     }
 
     #[cfg(target_os = "macos")]

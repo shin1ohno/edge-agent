@@ -448,96 +448,57 @@ pub fn describe_default_output() -> String {
     }
 }
 
-/// Read system volume (0.0..=1.0) of the current default output device.
+/// Read system output volume (0..=100 normalized to 0.0..=1.0) via
+/// `osascript "output volume of (get volume settings)"`. This is what
+/// the macOS menu bar slider actually represents.
 ///
-/// Tries multiple (selector, element) combinations — see `volume_candidates`.
-/// Returns the first reading that succeeds; falls through all candidates
-/// before reporting failure, including the device description for triage.
+/// Earlier versions tried `kAudioDevicePropertyVolumeScalar` /
+/// `kAudioHardwareServiceDeviceProperty_VirtualMainVolume` directly on
+/// the default output `AudioDeviceID`; on macOS 15 (Sequoia) those
+/// writes are accepted at the Core Audio layer but do not propagate to
+/// the system output volume that the user perceives. osascript
+/// `set volume output volume …` remains the canonical path and works
+/// across all macOS releases.
 pub fn get_system_volume() -> Result<f32> {
-    unsafe {
-        let device = get_default_output()?;
-        if device == 0 {
-            bail!("no default output device");
-        }
-        for (selector, element) in volume_candidates() {
-            if let Ok(v) = get_f32_at(device, selector, element) {
-                tracing::debug!(
-                    "volume read via selector={:08x} element={} = {}",
-                    selector, element, v
-                );
-                return Ok(v.clamp(0.0, 1.0));
-            }
-        }
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg("output volume of (get volume settings)")
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn osascript: {}", e))?;
+    if !output.status.success() {
         bail!(
-            "no readable volume property on default output device ({})",
-            describe_default_output()
-        )
+            "osascript get volume failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let v: u8 = s
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parse volume '{}': {}", s, e))?;
+    Ok((v as f32) / 100.0)
 }
 
-/// Set system volume (0.0..=1.0) on the current default output device.
-/// Tries the same candidate list as `get_system_volume`; on write, if
-/// the main-element `volu` succeeds, returns immediately; per-channel
-/// writes accumulate (set every channel that accepts the write).
+/// Set system output volume via `osascript "set volume output volume N"`
+/// where N is 0..=100. Reliably drives the menu bar slider — Core Audio
+/// per-device scalar writes were accepted but no-op on macOS 15.
 pub fn set_system_volume(level: f32) -> Result<()> {
-    unsafe {
-        let device = get_default_output()?;
-        if device == 0 {
-            bail!("no default output device");
-        }
-        let clamped = level.clamp(0.0, 1.0);
-
-        // First try vmvc main + volu main — single-shot writes.
-        for (selector, element, label) in [
-            (
-                K_AUDIO_HW_SERVICE_VIRTUAL_MAIN_VOLUME,
-                K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
-                "vmvc main",
-            ),
-            (
-                K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
-                K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
-                "volu main",
-            ),
-        ] {
-            if set_f32_at(device, selector, element, clamped).is_ok() {
-                tracing::info!(
-                    "volume set via {} on device ({})",
-                    label,
-                    describe_default_output()
-                );
-                return Ok(());
-            }
-        }
-
-        // Per-channel volu fallback — write every channel that accepts it.
-        let mut channels_written = Vec::new();
-        for element in 1..=8u32 {
-            if set_f32_at(
-                device,
-                K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
-                element,
-                clamped,
-            )
-            .is_ok()
-            {
-                channels_written.push(element);
-            }
-        }
-        if !channels_written.is_empty() {
-            tracing::info!(
-                "volume set via per-channel volu on elements {:?} on device ({})",
-                channels_written,
-                describe_default_output()
-            );
-            return Ok(());
-        }
-
+    let clamped = level.clamp(0.0, 1.0);
+    let n = (clamped * 100.0).round() as u8;
+    let script = format!("set volume output volume {}", n);
+    let output = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn osascript: {}", e))?;
+    if !output.status.success() {
         bail!(
-            "no writable volume property on default output device ({})",
-            describe_default_output()
-        )
+            "osascript set volume {} failed: {}",
+            n,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
+    tracing::info!("system output volume set to {}", n);
+    Ok(())
 }
 
 /// Convenience: look up an `OutputDevice` by UID via a fresh enumeration.

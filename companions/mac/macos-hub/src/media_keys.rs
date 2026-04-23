@@ -1,122 +1,126 @@
-//! Media-key injection via AppKit's NSEvent.
+//! Media playback commands via MediaRemote private framework.
 //!
-//! Media keys on macOS are `NSEventType::SystemDefined` (14) events with
-//! subtype 8 and a data1 payload encoding `(keyCode << 16) | (keyState << 8)`.
-//! The previous CGEvent-only path (CGEventCreate + CGEventSetType(14) +
-//! CGEventSetIntegerValueField(..., 155, data1)) did NOT reach Music.app on
-//! macOS 15 — the integer field index is not part of public API and the
-//! NSEvent wrapper is the canonical bridge.
+//! Why not NSEvent / CGEventPost: on macOS 12+ injecting NSSystemDefined
+//! events via CGEventPost is unreliable — events reach the HID tap but
+//! media apps do not respond. Sequoia appears to have further tightened
+//! this path even with Accessibility permission granted.
 //!
-//! This implementation constructs the NSEvent via
-//! `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:]`,
-//! extracts its CGEvent ref, and posts via `CGEventPost(kCGHIDEventTap, ...)`.
+//! Why MediaRemote: it is the framework that Control Center, the Touch
+//! Bar, and all Apple-shipped media widgets use internally to command
+//! the "Now Playing" app. The function `MRMediaRemoteSendCommand` has
+//! been stable since macOS 10.10 (2014) and is used by every
+//! open-source now-playing tool (`nowplaying-cli`, `MediaControl`,
+//! `macos-media-controls`). It does NOT require Accessibility permission
+//! and works with any media source that has registered with the
+//! `MPNowPlayingInfoCenter` — Music, Spotify, Safari/Chrome audio, QuickTime,
+//! Podcast.app, etc.
 //!
-//! `CGEventPost` silently drops events if the process lacks Accessibility
-//! permission (System Settings → Privacy & Security → Accessibility →
-//! enable the app / terminal from which macos-hub was launched). An
-//! explicit `AXIsProcessTrusted()` check at startup is provided.
+//! Trade-off: `MediaRemote.framework` lives under
+//! `/System/Library/PrivateFrameworks/` and is not a public API.
+//! It is however unlikely to change — the whole macOS media experience
+//! depends on its binary compatibility.
 //!
-//! Key codes (from IOKit/hidsystem/ev_keymap.h):
-//!   16 NX_KEYTYPE_PLAY
-//!   17 NX_KEYTYPE_NEXT
-//!   18 NX_KEYTYPE_PREVIOUS
-//!   19 NX_KEYTYPE_FAST
-//!   20 NX_KEYTYPE_REWIND
-//!
-//! Key states:
-//!   0xA (= 10) NX key-down
-//!   0xB (= 11) NX key-up
+//! Commands (from MRMediaRemote.h, reverse-engineered from many sources):
+//!   kMRPlay             = 0
+//!   kMRPause            = 1
+//!   kMRTogglePlayPause  = 2
+//!   kMRStop             = 3
+//!   kMRNextTrack        = 4
+//!   kMRPreviousTrack    = 5
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
+use std::sync::OnceLock;
 
 use anyhow::{bail, Result};
-use objc2::rc::autoreleasepool;
-use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
-use objc2_foundation::NSPoint;
 
-pub const NX_KEYTYPE_PLAY: u8 = 16;
-pub const NX_KEYTYPE_NEXT: u8 = 17;
-pub const NX_KEYTYPE_PREVIOUS: u8 = 18;
+const RTLD_NOW: i32 = 0x2;
 
-const NX_KEY_DOWN: u8 = 0x0A;
-const NX_KEY_UP: u8 = 0x0B;
-
-// NSEventType::SystemDefined
-const NS_SYSTEM_DEFINED: u64 = 14;
-// NSSystemDefined subtype for media/HID keys.
-const MEDIA_KEY_SUBTYPE: i16 = 8;
-
-// CGEventTapLocation::kCGHIDEventTap
-const K_CG_HID_EVENT_TAP: u32 = 0;
-
-type CGEventRef = *mut c_void;
-
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {}
-
-#[link(name = "CoreGraphics", kind = "framework")]
+#[link(name = "dl", kind = "dylib")]
 extern "C" {
-    fn CGEventPost(tap: u32, event: CGEventRef);
+    fn dlopen(path: *const i8, flag: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
+    fn dlerror() -> *const i8;
 }
 
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXIsProcessTrusted() -> u8;
-}
+const MEDIA_REMOTE_PATH: &str =
+    "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote";
+const MEDIA_REMOTE_SYMBOL: &str = "MRMediaRemoteSendCommand";
 
-/// Returns true if the process has Accessibility permission.
-/// `CGEventPost` silently no-ops without it — calling this at startup lets
-/// us warn loudly instead of puzzling over why play/pause does nothing.
-pub fn is_accessibility_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() != 0 }
-}
+const MR_CMD_TOGGLE_PLAY_PAUSE: u32 = 2;
+const MR_CMD_NEXT_TRACK: u32 = 4;
+const MR_CMD_PREVIOUS_TRACK: u32 = 5;
 
-fn post_media_key(key_code: u8, key_state: u8) -> Result<()> {
-    let data1: isize = ((key_code as isize) << 16) | ((key_state as isize) << 8);
+type MRSendCommandFn = unsafe extern "C" fn(u32, *mut c_void) -> bool;
 
-    autoreleasepool(|_| unsafe {
-        let cls = class!(NSEvent);
-        let event: *mut AnyObject = msg_send![
-            cls,
-            otherEventWithType: NS_SYSTEM_DEFINED,
-            location: NSPoint::new(0.0, 0.0),
-            modifierFlags: 0xa00u64,
-            timestamp: 0f64,
-            windowNumber: 0isize,
-            context: std::ptr::null::<AnyObject>(),
-            subtype: MEDIA_KEY_SUBTYPE,
-            data1: data1,
-            data2: -1isize,
-        ];
-        if event.is_null() {
-            bail!("NSEvent otherEventWithType: returned nil");
+static MR_SEND_COMMAND: OnceLock<Option<MRSendCommandFn>> = OnceLock::new();
+
+fn load_media_remote() -> Option<MRSendCommandFn> {
+    *MR_SEND_COMMAND.get_or_init(|| unsafe {
+        let path = CString::new(MEDIA_REMOTE_PATH).ok()?;
+        let handle = dlopen(path.as_ptr(), RTLD_NOW);
+        if handle.is_null() {
+            let err = dlerror();
+            if !err.is_null() {
+                let msg = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                tracing::error!("dlopen MediaRemote failed: {}", msg);
+            } else {
+                tracing::error!("dlopen MediaRemote returned null (unknown error)");
+            }
+            return None;
         }
-        let cg_event: CGEventRef = msg_send![event, CGEvent];
-        if cg_event.is_null() {
-            bail!("NSEvent.CGEvent returned null");
+        let name = CString::new(MEDIA_REMOTE_SYMBOL).ok()?;
+        let sym = dlsym(handle, name.as_ptr());
+        if sym.is_null() {
+            let err = dlerror();
+            if !err.is_null() {
+                let msg = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                tracing::error!("dlsym MRMediaRemoteSendCommand failed: {}", msg);
+            }
+            return None;
         }
-        CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
-        Ok(())
+        Some(std::mem::transmute::<*mut c_void, MRSendCommandFn>(sym))
     })
 }
 
-fn tap_media_key(key_code: u8) -> Result<()> {
-    post_media_key(key_code, NX_KEY_DOWN)?;
-    post_media_key(key_code, NX_KEY_UP)?;
-    Ok(())
+/// True if MediaRemote.framework was located and the command symbol is
+/// usable. Intended for a startup log — the actual command functions
+/// below call `load_media_remote` lazily, so this is purely for UX.
+pub fn is_media_remote_available() -> bool {
+    load_media_remote().is_some()
+}
+
+/// Kept for API compatibility with earlier CGEventPost-based builds.
+/// MediaRemote does not require Accessibility permission, so always true.
+pub fn is_accessibility_trusted() -> bool {
+    true
+}
+
+fn send_command(cmd: u32, name: &str) -> Result<()> {
+    match load_media_remote() {
+        Some(f) => unsafe {
+            let _result = f(cmd, std::ptr::null_mut());
+            // MediaRemote returns true on "command delivered to now-playing" and
+            // false when no registered app is listening; we treat both as OK so
+            // that pressing play/pause with nothing playing is not an error.
+            tracing::debug!("MRMediaRemoteSendCommand({}) sent", name);
+            Ok(())
+        },
+        None => bail!(
+            "MediaRemote framework could not be loaded — commands are unavailable"
+        ),
+    }
 }
 
 pub fn play_pause() -> Result<()> {
-    tap_media_key(NX_KEYTYPE_PLAY)
+    send_command(MR_CMD_TOGGLE_PLAY_PAUSE, "TogglePlayPause")
 }
 
 pub fn next_track() -> Result<()> {
-    tap_media_key(NX_KEYTYPE_NEXT)
+    send_command(MR_CMD_NEXT_TRACK, "NextTrack")
 }
 
 pub fn previous_track() -> Result<()> {
-    tap_media_key(NX_KEYTYPE_PREVIOUS)
+    send_command(MR_CMD_PREVIOUS_TRACK, "PreviousTrack")
 }

@@ -4,8 +4,13 @@
 
 use anyhow::{bail, Result};
 
+#[allow(dead_code)]
 pub fn is_accessibility_trusted() -> bool {
-    true // stub: pretend trusted so Linux CI path doesn't complain
+    true // MediaRemote path doesn't need Accessibility; stub is true for parity
+}
+
+pub fn is_media_remote_available() -> bool {
+    false // not on macOS
 }
 
 pub fn play_pause() -> Result<()> {
