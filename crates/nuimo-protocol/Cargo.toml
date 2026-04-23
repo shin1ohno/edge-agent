@@ -1,0 +1,14 @@
+[package]
+name = "nuimo-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Transport-agnostic parser and encoder for the Nuimo BLE GATT protocol."
+
+[dependencies]
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
