@@ -1,7 +1,11 @@
 @preconcurrency import CoreBluetooth
 import Foundation
 import Observation
-@preconcurrency import WeaveIosCore
+
+// UniFFI types (`NuimoEvent`, `Glyph`, `DisplayOptions`) and functions
+// (`parseNuimoNotification`, `buildLedPayload`, `nuimoServiceUuid`,
+// `ledMatrixUuid`) live in `Bundle/WeaveIosCore.swift`, which is part of
+// this same target — no `import WeaveIosCore` is needed.
 
 /// Coordinates CoreBluetooth discovery, connection, and GATT I/O for Nuimo
 /// peripherals. UniFFI-exposed helpers from `WeaveIosCore` turn raw

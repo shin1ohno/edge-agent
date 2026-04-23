@@ -6,6 +6,7 @@ import UIKit
 
 /// Persisted app settings backed by `UserDefaults`. See
 /// `~/.claude/plans/purrfect-plotting-karp.md` §B-4 for the key layout.
+@MainActor
 @Observable
 final class SettingsStore {
     var serverURL: String {

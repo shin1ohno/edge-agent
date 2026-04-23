@@ -9,6 +9,9 @@
 
 uniffi::setup_scaffolding!();
 
+mod ui_client;
+pub use ui_client::{UiClient, UiEventSink};
+
 use nuimo_protocol as np;
 use thiserror::Error;
 use uuid::Uuid;
@@ -25,6 +28,10 @@ pub enum WeaveError {
     InvalidUuid { message: String },
     #[error("parse failed: {message}")]
     ParseFailed { message: String },
+    #[error("network: {message}")]
+    Network { message: String },
+    #[error("HTTP {status}: {message}")]
+    Http { status: u16, message: String },
 }
 
 impl From<uuid::Error> for WeaveError {
