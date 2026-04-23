@@ -85,11 +85,10 @@ final class NuimoDevice: NSObject, CBPeripheralDelegate {
         error: Error?
     ) {
         guard let data = characteristic.value else { return }
-        let bytes = Array(data)
         let charUUID = characteristic.uuid.uuidString.lowercased()
 
         do {
-            if let event = try parseNuimoNotification(charUuid: charUUID, data: bytes) {
+            if let event = try parseNuimoNotification(charUuid: charUUID, data: data) {
                 if case .batteryLevel(let level) = event {
                     batteryLevel = level
                 }
