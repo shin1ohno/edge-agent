@@ -17,6 +17,10 @@ pub struct Config {
     /// disabled. `Some(_)` with an empty body enables Hue with the default
     /// XDG_STATE_HOME token path.
     pub hue: Option<HueSection>,
+    /// `None` when the `[macos]` section is absent from TOML — macOS adapter
+    /// stays disabled. `Some(_)` with an empty body enables the adapter with
+    /// the default broker at `localhost:1883`.
+    pub macos: Option<MacosSection>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -48,6 +52,36 @@ pub struct HueSection {
     /// If the resolved file is missing or unreadable, the Hue adapter logs a
     /// warning and stays disabled at runtime.
     pub token_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MacosSection {
+    #[serde(default = "default_macos_mqtt_host")]
+    pub mqtt_host: String,
+    #[serde(default = "default_macos_mqtt_port")]
+    pub mqtt_port: u16,
+    #[serde(default = "default_macos_mqtt_client_id")]
+    pub mqtt_client_id: String,
+}
+
+impl Default for MacosSection {
+    fn default() -> Self {
+        Self {
+            mqtt_host: default_macos_mqtt_host(),
+            mqtt_port: default_macos_mqtt_port(),
+            mqtt_client_id: default_macos_mqtt_client_id(),
+        }
+    }
+}
+
+fn default_macos_mqtt_host() -> String {
+    "localhost".to_string()
+}
+fn default_macos_mqtt_port() -> u16 {
+    1883
+}
+fn default_macos_mqtt_client_id() -> String {
+    "edge-agent-macos".to_string()
 }
 
 impl Config {
@@ -83,6 +117,20 @@ impl Config {
         if let Ok(v) = std::env::var("EDGE_AGENT_HUE_TOKEN_PATH") {
             let hue = self.hue.get_or_insert_with(HueSection::default);
             hue.token_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("EDGE_AGENT_MACOS_MQTT_HOST") {
+            let macos = self.macos.get_or_insert_with(MacosSection::default);
+            macos.mqtt_host = v;
+        }
+        if let Ok(v) = std::env::var("EDGE_AGENT_MACOS_MQTT_PORT") {
+            if let Ok(p) = v.parse() {
+                let macos = self.macos.get_or_insert_with(MacosSection::default);
+                macos.mqtt_port = p;
+            }
+        }
+        if let Ok(v) = std::env::var("EDGE_AGENT_MACOS_MQTT_CLIENT_ID") {
+            let macos = self.macos.get_or_insert_with(MacosSection::default);
+            macos.mqtt_client_id = v;
         }
     }
 }

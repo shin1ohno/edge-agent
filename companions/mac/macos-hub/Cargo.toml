@@ -1,0 +1,38 @@
+[package]
+name = "macos-hub"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "MQTT bridge for macOS audio control (output switching, volume, media keys)"
+publish = false
+
+# This crate is intentionally OUTSIDE the edge-agent workspace
+# (edge-agent workspace = crates/*). Build with:
+#   cd companions/mac/macos-hub && cargo build --release
+# macOS target only; Core Audio + CGEvent FFI will not link on Linux.
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+rumqttc = "0.24"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Core Audio HAL bindings.
+# core-audio-sys exposes raw Core Audio C API symbols + property selector constants.
+# Last published 0.2.x (2023); bindings are stable because the C API itself is
+# frozen. We only use selector / address / format constants and 4-5 functions
+# (AudioObjectGetPropertyData, AudioObjectSetPropertyData, AudioObjectGetPropertyDataSize,
+# AudioHardwareServiceGetPropertyData, AudioHardwareServiceSetPropertyData). Raw FFI
+# would reproduce these headers byte-for-byte; not worth the maintenance.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-audio-sys = "0.2"
+core-foundation-sys = "0.8"
+
+[[bin]]
+name = "macos-hub"
+path = "src/main.rs"

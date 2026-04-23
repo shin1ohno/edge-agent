@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shin1ohno.macos-hub</string>
+
+    <!-- Path to the built binary. Update REPLACE_ME after `cargo build --release`. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/macos-hub</string>
+        <string>/Users/REPLACE_ME/.config/macos-hub/macos-hub.toml</string>
+    </array>
+
+    <!-- LaunchAgents run in the user session. CGEvent / media-key injection
+         requires the Aqua session (not background / system). -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts to avoid tight loops if the binary crashes. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/macos-hub.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/macos-hub.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info,macos_hub=debug</string>
+    </dict>
+</dict>
+</plist>
