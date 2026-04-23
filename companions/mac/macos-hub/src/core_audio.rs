@@ -68,11 +68,16 @@ pub const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: AudioObjectPropertySelector = four
 pub const K_AUDIO_OBJECT_PROPERTY_NAME: AudioObjectPropertySelector = four_cc(b"lnam");
 pub const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: AudioObjectPropertySelector = four_cc(b"tran");
 /// `kAudioDevicePropertyVolumeScalar` — per-channel scalar volume [0.0..=1.0].
-/// Used with scope Output and element main for the aggregate main volume on
-/// devices that expose it. Replaces the deprecated
-/// `AudioHardwareServiceGetPropertyData` + `kAudioHardwareServiceDeviceProperty_VirtualMainVolume`
-/// pair which was removed from the CoreAudio framework in modern macOS SDKs.
+/// Used with scope Output and element main/channel for devices that expose it.
 pub const K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR: AudioObjectPropertySelector = four_cc(b"volu");
+
+/// `kAudioHardwareServiceDeviceProperty_VirtualMainVolume` — the selector
+/// the menu bar volume slider actually uses. Historically accessed via the
+/// deprecated `AudioHardwareService*PropertyData` pair, but the selector
+/// itself remains accessible via `AudioObjectGetPropertyData` on modern
+/// macOS. Required for AirPlay virtual output devices and some others
+/// that do not expose per-channel `volu`.
+pub const K_AUDIO_HW_SERVICE_VIRTUAL_MAIN_VOLUME: AudioObjectPropertySelector = four_cc(b"vmvc");
 
 // Scopes.
 pub const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: AudioObjectPropertyScope = four_cc(b"glob");
@@ -349,11 +354,14 @@ pub fn set_default_output(id: u32) -> Result<()> {
     }
 }
 
-/// Read volume scalar at a specific element. Returns the raw `f32` in
-/// the Core Audio convention (0.0..=1.0), NOT clamped. Caller clamps.
-unsafe fn get_volume_scalar_at(device: AudioObjectID, element: u32) -> Result<f32> {
+/// Read a Float32 property at (selector, scope=Output, element).
+unsafe fn get_f32_at(
+    device: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    element: u32,
+) -> Result<f32> {
     let addr = AudioObjectPropertyAddress {
-        mSelector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        mSelector: selector,
         mScope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
         mElement: element,
     };
@@ -368,15 +376,20 @@ unsafe fn get_volume_scalar_at(device: AudioObjectID, element: u32) -> Result<f3
             &mut size,
             &mut value as *mut f32 as *mut c_void,
         ),
-        &format!("get volume scalar element={}", element),
+        &format!("get f32 selector={:08x} element={}", selector, element),
     )?;
     Ok(value)
 }
 
-/// Write volume scalar at a specific element.
-unsafe fn set_volume_scalar_at(device: AudioObjectID, element: u32, level: f32) -> Result<()> {
+/// Write a Float32 property at (selector, scope=Output, element).
+unsafe fn set_f32_at(
+    device: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    element: u32,
+    level: f32,
+) -> Result<()> {
     let addr = AudioObjectPropertyAddress {
-        mSelector: K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        mSelector: selector,
         mScope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
         mElement: element,
     };
@@ -390,48 +403,82 @@ unsafe fn set_volume_scalar_at(device: AudioObjectID, element: u32, level: f32) 
             size,
             &level as *const f32 as *const c_void,
         ),
-        &format!("set volume scalar element={}", element),
+        &format!("set f32 selector={:08x} element={}", selector, element),
     )
+}
+
+/// Ordered list of (selector, element) candidates to try for volume.
+/// First match wins. `vmvc` (VirtualMainVolume) is preferred because it
+/// mirrors the menu bar slider; `volu` (VolumeScalar) is the fallback
+/// for devices that only expose per-channel scalars.
+fn volume_candidates() -> Vec<(AudioObjectPropertySelector, u32)> {
+    let mut out = Vec::with_capacity(20);
+    // 1. vmvc on main element — the menu bar slider's preferred path.
+    out.push((
+        K_AUDIO_HW_SERVICE_VIRTUAL_MAIN_VOLUME,
+        K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    ));
+    // 2. volu on main element — aggregated main volume on devices that support it.
+    out.push((
+        K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+        K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    ));
+    // 3. volu on per-channel elements (stereo + up to 8 channels).
+    for element in 1..=8u32 {
+        out.push((K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR, element));
+    }
+    out
+}
+
+/// Describe the current default output device for diagnostic logs.
+fn describe_default_output() -> String {
+    match get_default_output() {
+        Err(e) => format!("<error: {}>", e),
+        Ok(0) => "<none>".to_string(),
+        Ok(id) => match list_outputs() {
+            Err(e) => format!("id={} <list error: {}>", id, e),
+            Ok(devices) => match devices.iter().find(|d| d.id == id) {
+                Some(d) => format!(
+                    "id={} uid={:?} name={:?} transport={:08x} is_airplay={}",
+                    d.id, d.uid, d.name, d.transport_type, d.is_airplay
+                ),
+                None => format!("id={} (not in list_outputs output)", id),
+            },
+        },
+    }
 }
 
 /// Read system volume (0.0..=1.0) of the current default output device.
 ///
-/// Strategy: try the main element (0) first — fastest path for devices
-/// that aggregate channel volumes. On `kAudioHardwareIllegalOperationError`
-/// (OSStatus 'what' = 2003332927), fall back to iterating per-channel
-/// elements (1, 2, ...) and averaging. Built-in Mac outputs typically
-/// require the per-channel path.
+/// Tries multiple (selector, element) combinations — see `volume_candidates`.
+/// Returns the first reading that succeeds; falls through all candidates
+/// before reporting failure, including the device description for triage.
 pub fn get_system_volume() -> Result<f32> {
     unsafe {
         let device = get_default_output()?;
         if device == 0 {
             bail!("no default output device");
         }
-        if let Ok(v) = get_volume_scalar_at(device, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN) {
-            return Ok(v.clamp(0.0, 1.0));
-        }
-        // Per-channel fallback: accumulate readable elements, average them.
-        let mut sum = 0.0f32;
-        let mut count = 0u32;
-        for element in 1..=8u32 {
-            if let Ok(v) = get_volume_scalar_at(device, element) {
-                sum += v;
-                count += 1;
+        for (selector, element) in volume_candidates() {
+            if let Ok(v) = get_f32_at(device, selector, element) {
+                tracing::debug!(
+                    "volume read via selector={:08x} element={} = {}",
+                    selector, element, v
+                );
+                return Ok(v.clamp(0.0, 1.0));
             }
         }
-        if count == 0 {
-            bail!("no readable volume elements on default output device");
-        }
-        Ok((sum / count as f32).clamp(0.0, 1.0))
+        bail!(
+            "no readable volume property on default output device ({})",
+            describe_default_output()
+        )
     }
 }
 
 /// Set system volume (0.0..=1.0) on the current default output device.
-/// Out-of-range inputs are clamped.
-///
-/// Strategy: try the main element first; on failure, iterate per-channel
-/// elements (1..=8) and set every element that accepts the write. At
-/// least one write must succeed or the call errors.
+/// Tries the same candidate list as `get_system_volume`; on write, if
+/// the main-element `volu` succeeds, returns immediately; per-channel
+/// writes accumulate (set every channel that accepts the write).
 pub fn set_system_volume(level: f32) -> Result<()> {
     unsafe {
         let device = get_default_output()?;
@@ -439,21 +486,50 @@ pub fn set_system_volume(level: f32) -> Result<()> {
             bail!("no default output device");
         }
         let clamped = level.clamp(0.0, 1.0);
-        if set_volume_scalar_at(device, K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN, clamped).is_ok() {
-            return Ok(());
+
+        // First try vmvc main + volu main — single-shot writes.
+        for (selector, element) in [
+            (
+                K_AUDIO_HW_SERVICE_VIRTUAL_MAIN_VOLUME,
+                K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+            ),
+            (
+                K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+                K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+            ),
+        ] {
+            if set_f32_at(device, selector, element, clamped).is_ok() {
+                tracing::debug!(
+                    "volume set via selector={:08x} element={}",
+                    selector, element
+                );
+                return Ok(());
+            }
         }
-        // Per-channel fallback.
+
+        // Per-channel volu fallback — write every channel that accepts it.
         let mut any_ok = false;
         for element in 1..=8u32 {
-            if set_volume_scalar_at(device, element, clamped).is_ok() {
+            if set_f32_at(
+                device,
+                K_AUDIO_DEVICE_PROPERTY_VOLUME_SCALAR,
+                element,
+                clamped,
+            )
+            .is_ok()
+            {
                 any_ok = true;
             }
         }
         if any_ok {
-            Ok(())
-        } else {
-            bail!("no writable volume elements on default output device")
+            tracing::debug!("volume set via per-channel volu fallback");
+            return Ok(());
         }
+
+        bail!(
+            "no writable volume property on default output device ({})",
+            describe_default_output()
+        )
     }
 }
 
