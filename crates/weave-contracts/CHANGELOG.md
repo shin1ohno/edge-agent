@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.4.3...weave-contracts-v0.5.0) - 2026-04-23
+
+### Other
+
+- add Command and Error frames for UI live stream ([#30](https://github.com/shin1ohno/edge-agent/pull/30))
+
 ## [0.4.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.3.3...weave-contracts-v0.4.0) - 2026-04-22
 
 ### Other

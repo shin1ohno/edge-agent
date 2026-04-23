@@ -12,7 +12,7 @@ keywords = ["iot", "nuimo", "roon", "hue", "edge-agent"]
 categories = ["command-line-utilities", "hardware-support"]
 
 [dependencies]
-weave-contracts = { version = "0.4", path = "../weave-contracts" }
+weave-contracts = { version = "0.5", path = "../weave-contracts" }
 nuimo = "0.1.1"
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
