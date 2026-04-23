@@ -11,10 +11,13 @@ mod media_keys_stub;
 mod mqtt;
 
 #[cfg(target_os = "macos")]
-use crate::{core_audio as audio, media_keys};
+use crate::core_audio as audio;
 
 #[cfg(not(target_os = "macos"))]
-use crate::{core_audio_stub as audio, media_keys_stub as media_keys};
+use crate::core_audio_stub as audio;
+
+#[cfg(not(target_os = "macos"))]
+use crate::media_keys_stub as media_keys;
 
 use std::path::PathBuf;
 use std::time::Duration;
