@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.shin1ohno.macos-hub</string>
+
+  <!--
+    CGEventPost requires the user's Aqua session (HID event tap). A daemon
+    (root, no session) cannot inject media keys. Running as a LaunchAgent
+    with LimitLoadToSessionType=Aqua scopes the agent to GUI sessions.
+  -->
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Adjust path if installed to /opt/homebrew/bin/ on Apple Silicon. -->
+    <string>/usr/local/bin/macos-hub</string>
+    <!-- Optional explicit config path; otherwise uses ./macos-hub.toml -->
+    <!-- <string>/Users/YOUR_USER/Library/Application Support/macos-hub/macos-hub.toml</string> -->
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Keep restart backoff conservative so a crashloop doesn't spam logs. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/macos-hub/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/Library/Logs/macos-hub/stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USER/Library/Application Support/macos-hub</string>
+</dict>
+</plist>

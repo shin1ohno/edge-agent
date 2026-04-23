@@ -13,6 +13,8 @@
 
 #[cfg(feature = "hue")]
 mod adapter_hue;
+#[cfg(feature = "macos")]
+mod adapter_macos;
 #[cfg(feature = "roon")]
 mod adapter_roon;
 mod config;
@@ -29,6 +31,8 @@ use std::time::Duration;
 
 #[cfg(feature = "hue")]
 use adapter_hue::{HueAdapter, HueConfig};
+#[cfg(feature = "macos")]
+use adapter_macos::{MacosAdapter, MacosConfig};
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
 use edge_core::{
@@ -77,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
         }
         if cfg!(feature = "hue") {
             caps.push("hue".to_string());
+        }
+        if cfg!(feature = "macos") {
+            caps.push("macos".to_string());
         }
         caps
     };
@@ -162,6 +169,27 @@ async fn main() -> anyhow::Result<()> {
         rx
     };
 
+    // Like Hue: lazy bootstrap so a broker that isn't up yet doesn't crash
+    // the agent. The watch channel lets the dispatcher pick the adapter up
+    // the moment it's online, and the bootstrap task owns state-pump spawn
+    // so macOS updates forward to /ws/edge immediately.
+    #[cfg(feature = "macos")]
+    let macos_adapter_rx: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>> = {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        match cfg.macos.as_ref() {
+            Some(macos_cfg) => {
+                let macos_cfg = macos_cfg.clone();
+                let outbox = ws_outbox.clone();
+                let resync = ws_resync.clone();
+                tokio::spawn(run_macos_bootstrap(macos_cfg, tx, outbox, resync));
+            }
+            None => {
+                tracing::info!("no [macos] section in config — macos adapter disabled");
+            }
+        }
+        rx
+    };
+
     // nuimo.skip lets an edge run as a WS-only witness (dashboard / hub
     // validation / multi-edge routing tests without requiring physical BLE
     // hardware on every host).
@@ -179,6 +207,10 @@ async fn main() -> anyhow::Result<()> {
         // the adapter first comes online, so nothing to do here.
         #[cfg(feature = "hue")]
         let _ = &hue_adapter_rx;
+
+        // Same story for macOS: `run_macos_bootstrap` owns the state pump.
+        #[cfg(feature = "macos")]
+        let _ = &macos_adapter_rx;
 
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down");
@@ -324,6 +356,8 @@ async fn main() -> anyhow::Result<()> {
         roon_adapter.clone(),
         #[cfg(feature = "hue")]
         hue_adapter_rx.clone(),
+        #[cfg(feature = "macos")]
+        macos_adapter_rx.clone(),
     ));
 
     // Input pump: Nuimo BLE events → routing → coalescer.
@@ -524,6 +558,71 @@ async fn try_hue_init(token_path: &std::path::Path) -> anyhow::Result<HueAdapter
     .await
 }
 
+/// Bring up the macOS adapter, retrying indefinitely with exponential
+/// backoff (start 30s, cap 300s) when the broker is unreachable. On
+/// success, publishes the adapter into the watch channel so the
+/// dispatcher picks it up, and spawns the state pump so macOS updates
+/// flow to `/ws/edge`.
+#[cfg(feature = "macos")]
+async fn run_macos_bootstrap(
+    cfg: config::MacosSection,
+    tx: tokio::sync::watch::Sender<Option<Arc<dyn ServiceAdapter>>>,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    resync: tokio::sync::broadcast::Sender<()>,
+) {
+    let mut delay = Duration::from_secs(0);
+    let cap = Duration::from_secs(300);
+    let mut attempt: u32 = 0;
+    loop {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        attempt += 1;
+        match try_macos_init(&cfg).await {
+            Ok(adapter) => {
+                let arc: Arc<dyn ServiceAdapter> = Arc::new(adapter);
+                tracing::info!(attempt, "macos adapter online");
+                spawn_state_pump(arc.subscribe_state(), outbox.clone(), resync.subscribe());
+                let _ = tx.send(Some(arc));
+                return;
+            }
+            Err(e) => {
+                delay = if delay.is_zero() {
+                    Duration::from_secs(30)
+                } else {
+                    (delay * 2).min(cap)
+                };
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    next_retry_secs = delay.as_secs(),
+                    "macos adapter init failed — retrying in background",
+                );
+                let _ = outbox
+                    .send(EdgeToServer::Error {
+                        context: "macos.bootstrap".into(),
+                        message: format!(
+                            "init failed (attempt {attempt}, next retry {}s): {e}",
+                            delay.as_secs()
+                        ),
+                        severity: weave_contracts::ErrorSeverity::Warn,
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "macos")]
+async fn try_macos_init(cfg: &config::MacosSection) -> anyhow::Result<MacosAdapter> {
+    MacosAdapter::start(MacosConfig {
+        mqtt_host: cfg.mqtt_host.clone(),
+        mqtt_port: cfg.mqtt_port,
+        mqtt_client_id: cfg.mqtt_client_id.clone(),
+    })
+    .await
+}
+
 /// Fan incoming `RoutedIntent`s out to per-target workers, spawning a new
 /// worker the first time we see a given `(service_type, target)` pair.
 async fn run_dispatcher(
@@ -531,6 +630,7 @@ async fn run_dispatcher(
     outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     #[cfg(feature = "roon")] roon: Arc<dyn ServiceAdapter>,
     #[cfg(feature = "hue")] hue: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
+    #[cfg(feature = "macos")] macos: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
 ) {
     let mut workers: HashMap<(String, String), tokio::sync::mpsc::Sender<Intent>> = HashMap::new();
 
@@ -543,6 +643,8 @@ async fn run_dispatcher(
                 "roon" => Some(roon.clone()),
                 #[cfg(feature = "hue")]
                 "hue" => hue.borrow().clone(),
+                #[cfg(feature = "macos")]
+                "macos" => macos.borrow().clone(),
                 _ => None,
             };
             let Some(adapter) = adapter else {
