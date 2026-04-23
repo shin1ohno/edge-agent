@@ -6,6 +6,9 @@ struct RootView: View {
             HomeView()
                 .tabItem { Label("Home", systemImage: "house") }
 
+            GlyphListView()
+                .tabItem { Label("Glyphs", systemImage: "square.grid.3x3.square") }
+
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
