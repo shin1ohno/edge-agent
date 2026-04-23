@@ -1,0 +1,40 @@
+[package]
+name = "macos-hub"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "MQTT bridge for macOS audio control (Core Audio HAL + system volume + media keys)"
+authors = ["Shin'ichi Ohno <sh1@mercari.com>"]
+repository = "https://github.com/shin1ohno/edge-agent"
+
+# Independent package — NOT a member of the edge-agent workspace.
+# The root Cargo.toml uses `members = ["crates/*"]` so this directory is
+# naturally excluded; no explicit [workspace] exclude entry is needed.
+# Declaring an empty [workspace] table below makes this crate self-contained
+# even if run from a parent directory that has its own workspace.
+[workspace]
+
+[dependencies]
+rumqttc = "0.24"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Core Audio FFI (macOS only). We link CoreAudio + CoreFoundation + CoreGraphics
+# frameworks via `#[link]` attributes in source and declare the small set of
+# extern fns we need. `coreaudio-sys` (RustAudio) exists on crates.io but pulls
+# bindgen + a wide selector table; for the 6 functions we use here, raw FFI is
+# simpler and avoids a heavy build-dep.
+#
+# `core-foundation-sys` handles the CFString boilerplate (CFRelease, CFStringGetCString).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8"
+
+[[bin]]
+name = "macos-hub"
+path = "src/main.rs"

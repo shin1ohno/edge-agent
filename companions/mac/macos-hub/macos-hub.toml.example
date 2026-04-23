@@ -1,0 +1,35 @@
+# macos-hub configuration
+# Copy to macos-hub.toml and adjust as needed.
+
+[mqtt]
+# Broker hostname or IP reachable from this Mac.
+host = "localhost"
+port = 1883
+# Client ID must be unique on the broker.
+client_id = "macos-hub"
+
+[macos]
+# Target segment used in `service/macos/{edge_id}/...` topics.
+# Keep stable per physical Mac.
+edge_id = "mac-mini-livingroom"
+# Re-publish volume + output_device every N seconds so external changes
+# (menubar slider, plugging in AirPods, AirPlay routing) show up on MQTT.
+periodic_publish_interval_secs = 5
+
+# MQTT topic schema:
+#   Publish (retain = true, QoS 1):
+#     service/macos/{edge_id}/state/volume            {"level": 0..=100}
+#     service/macos/{edge_id}/state/output_device     OutputDevice JSON
+#     service/macos/{edge_id}/state/available_outputs [OutputDevice, ...]
+#     service/macos/{edge_id}/state/playback_active   {"active": true|false|null}
+#
+#   Subscribe:
+#     service/macos/{edge_id}/command/play_pause      (empty body)
+#     service/macos/{edge_id}/command/play            (empty body, == play_pause)
+#     service/macos/{edge_id}/command/pause           (empty body, == play_pause)
+#     service/macos/{edge_id}/command/next            (empty body)
+#     service/macos/{edge_id}/command/previous        (empty body)
+#     service/macos/{edge_id}/command/stop            (ignored — no NX stop key)
+#     service/macos/{edge_id}/command/volume          {"how":"absolute|relative|step","value":N}
+#     service/macos/{edge_id}/command/set_output      {"device_uid":"<uid>"}
+#     service/macos/{edge_id}/command/mute            {"action":"mute|unmute|toggle"}
