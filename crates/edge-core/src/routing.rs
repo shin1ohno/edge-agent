@@ -203,19 +203,34 @@ impl RoutingEngine {
     ) -> Vec<FeedbackRule> {
         let guard = self.by_device.read().await;
         for list in guard.values() {
-            for m in list {
-                if m.service_type == service_type && m.service_target == target {
-                    return m.feedback.clone();
-                }
-                for c in &m.target_candidates {
-                    let c_service_type = c.service_type.as_deref().unwrap_or(&m.service_type);
-                    if c_service_type == service_type && c.target == target {
-                        return m.feedback.clone();
-                    }
-                }
+            if let Some(rules) = mapping_rules_for_target(list, service_type, target) {
+                return rules;
             }
         }
         Vec::new()
+    }
+
+    /// Same as `feedback_rules_for_target` but scoped to one `(device_type,
+    /// device_id)` bucket. Use this from per-device feedback pumps so a
+    /// Nuimo only reacts when the state change belongs to a mapping it
+    /// owns — otherwise a second Nuimo mapped elsewhere would flash glyphs
+    /// for unrelated service activity.
+    ///
+    /// Returns `None` when no mapping on this device covers
+    /// `(service_type, target)` — the caller should skip. Returns
+    /// `Some(vec)` when a mapping exists; the vec may be empty, which
+    /// signals "mapping exists but user configured no rules — fall back
+    /// to hardcoded defaults" (preserves single-device behavior).
+    pub async fn feedback_rules_for_device_target(
+        &self,
+        device_type: &str,
+        device_id: &str,
+        service_type: &str,
+        target: &str,
+    ) -> Option<Vec<FeedbackRule>> {
+        let guard = self.by_device.read().await;
+        let list = guard.get(&(device_type.to_string(), device_id.to_string()))?;
+        mapping_rules_for_target(list, service_type, target)
     }
 
     /// Apply the given input primitive from a specific device, returning every
@@ -334,6 +349,29 @@ impl RoutingEngine {
 
         RouteOutcome::Normal(route_mappings(mappings, input))
     }
+}
+
+/// Look for a mapping in `list` whose primary `(service_type, target)` or
+/// any `target_candidates` entry matches the given pair. Returns the
+/// mapping's `feedback` clone on hit. `None` means no mapping covers the
+/// target, letting the caller fall back to defaults.
+fn mapping_rules_for_target(
+    list: &[Mapping],
+    service_type: &str,
+    target: &str,
+) -> Option<Vec<FeedbackRule>> {
+    for m in list {
+        if m.service_type == service_type && m.service_target == target {
+            return Some(m.feedback.clone());
+        }
+        for c in &m.target_candidates {
+            let c_service_type = c.service_type.as_deref().unwrap_or(&m.service_type);
+            if c_service_type == service_type && c.target == target {
+                return Some(m.feedback.clone());
+            }
+        }
+    }
+    None
 }
 
 fn route_mappings(mappings: &[Mapping], input: &InputPrimitive) -> Vec<RoutedIntent> {
@@ -797,5 +835,73 @@ mod tests {
             .feedback_rules_for_target("roon", "some-other-zone")
             .await;
         assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_for_device_target_scopes_by_device() {
+        // Two mappings for the same Roon zone, but on different Nuimos.
+        // Only the device that owns the mapping should receive feedback.
+        let mut m_a = mapping_with_feedback();
+        m_a.device_id = "nuimo-a".into();
+        let mut m_b = mapping_with_feedback();
+        m_b.mapping_id = Uuid::new_v4();
+        m_b.device_id = "nuimo-b".into();
+        m_b.service_target = "zone-b".into();
+
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![m_a, m_b]).await;
+
+        let rules_a = engine
+            .feedback_rules_for_device_target("nuimo", "nuimo-a", "roon", "zone-1")
+            .await;
+        let rules_a = rules_a.expect("nuimo-a owns zone-1");
+        assert_eq!(rules_a.len(), 1);
+
+        let rules_b_wrong = engine
+            .feedback_rules_for_device_target("nuimo", "nuimo-b", "roon", "zone-1")
+            .await;
+        assert!(
+            rules_b_wrong.is_none(),
+            "nuimo-b does not own zone-1 — must skip entirely",
+        );
+
+        let rules_b_right = engine
+            .feedback_rules_for_device_target("nuimo", "nuimo-b", "roon", "zone-b")
+            .await;
+        let rules_b_right = rules_b_right.expect("nuimo-b owns zone-b");
+        assert_eq!(rules_b_right.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_for_device_target_none_for_unknown_device() {
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![mapping_with_feedback()]).await;
+
+        let rules = engine
+            .feedback_rules_for_device_target("nuimo", "unknown-device", "roon", "zone-1")
+            .await;
+        assert!(
+            rules.is_none(),
+            "no mapping for unknown device — caller should skip",
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_for_device_target_some_empty_for_mapping_without_rules() {
+        // A mapping exists for the device + target, but `feedback` is empty.
+        // Result must be `Some(vec![])` so the caller falls back to
+        // hardcoded defaults (preserves single-device behavior).
+        let m = rotate_mapping(); // no feedback rules
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![m]).await;
+
+        let rules = engine
+            .feedback_rules_for_device_target("nuimo", "C3:81:DF:4E", "roon", "zone-1")
+            .await;
+        let rules = rules.expect("mapping exists — caller should fall back to defaults");
+        assert!(
+            rules.is_empty(),
+            "no explicit rules configured — pump will use FeedbackPlan defaults",
+        );
     }
 }
