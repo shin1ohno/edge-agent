@@ -76,7 +76,12 @@ pub fn handle_publish(topic: &str, payload: &[u8], state_tx: &broadcast::Sender<
         output_id: None,
         value,
     };
-    let _ = state_tx.send(update);
+    match state_tx.send(update) {
+        Ok(n) => tracing::debug!(%topic, delivered_to = n, "macos state forwarded"),
+        Err(_) => {
+            tracing::warn!(%topic, "macos state dropped — no active receivers on broadcast channel")
+        }
+    }
 }
 
 #[cfg(test)]
