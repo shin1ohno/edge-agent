@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.2...edge-agent-v0.5.3) - 2026-04-24
+
+### Other
+
+- empty ble_addresses now means accept-all, not WS-only ([#39](https://github.com/shin1ohno/edge-agent/pull/39))
+
 ## [0.5.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.1...edge-agent-v0.5.2) - 2026-04-24
 
 ### Other
