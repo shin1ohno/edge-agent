@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.1...edge-agent-v0.5.2) - 2026-04-24
+
+### Other
+
+- supervise multiple Nuimos in parallel ([#37](https://github.com/shin1ohno/edge-agent/pull/37))
+
 ## [0.5.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.0...edge-agent-v0.5.1) - 2026-04-24
 
 ### Other
