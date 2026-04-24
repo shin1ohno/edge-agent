@@ -190,164 +190,17 @@ async fn main() -> anyhow::Result<()> {
         rx
     };
 
-    // nuimo.skip lets an edge run as a WS-only witness (dashboard / hub
-    // validation / multi-edge routing tests without requiring physical BLE
-    // hardware on every host).
-    if cfg.nuimo.skip {
-        tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
-
-        #[cfg(feature = "roon")]
-        spawn_state_pump(
-            roon_adapter.subscribe_state(),
-            ws_outbox.clone(),
-            ws_resync.subscribe(),
-        );
-
-        // Hue state pump is spawned from inside `run_hue_bootstrap` when
-        // the adapter first comes online, so nothing to do here.
-        #[cfg(feature = "hue")]
-        let _ = &hue_adapter_rx;
-
-        // Same story for macOS: `run_macos_bootstrap` owns the state pump.
-        #[cfg(feature = "macos")]
-        let _ = &macos_adapter_rx;
-
-        tokio::signal::ctrl_c().await?;
-        tracing::info!("shutting down");
-        return Ok(());
-    }
-
-    // Discover a Nuimo. Optionally pin to a specific BLE address.
-    tracing::info!("scanning for Nuimo...");
-    let (mut discovered_rx, _discovery_handle) = discover().await?;
-    let discovered = loop {
-        let Some(d) = tokio::time::timeout(Duration::from_secs(60), discovered_rx.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("nuimo discovery timed out after 60s"))?
-        else {
-            anyhow::bail!("nuimo discovery channel closed");
-        };
-        if let Some(wanted) = cfg.nuimo.ble_address.as_deref() {
-            if d.address != wanted {
-                tracing::debug!(found = %d.address, wanted, "skipping non-matching Nuimo");
-                continue;
-            }
-        }
-        break d;
-    };
-    tracing::info!(name = %discovered.name, addr = %discovered.address, "nuimo found");
-
-    let device = Arc::new(NuimoDevice::new(discovered.address, &discovered.adapter));
-    device.connect().await?;
-    device.set_rotation_mode(RotationMode::Continuous).await;
-    let device_id = device.id();
-    tracing::info!(%device_id, "nuimo connected");
-
-    // Device-state pump for weave-web visibility. `spawn_device_state_pump`
-    // caches the last value per property and replays on every ws reconnect,
-    // so a weave-server restart does not leave the UI stuck on "offline".
-    // Input events bypass the cache (transient; see `emit_input_device_state`).
-    //
-    // The initial `connected: true` is sent explicitly here because the
-    // `NuimoEvent::Connected` emitted by `device.connect()` above fires
-    // before the event loop below subscribes, so relying on the event
-    // broadcast alone would miss the startup transition.
-    let device_state_tx = spawn_device_state_pump(
-        "nuimo",
-        device_id.clone(),
+    // Global adapter → WS state pump and intent dispatcher. Spawned before
+    // the Nuimo supervisor so service state continues to flow to
+    // `/ws/edge` even in WS-only mode (no allowlist entries) or while the
+    // first Nuimo hasn't connected yet.
+    #[cfg(feature = "roon")]
+    spawn_state_pump(
+        roon_adapter.subscribe_state(),
         ws_outbox.clone(),
         ws_resync.subscribe(),
     );
-    let _ = device_state_tx
-        .send(("connected".into(), serde_json::json!(true)))
-        .await;
 
-    // Best-effort link glyph on connect — skipped if the registry isn't
-    // populated yet (first run with no cache and server unreachable).
-    if let Some(link) = glyphs.get("link").await {
-        let _ = device
-            .display_glyph(
-                &nuimo::Glyph::from_str(&link.pattern),
-                &DisplayOptions {
-                    brightness: 1.0,
-                    timeout_ms: 3000,
-                    transition: DisplayTransition::CrossFade,
-                },
-            )
-            .await;
-    }
-
-    // State pump: adapter state → /ws/edge outbox + local glyph feedback.
-    //
-    // adapter-roon already suppresses unchanged values at the source, so
-    // here we only need to throttle BLE-bound writes. Feedback LED writes
-    // share the Nuimo's single BLE connection with rotate notifications —
-    // volume bar renders are limited to ~10 Hz so the gesture stays smooth.
-    //
-    // WS-forward and local glyph feedback subscribe to the same adapter
-    // broadcast independently: WS-forward goes through `spawn_state_pump`
-    // (which handles replay-on-reconnect so weave-server recovers its full
-    // snapshot after a restart), and feedback runs on its own task so a
-    // stall on the BLE write side can't block outbound WS frames.
-    #[cfg(feature = "roon")]
-    {
-        spawn_state_pump(
-            roon_adapter.subscribe_state(),
-            ws_outbox.clone(),
-            ws_resync.subscribe(),
-        );
-
-        tokio::spawn(run_feedback_pump(
-            roon_adapter.subscribe_state(),
-            device.clone(),
-            glyphs.clone(),
-            engine.clone(),
-        ));
-    }
-
-    // Hue feedback pump: `run_hue_bootstrap` flips the watch channel to
-    // `Some(adapter)` the first time the bridge becomes reachable. Until
-    // then the pump is idle; once the adapter appears, it subscribes to
-    // its state broadcast and runs the same feedback loop as Roon so
-    // e.g. a Hue brightness change renders on the Nuimo LED.
-    //
-    // Gated on both features: `run_feedback_pump` and `FeedbackPlan` live
-    // under `feature = "roon"` today because that was the original
-    // consumer. Default production builds enable `roon` + `hue`, so in
-    // practice this block is always active; a `--no-default-features
-    // --features hue` build intentionally loses the feedback pump (no
-    // cross-feature plumbing for a niche config).
-    #[cfg(all(feature = "roon", feature = "hue"))]
-    {
-        let dev = device.clone();
-        let glyphs_for_feedback = glyphs.clone();
-        let engine_for_feedback = engine.clone();
-        let mut hue_rx_watch = hue_adapter_rx.clone();
-        tokio::spawn(async move {
-            let adapter = loop {
-                if let Some(a) = hue_rx_watch.borrow().clone() {
-                    break a;
-                }
-                if hue_rx_watch.changed().await.is_err() {
-                    return;
-                }
-            };
-            run_feedback_pump(
-                adapter.subscribe_state(),
-                dev,
-                glyphs_for_feedback,
-                engine_for_feedback,
-            )
-            .await;
-        });
-    }
-
-    // Dispatch pipeline. Each (service_type, service_target) gets a dedicated
-    // worker task that serializes RPCs for that target: one RPC in flight at
-    // a time, with natural back-pressure driving the coalescing. While an
-    // RPC is awaited, incoming continuous deltas (volume_change etc.) queue
-    // and get merged on the next drain — so on a fast knob turn the service
-    // sees one large merged change instead of a race of many small ones.
     let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
     tokio::spawn(run_dispatcher(
         intent_rx,
@@ -360,111 +213,404 @@ async fn main() -> anyhow::Result<()> {
         macos_adapter_rx.clone(),
     ));
 
-    // Input pump: Nuimo BLE events → routing → coalescer.
-    //
-    // BLE connections to the Nuimo drop occasionally (peripheral side
-    // resets, host BlueZ hiccups). The `event_tx` broadcast inside the
-    // nuimo SDK is stable across reconnects, so we keep the same
-    // subscription and re-drive `device.connect()` with exponential
-    // backoff when a Disconnected event fires.
-    let mut events = device.events();
-    let device_type = "nuimo";
+    // WS-only mode: (a) explicit `nuimo.skip=true`, or (b) empty
+    // `ble_addresses` allowlist. Either way, no BLE scan is started.
+    if cfg.nuimo.skip || cfg.nuimo.ble_addresses.is_empty() {
+        if cfg.nuimo.skip {
+            tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
+        } else {
+            tracing::warn!(
+                "nuimo.ble_addresses is empty — running WS-only (no Nuimos bound to this edge)",
+            );
+        }
+        // Keep `hue_adapter_rx` / `macos_adapter_rx` alive: their bootstrap
+        // tasks own their state pumps and depend on the watch channel
+        // receiver staying in scope.
+        #[cfg(feature = "hue")]
+        let _ = &hue_adapter_rx;
+        #[cfg(feature = "macos")]
+        let _ = &macos_adapter_rx;
+
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("shutting down");
+        return Ok(());
+    }
+
+    let deps = NuimoDeps {
+        engine: engine.clone(),
+        glyphs: glyphs.clone(),
+        ws_outbox: ws_outbox.clone(),
+        ws_resync: ws_resync.clone(),
+        intent_tx,
+        #[cfg(feature = "roon")]
+        roon_adapter: roon_adapter.clone(),
+        #[cfg(feature = "hue")]
+        hue_adapter_rx: hue_adapter_rx.clone(),
+    };
+
+    run_nuimo_supervisor(cfg.nuimo.ble_addresses, deps).await
+}
+
+/// Shared context every per-device Nuimo task needs. Collected into one
+/// struct so `connect_and_spawn` doesn't grow an ever-widening signature
+/// as new features land.
+#[derive(Clone)]
+struct NuimoDeps {
+    engine: Arc<RoutingEngine>,
+    glyphs: Arc<GlyphRegistry>,
+    ws_outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    ws_resync: tokio::sync::broadcast::Sender<()>,
+    intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
+    #[cfg(feature = "roon")]
+    roon_adapter: Arc<dyn ServiceAdapter>,
+    #[cfg(feature = "hue")]
+    hue_adapter_rx: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
+}
+
+/// Long-running task that consumes `nuimo::discover()` forever and brings
+/// each allowlisted Nuimo online in parallel. Handles hot-plug: a Nuimo
+/// powered on after edge-agent startup is picked up on the next
+/// discovery sweep without restart.
+///
+/// `allowlist` is the set of BLE addresses (case-insensitive) the edge
+/// is allowed to bind. Discoveries outside the list are logged at debug
+/// and ignored. Duplicate discoveries for an already-supervised address
+/// are silently skipped.
+async fn run_nuimo_supervisor(
+    allowlist: Vec<String>,
+    deps: NuimoDeps,
+) -> anyhow::Result<()> {
+    let allowlist = build_allowlist(&allowlist);
+    tracing::info!(
+        allowlist_count = allowlist.len(),
+        "scanning for Nuimo (multi-device supervisor)",
+    );
+
+    let (mut discovered_rx, _discovery_handle) = discover().await?;
+    // Tracked devices: key = uppercased BLE address so lookup is
+    // case-insensitive. Value carries the device + spawned task handles
+    // (handles kept solely to keep the tasks owned by the supervisor so
+    // they live as long as the process; we do not poll or abort them).
+    let mut tracked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut devices: HashMap<String, NuimoContext> = HashMap::new();
+
     loop {
         tokio::select! {
-            res = events.recv() => {
-                match res {
-                    Ok(NuimoEvent::Disconnected) => {
-                        tracing::warn!("nuimo BLE disconnected — reconnecting");
-                        let _ = ws_outbox
-                            .send(EdgeToServer::Error {
-                                context: "nuimo.ble".into(),
-                                message: "disconnected — reconnecting".into(),
-                                severity: weave_contracts::ErrorSeverity::Warn,
-                            })
-                            .await;
-                        let _ = device_state_tx
-                            .send(("connected".into(), serde_json::json!(false)))
-                            .await;
-                        reconnect_nuimo(&device).await;
-                        let _ = device_state_tx
-                            .send(("connected".into(), serde_json::json!(true)))
-                            .await;
+            maybe_d = discovered_rx.recv() => {
+                let Some(d) = maybe_d else {
+                    tracing::warn!("nuimo discovery channel closed — supervisor exiting");
+                    return Ok(());
+                };
+                match supervisor_decision(&d.address, &allowlist, &tracked) {
+                    SupervisorDecision::Ignore => {
+                        tracing::debug!(found = %d.address, "nuimo not in allowlist — ignoring");
+                        continue;
                     }
-                    Ok(NuimoEvent::Connected) => {
-                        // Idempotent: the Disconnected arm already re-sent
-                        // connected:true after reconnect. This catches any
-                        // SDK-initiated Connected emission we didn't trigger
-                        // explicitly (defensive, cache-deduped on server).
-                        let _ = device_state_tx
-                            .send(("connected".into(), serde_json::json!(true)))
-                            .await;
+                    SupervisorDecision::AlreadyTracked => {
+                        // Re-discovery of an already-connected Nuimo (BlueZ
+                        // cache sweep). Ignore silently.
+                        continue;
                     }
-                    Ok(NuimoEvent::BatteryLevel(pct)) => {
-                        let _ = device_state_tx
-                            .send(("battery".into(), serde_json::json!(pct)))
-                            .await;
-                    }
-                    Ok(NuimoEvent::Rssi(_)) => {
-                        // Not surfaced today; skip without routing.
-                    }
-                    Ok(event) => {
-                        // Unconditional input-event forward for observability
-                        // (Try It Now, debug dashboards). Sent even when
-                        // routing has no mapping — the event itself is the
-                        // diagnostic signal.
-                        emit_input_device_state(&ws_outbox, &device_id, &event).await;
-                        let Some(primitive) = translate_nuimo_event(&event) else { continue; };
-                        use edge_core::RouteOutcome;
-                        match engine.route_with_mode(device_type, &device_id, &primitive).await {
-                            RouteOutcome::Normal(routed) => {
-                                for r in routed {
-                                    if let Err(e) = intent_tx.try_send(r) {
-                                        tracing::warn!(error = %e, "intent channel full; dropping event");
-                                    }
-                                }
+                    SupervisorDecision::Admit(key) => {
+                        tracing::info!(name = %d.name, addr = %d.address, "nuimo found");
+                        match connect_and_spawn(d, deps.clone()).await {
+                            Ok(ctx) => {
+                                tracked.insert(key.clone());
+                                devices.insert(key, ctx);
                             }
-                            RouteOutcome::EnterSelection { edge_id: _, mapping_id, glyph }
-                            | RouteOutcome::UpdateSelection { mapping_id, glyph } => {
-                                tracing::info!(%mapping_id, %glyph, "target selection: showing candidate");
-                                if let Some(entry) = glyphs.get(&glyph).await {
-                                    let n_glyph = nuimo::Glyph::from_str(&entry.pattern);
-                                    if let Err(e) = device
-                                        .display_glyph(&n_glyph, &DisplayOptions {
-                                            brightness: 1.0,
-                                            timeout_ms: 10_000,
-                                            transition: DisplayTransition::CrossFade,
-                                        })
-                                        .await
-                                    {
-                                        tracing::warn!(error = %e, "failed to push selection glyph");
-                                    }
-                                } else {
-                                    tracing::warn!(%glyph, "selection glyph not in registry — skipping LED push");
-                                }
-                            }
-                            RouteOutcome::CommitSelection { edge_id: _, mapping_id, service_target } => {
-                                tracing::info!(%mapping_id, %service_target, "target selection: committing");
-                                let _ = ws_outbox
-                                    .send(EdgeToServer::SwitchTarget { mapping_id, service_target })
-                                    .await;
-                            }
-                            RouteOutcome::CancelSelection { mapping_id } => {
-                                tracing::info!(%mapping_id, "target selection: cancelled");
+                            Err(e) => {
+                                tracing::warn!(error = %e, key = %key, "failed to bring up nuimo");
                             }
                         }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "nuimo event lag");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::error!("nuimo event broadcast closed — cannot continue");
-                        return Ok(());
                     }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutting down");
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// Normalize a list of BLE addresses into a case-insensitive allowlist.
+/// Trims whitespace and skips empty entries; duplicates are collapsed by
+/// the `HashSet`.
+fn build_allowlist(addrs: &[String]) -> std::collections::HashSet<String> {
+    addrs
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Pure decision for a single discovered Nuimo: admit, already tracked,
+/// or ignore (not in allowlist). Extracted from the supervisor loop so
+/// it can be unit tested without BLE hardware.
+#[derive(Debug, PartialEq, Eq)]
+enum SupervisorDecision {
+    /// Admit a new device. Carries the uppercased key so the caller can
+    /// insert into its tracking set without re-normalizing.
+    Admit(String),
+    /// Address matches the allowlist but is already being supervised.
+    AlreadyTracked,
+    /// Address is not in the allowlist.
+    Ignore,
+}
+
+fn supervisor_decision(
+    address: &str,
+    allowlist: &std::collections::HashSet<String>,
+    tracked: &std::collections::HashSet<String>,
+) -> SupervisorDecision {
+    let key = address.trim().to_ascii_uppercase();
+    if !allowlist.contains(&key) {
+        return SupervisorDecision::Ignore;
+    }
+    if tracked.contains(&key) {
+        return SupervisorDecision::AlreadyTracked;
+    }
+    SupervisorDecision::Admit(key)
+}
+
+/// Per-device state kept by the supervisor. Holds the `Arc<NuimoDevice>`
+/// plus the `JoinHandle`s for every task spawned on behalf of the device;
+/// the handles exist only to tie the tasks' lifetimes to the supervisor
+/// entry.
+#[allow(dead_code)]
+struct NuimoContext {
+    device: Arc<NuimoDevice>,
+    device_id: String,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Bring one discovered Nuimo online: connect BLE, register device-state
+/// pump, render the link glyph, and spawn the per-device feedback pumps
+/// and event loop. Returns the tracking context; dropping it does NOT
+/// disconnect the device — the tasks outlive their handles.
+async fn connect_and_spawn(
+    discovered: nuimo::DiscoveredNuimo,
+    deps: NuimoDeps,
+) -> anyhow::Result<NuimoContext> {
+    let device = Arc::new(NuimoDevice::new(discovered.address, &discovered.adapter));
+    device.connect().await?;
+    device.set_rotation_mode(RotationMode::Continuous).await;
+    let device_id = device.id();
+    tracing::info!(%device_id, "nuimo connected");
+
+    // Device-state pump for weave-web visibility. Cache + replay on every
+    // ws resync so weave-server restarts don't leave the UI stuck on
+    // stale state. Initial `connected: true` is sent here because the
+    // `NuimoEvent::Connected` emitted by `device.connect()` above fires
+    // before the event loop subscribes.
+    let device_state_tx = spawn_device_state_pump(
+        "nuimo",
+        device_id.clone(),
+        deps.ws_outbox.clone(),
+        deps.ws_resync.subscribe(),
+    );
+    let _ = device_state_tx
+        .send(("connected".into(), serde_json::json!(true)))
+        .await;
+
+    // Best-effort link glyph on connect — skipped if the registry isn't
+    // populated yet (first run with no cache and server unreachable).
+    if let Some(link) = deps.glyphs.get("link").await {
+        let _ = device
+            .display_glyph(
+                &nuimo::Glyph::from_str(&link.pattern),
+                &DisplayOptions {
+                    brightness: 1.0,
+                    timeout_ms: 3000,
+                    transition: DisplayTransition::CrossFade,
+                },
+            )
+            .await;
+    }
+
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Per-device feedback pumps. Each pump subscribes to an adapter's
+    // state broadcast independently and filters by (device_type,
+    // device_id) so a second Nuimo mapped elsewhere never reacts to
+    // unrelated service activity.
+    #[cfg(feature = "roon")]
+    {
+        handles.push(tokio::spawn(run_feedback_pump(
+            deps.roon_adapter.subscribe_state(),
+            device.clone(),
+            device_id.clone(),
+            deps.glyphs.clone(),
+            deps.engine.clone(),
+        )));
+    }
+
+    #[cfg(all(feature = "roon", feature = "hue"))]
+    {
+        let dev = device.clone();
+        let dev_id = device_id.clone();
+        let glyphs_for_feedback = deps.glyphs.clone();
+        let engine_for_feedback = deps.engine.clone();
+        let mut hue_rx_watch = deps.hue_adapter_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let adapter = loop {
+                if let Some(a) = hue_rx_watch.borrow().clone() {
+                    break a;
+                }
+                if hue_rx_watch.changed().await.is_err() {
+                    return;
+                }
+            };
+            run_feedback_pump(
+                adapter.subscribe_state(),
+                dev,
+                dev_id,
+                glyphs_for_feedback,
+                engine_for_feedback,
+            )
+            .await;
+        }));
+    }
+
+    // Event loop: consumes `device.events()` forever, translates to
+    // routed intents, drives reconnect on disconnect. One task per
+    // Nuimo; tasks are fully independent so Nuimo A's reconnect never
+    // blocks Nuimo B's event flow.
+    let event_loop = tokio::spawn(run_nuimo_event_loop(
+        device.clone(),
+        device_id.clone(),
+        device_state_tx,
+        deps.engine.clone(),
+        deps.intent_tx.clone(),
+        deps.glyphs.clone(),
+        deps.ws_outbox.clone(),
+    ));
+    handles.push(event_loop);
+
+    Ok(NuimoContext {
+        device,
+        device_id,
+        handles,
+    })
+}
+
+/// Per-device event pump. Runs forever (until the broadcast closes or
+/// the runtime shuts down). Owns reconnect on `Disconnected`, routing of
+/// input events, and selection-mode LED rendering for one Nuimo.
+async fn run_nuimo_event_loop(
+    device: Arc<NuimoDevice>,
+    device_id: String,
+    device_state_tx: tokio::sync::mpsc::Sender<(String, serde_json::Value)>,
+    engine: Arc<RoutingEngine>,
+    intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
+    glyphs: Arc<GlyphRegistry>,
+    ws_outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+) {
+    let mut events = device.events();
+    let device_type = "nuimo";
+    loop {
+        match events.recv().await {
+            Ok(NuimoEvent::Disconnected) => {
+                tracing::warn!(%device_id, "nuimo BLE disconnected — reconnecting");
+                let _ = ws_outbox
+                    .send(EdgeToServer::Error {
+                        context: "nuimo.ble".into(),
+                        message: format!("{device_id}: disconnected — reconnecting"),
+                        severity: weave_contracts::ErrorSeverity::Warn,
+                    })
+                    .await;
+                let _ = device_state_tx
+                    .send(("connected".into(), serde_json::json!(false)))
+                    .await;
+                reconnect_nuimo(&device).await;
+                let _ = device_state_tx
+                    .send(("connected".into(), serde_json::json!(true)))
+                    .await;
+            }
+            Ok(NuimoEvent::Connected) => {
+                // Idempotent: the Disconnected arm already re-sent
+                // connected:true after reconnect. This catches any
+                // SDK-initiated Connected emission we didn't trigger
+                // explicitly (defensive, cache-deduped on server).
+                let _ = device_state_tx
+                    .send(("connected".into(), serde_json::json!(true)))
+                    .await;
+            }
+            Ok(NuimoEvent::BatteryLevel(pct)) => {
+                let _ = device_state_tx
+                    .send(("battery".into(), serde_json::json!(pct)))
+                    .await;
+            }
+            Ok(NuimoEvent::Rssi(_)) => {
+                // Not surfaced today; skip without routing.
+            }
+            Ok(event) => {
+                emit_input_device_state(&ws_outbox, &device_id, &event).await;
+                let Some(primitive) = translate_nuimo_event(&event) else {
+                    continue;
+                };
+                use edge_core::RouteOutcome;
+                match engine
+                    .route_with_mode(device_type, &device_id, &primitive)
+                    .await
+                {
+                    RouteOutcome::Normal(routed) => {
+                        for r in routed {
+                            if let Err(e) = intent_tx.try_send(r) {
+                                tracing::warn!(error = %e, "intent channel full; dropping event");
+                            }
+                        }
+                    }
+                    RouteOutcome::EnterSelection {
+                        edge_id: _,
+                        mapping_id,
+                        glyph,
+                    }
+                    | RouteOutcome::UpdateSelection { mapping_id, glyph } => {
+                        tracing::info!(%mapping_id, %glyph, "target selection: showing candidate");
+                        if let Some(entry) = glyphs.get(&glyph).await {
+                            let n_glyph = nuimo::Glyph::from_str(&entry.pattern);
+                            if let Err(e) = device
+                                .display_glyph(
+                                    &n_glyph,
+                                    &DisplayOptions {
+                                        brightness: 1.0,
+                                        timeout_ms: 10_000,
+                                        transition: DisplayTransition::CrossFade,
+                                    },
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "failed to push selection glyph");
+                            }
+                        } else {
+                            tracing::warn!(%glyph, "selection glyph not in registry — skipping LED push");
+                        }
+                    }
+                    RouteOutcome::CommitSelection {
+                        edge_id: _,
+                        mapping_id,
+                        service_target,
+                    } => {
+                        tracing::info!(%mapping_id, %service_target, "target selection: committing");
+                        let _ = ws_outbox
+                            .send(EdgeToServer::SwitchTarget {
+                                mapping_id,
+                                service_target,
+                            })
+                            .await;
+                    }
+                    RouteOutcome::CancelSelection { mapping_id } => {
+                        tracing::info!(%mapping_id, "target selection: cancelled");
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "nuimo event lag");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::error!(%device_id, "nuimo event broadcast closed — event loop exiting");
+                return;
             }
         }
     }
@@ -763,6 +909,7 @@ fn push_merged(pending: &mut Vec<Intent>, intent: Intent) {
 async fn run_feedback_pump(
     mut state_rx: tokio::sync::broadcast::Receiver<StateUpdate>,
     device: Arc<NuimoDevice>,
+    device_id: String,
     glyphs: Arc<GlyphRegistry>,
     engine: Arc<RoutingEngine>,
 ) {
@@ -770,14 +917,23 @@ async fn run_feedback_pump(
     loop {
         match state_rx.recv().await {
             Ok(update) => {
-                // Consult mapping-level feedback rules first — they let
-                // a user override e.g. the "paused" glyph per target
-                // from the weave-web UI. Hardcoded defaults apply when
-                // no rule matches (preserves behavior for deployments
-                // that never populated `feedback`).
-                let rules = engine
-                    .feedback_rules_for_target(&update.service_type, &update.target)
-                    .await;
+                // Scoped to this device's mappings: `None` means this
+                // Nuimo owns no mapping for the target (skip, another
+                // Nuimo may handle it); `Some(vec)` means a mapping
+                // exists and we hand off to `FeedbackPlan::resolve`,
+                // which falls back to hardcoded defaults when the user
+                // configured no explicit rules.
+                let Some(rules) = engine
+                    .feedback_rules_for_device_target(
+                        "nuimo",
+                        &device_id,
+                        &update.service_type,
+                        &update.target,
+                    )
+                    .await
+                else {
+                    continue;
+                };
                 if let Some(plan) = FeedbackPlan::resolve(&update, &rules) {
                     let sig = plan.signature();
                     if filter.should_render(&update, &sig) {
@@ -1592,5 +1748,92 @@ mod tests {
         let (_, _, property, value) = unwrap_device_state(&replayed[0]);
         assert_eq!(property, "battery");
         assert_eq!(value, &json!(55), "latest value wins");
+    }
+
+    #[test]
+    fn allowlist_normalizes_case_and_whitespace() {
+        let addrs = vec![
+            "AA:BB:CC:DD:EE:FF".into(),
+            "  aa:bb:cc:dd:ee:ff  ".into(), // duplicate after trim+upper
+            "11:22:33:44:55:66".into(),
+            "".into(), // dropped
+        ];
+        let set = build_allowlist(&addrs);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("AA:BB:CC:DD:EE:FF"));
+        assert!(set.contains("11:22:33:44:55:66"));
+    }
+
+    #[test]
+    fn supervisor_decision_admits_allowlisted() {
+        let allowlist = build_allowlist(&["AA:BB:CC:DD:EE:FF".into()]);
+        let tracked = std::collections::HashSet::new();
+        let decision = supervisor_decision("aa:bb:cc:dd:ee:ff", &allowlist, &tracked);
+        assert_eq!(
+            decision,
+            SupervisorDecision::Admit("AA:BB:CC:DD:EE:FF".into()),
+        );
+    }
+
+    #[test]
+    fn supervisor_decision_ignores_unknown() {
+        let allowlist = build_allowlist(&["AA:BB:CC:DD:EE:FF".into()]);
+        let tracked = std::collections::HashSet::new();
+        let decision = supervisor_decision("99:99:99:99:99:99", &allowlist, &tracked);
+        assert_eq!(decision, SupervisorDecision::Ignore);
+    }
+
+    #[test]
+    fn supervisor_decision_skips_already_tracked() {
+        let allowlist = build_allowlist(&["AA:BB:CC:DD:EE:FF".into()]);
+        let mut tracked = std::collections::HashSet::new();
+        tracked.insert("AA:BB:CC:DD:EE:FF".into());
+        let decision = supervisor_decision("aa:bb:cc:dd:ee:ff", &allowlist, &tracked);
+        assert_eq!(decision, SupervisorDecision::AlreadyTracked);
+    }
+
+    #[test]
+    fn supervisor_decision_empty_allowlist_admits_nothing() {
+        let allowlist = std::collections::HashSet::new();
+        let tracked = std::collections::HashSet::new();
+        let decision = supervisor_decision("AA:BB:CC:DD:EE:FF", &allowlist, &tracked);
+        assert_eq!(
+            decision,
+            SupervisorDecision::Ignore,
+            "empty allowlist must not admit — WS-only mode is the correct fallback",
+        );
+    }
+
+    #[test]
+    fn supervisor_decision_handles_multiple_nuimos_independently() {
+        // Simulate the supervisor accepting two different Nuimos in sequence,
+        // then rejecting a re-discovery of the first.
+        let allowlist = build_allowlist(&[
+            "AA:BB:CC:DD:EE:FF".into(),
+            "11:22:33:44:55:66".into(),
+        ]);
+        let mut tracked = std::collections::HashSet::new();
+
+        // Nuimo A arrives.
+        match supervisor_decision("AA:BB:CC:DD:EE:FF", &allowlist, &tracked) {
+            SupervisorDecision::Admit(key) => tracked.insert(key),
+            other => panic!("expected Admit, got {:?}", other),
+        };
+        // Nuimo B arrives next.
+        match supervisor_decision("11:22:33:44:55:66", &allowlist, &tracked) {
+            SupervisorDecision::Admit(key) => tracked.insert(key),
+            other => panic!("expected Admit, got {:?}", other),
+        };
+        // Nuimo A re-discovered (BlueZ cache sweep).
+        assert_eq!(
+            supervisor_decision("aa:bb:cc:dd:ee:ff", &allowlist, &tracked),
+            SupervisorDecision::AlreadyTracked,
+        );
+        // Unknown Nuimo.
+        assert_eq!(
+            supervisor_decision("99:99:99:99:99:99", &allowlist, &tracked),
+            SupervisorDecision::Ignore,
+        );
+        assert_eq!(tracked.len(), 2);
     }
 }
