@@ -213,16 +213,13 @@ async fn main() -> anyhow::Result<()> {
         macos_adapter_rx.clone(),
     ));
 
-    // WS-only mode: (a) explicit `nuimo.skip=true`, or (b) empty
-    // `ble_addresses` allowlist. Either way, no BLE scan is started.
-    if cfg.nuimo.skip || cfg.nuimo.ble_addresses.is_empty() {
-        if cfg.nuimo.skip {
-            tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
-        } else {
-            tracing::warn!(
-                "nuimo.ble_addresses is empty — running WS-only (no Nuimos bound to this edge)",
-            );
-        }
+    // WS-only mode: only the explicit `nuimo.skip=true` opts out of BLE.
+    // An empty `ble_addresses` means "no filter — accept every Nuimo
+    // discovered", which preserves the pre-multi-device default
+    // ("no pin" configs keep working) and maximises ergonomics for hosts
+    // that own whichever Nuimo is in range.
+    if cfg.nuimo.skip {
+        tracing::info!("nuimo.skip=true — running WS-only mode (no BLE)");
         // Keep `hue_adapter_rx` / `macos_adapter_rx` alive: their bootstrap
         // tasks own their state pumps and depend on the watch channel
         // receiver staying in scope.
@@ -273,15 +270,22 @@ struct NuimoDeps {
 /// discovery sweep without restart.
 ///
 /// `allowlist` is the set of BLE addresses (case-insensitive) the edge
-/// is allowed to bind. Discoveries outside the list are logged at debug
-/// and ignored. Duplicate discoveries for an already-supervised address
-/// are silently skipped.
+/// is allowed to bind. An **empty** allowlist means "accept every Nuimo
+/// discovered" (backward compat with pre-multi-device configs where
+/// `[nuimo]` with no `ble_address` pinned nothing). A non-empty
+/// allowlist filters discoveries; anything outside the list is logged
+/// at debug and ignored. Duplicate discoveries for an already-supervised
+/// address are silently skipped.
 async fn run_nuimo_supervisor(allowlist: Vec<String>, deps: NuimoDeps) -> anyhow::Result<()> {
     let allowlist = build_allowlist(&allowlist);
-    tracing::info!(
-        allowlist_count = allowlist.len(),
-        "scanning for Nuimo (multi-device supervisor)",
-    );
+    if allowlist.is_empty() {
+        tracing::info!("scanning for Nuimo (multi-device supervisor, accept-all)");
+    } else {
+        tracing::info!(
+            allowlist_count = allowlist.len(),
+            "scanning for Nuimo (multi-device supervisor, allowlist mode)",
+        );
+    }
 
     let (mut discovered_rx, _discovery_handle) = discover().await?;
     // Tracked devices: key = uppercased BLE address so lookup is
@@ -361,7 +365,11 @@ fn supervisor_decision(
     tracked: &std::collections::HashSet<String>,
 ) -> SupervisorDecision {
     let key = address.trim().to_ascii_uppercase();
-    if !allowlist.contains(&key) {
+    // Empty allowlist = accept-all (no filter). This preserves the
+    // pre-multi-device default where `[nuimo]` without `ble_address`
+    // meant "first discovered Nuimo"; now the same config admits every
+    // discovered Nuimo. `nuimo.skip=true` remains the opt-out for BLE.
+    if !allowlist.is_empty() && !allowlist.contains(&key) {
         return SupervisorDecision::Ignore;
     }
     if tracked.contains(&key) {
@@ -1790,14 +1798,17 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_decision_empty_allowlist_admits_nothing() {
+    fn supervisor_decision_empty_allowlist_admits_anything() {
+        // Empty allowlist = accept-all, matching the pre-multi-device
+        // behavior where `[nuimo]` without `ble_address` accepted the
+        // first Nuimo discovered. `nuimo.skip=true` is the opt-out.
         let allowlist = std::collections::HashSet::new();
         let tracked = std::collections::HashSet::new();
         let decision = supervisor_decision("AA:BB:CC:DD:EE:FF", &allowlist, &tracked);
         assert_eq!(
             decision,
-            SupervisorDecision::Ignore,
-            "empty allowlist must not admit — WS-only mode is the correct fallback",
+            SupervisorDecision::Admit("AA:BB:CC:DD:EE:FF".into()),
+            "empty allowlist should admit any discovered Nuimo — backward compat",
         );
     }
 
