@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.0...edge-agent-v0.5.1) - 2026-04-24
+
+### Other
+
+- demote diagnostic publish/forward logs to debug ([#35](https://github.com/shin1ohno/edge-agent/pull/35))
+- macOS audio control via MQTT (macos-hub + adapter_macos) ([#34](https://github.com/shin1ohno/edge-agent/pull/34))
+- rustfmt fixups after edge-core extraction
+- extract routing/adapter/ws-client out of edge-agent binary
+
 ## [0.5.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.4.3...edge-agent-v0.5.0) - 2026-04-23
 
 ### Other
