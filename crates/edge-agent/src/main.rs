@@ -276,10 +276,7 @@ struct NuimoDeps {
 /// is allowed to bind. Discoveries outside the list are logged at debug
 /// and ignored. Duplicate discoveries for an already-supervised address
 /// are silently skipped.
-async fn run_nuimo_supervisor(
-    allowlist: Vec<String>,
-    deps: NuimoDeps,
-) -> anyhow::Result<()> {
+async fn run_nuimo_supervisor(allowlist: Vec<String>, deps: NuimoDeps) -> anyhow::Result<()> {
     let allowlist = build_allowlist(&allowlist);
     tracing::info!(
         allowlist_count = allowlist.len(),
@@ -1808,10 +1805,7 @@ mod tests {
     fn supervisor_decision_handles_multiple_nuimos_independently() {
         // Simulate the supervisor accepting two different Nuimos in sequence,
         // then rejecting a re-discovery of the first.
-        let allowlist = build_allowlist(&[
-            "AA:BB:CC:DD:EE:FF".into(),
-            "11:22:33:44:55:66".into(),
-        ]);
+        let allowlist = build_allowlist(&["AA:BB:CC:DD:EE:FF".into(), "11:22:33:44:55:66".into()]);
         let mut tracked = std::collections::HashSet::new();
 
         // Nuimo A arrives.
