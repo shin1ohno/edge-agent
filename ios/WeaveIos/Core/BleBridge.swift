@@ -1,11 +1,22 @@
 @preconcurrency import CoreBluetooth
 import Foundation
 import Observation
+import os
 
 // UniFFI types (`NuimoEvent`, `Glyph`, `DisplayOptions`) and functions
 // (`parseNuimoNotification`, `buildLedPayload`, `nuimoServiceUuid`,
 // `ledMatrixUuid`) live in `Bundle/WeaveIosCore.swift`, which is part of
 // this same target — no `import WeaveIosCore` is needed.
+
+private let bleLogger = Logger(subsystem: "com.shin1ohno.weave.WeaveIos", category: "BLE")
+
+// Mirrors `nuimo_protocol::DEVICE_NAME`. Senic Nuimo advertises this string
+// in the ADV packet's local-name field but does NOT include the 128-bit
+// primary service UUID there (it lives in the scan response only). iOS
+// scan filters match against the ADV packet exclusively, so we scan
+// unfiltered and identify by name instead — same approach the reference
+// btleplug-based macOS backend takes (`nuimo-rs/.../macos.rs`).
+private let nuimoDeviceName = "Nuimo"
 
 /// Coordinates CoreBluetooth discovery, connection, and GATT I/O for Nuimo
 /// peripherals. UniFFI-exposed helpers from `WeaveIosCore` turn raw
@@ -33,7 +44,9 @@ final class BleBridge: NSObject {
 
     override init() {
         // Canonical service UUID comes from the Rust core so Swift doesn't
-        // drift if the GATT spec is bumped.
+        // drift if the GATT spec is bumped. Used post-connect during GATT
+        // discovery; not used as a scan filter (see comment on
+        // `nuimoDeviceName`).
         self.nuimoServiceUUID = CBUUID(string: nuimoServiceUuid())
         super.init()
         self.central = CBCentralManager(
@@ -49,12 +62,17 @@ final class BleBridge: NSObject {
     // MARK: - Public API
 
     func startScan() {
-        guard central.state == .poweredOn, !isScanning else { return }
+        guard central.state == .poweredOn, !isScanning else {
+            bleLogger.debug("startScan skipped: state=\(self.central.state.rawValue) scanning=\(self.isScanning)")
+            return
+        }
         isScanning = true
+        // `nil` services on purpose: see `nuimoDeviceName` comment above.
         central.scanForPeripherals(
-            withServices: [nuimoServiceUUID],
+            withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+        bleLogger.info("startScan: unfiltered, matching by name=\(nuimoDeviceName)")
     }
 
     func stopScan() {
@@ -93,6 +111,7 @@ final class BleBridge: NSObject {
 extension BleBridge: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothState = central.state
+        bleLogger.info("centralManagerDidUpdateState: state=\(central.state.rawValue)")
         if central.state != .poweredOn {
             isScanning = false
         }
@@ -116,12 +135,20 @@ extension BleBridge: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = advName ?? peripheral.name
+        guard name == nuimoDeviceName else {
+            bleLogger.debug("didDiscover ignored: name=\(name ?? "<nil>") rssi=\(RSSI.intValue)")
+            return
+        }
         if devices[peripheral.identifier] == nil {
             devices[peripheral.identifier] = NuimoDevice(peripheral: peripheral, owner: self)
+            bleLogger.info("didDiscover Nuimo: id=\(peripheral.identifier.uuidString) rssi=\(RSSI.intValue)")
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        bleLogger.info("didConnect: id=\(peripheral.identifier.uuidString)")
         devices[peripheral.identifier]?.handleConnected()
     }
 
@@ -130,6 +157,7 @@ extension BleBridge: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        bleLogger.info("didDisconnect: id=\(peripheral.identifier.uuidString) error=\(error?.localizedDescription ?? "none")")
         devices[peripheral.identifier]?.handleDisconnected()
     }
 
@@ -138,6 +166,7 @@ extension BleBridge: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        bleLogger.error("didFailToConnect: id=\(peripheral.identifier.uuidString) error=\(error?.localizedDescription ?? "none")")
         devices[peripheral.identifier]?.handleDisconnected()
     }
 }
