@@ -4,6 +4,7 @@
 /// Roon zones, Hue lights. Mappings live on their own tab (Phase 5).
 struct ConnectionsView: View {
     @Environment(UiClientHost.self) private var ui
+    @Environment(EdgeClientHost.self) private var edge
     @Environment(SettingsStore.self) private var settings
 
     var body: some View {
@@ -30,7 +31,28 @@ struct ConnectionsView: View {
                                 .truncationMode(.middle)
                         }
                     }
+                    HStack {
+                        Circle()
+                            .fill(edge.connected ? Color.green : Color.secondary)
+                            .frame(width: 8, height: 8)
+                        Text(edge.connected ? "edge online" : "edge offline")
+                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                        Spacer()
+                        if !settings.edgeID.isEmpty {
+                            Text("as \(settings.edgeID)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
                     if let err = ui.lastError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                    if let err = edge.lastError {
                         Text(err)
                             .font(.caption)
                             .foregroundStyle(.red)
@@ -70,11 +92,16 @@ struct ConnectionsView: View {
             .navigationTitle("Connections")
             .refreshable {
                 await ui.connect(serverURL: settings.serverURL)
+                await edge.connect(serverURL: settings.serverURL, edgeID: settings.edgeID)
             }
         }
         .task {
             if !settings.serverURL.isEmpty, ui.activeURL != settings.serverURL {
                 await ui.connect(serverURL: settings.serverURL)
+            }
+            if !settings.serverURL.isEmpty, !settings.edgeID.isEmpty,
+               edge.activeURL != settings.serverURL || edge.activeEdgeID != settings.edgeID {
+                await edge.connect(serverURL: settings.serverURL, edgeID: settings.edgeID)
             }
         }
     }

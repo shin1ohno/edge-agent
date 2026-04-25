@@ -3,6 +3,7 @@
 struct SettingsView: View {
     @Environment(SettingsStore.self) private var settings
     @Environment(BleBridge.self) private var ble
+    @Environment(EdgeClientHost.self) private var edge
 
     var body: some View {
         @Bindable var bindable = settings
@@ -17,6 +18,14 @@ struct SettingsView: View {
                     TextField("Edge ID", text: $bindable.edgeID)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    HStack {
+                        Circle()
+                            .fill(edge.connected ? Color.green : Color.secondary)
+                            .frame(width: 6, height: 6)
+                        Text(edge.connected ? "edge online" : "edge offline")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .textCase(nil)
 
@@ -64,4 +73,5 @@ struct SettingsView: View {
     SettingsView()
         .environment(BleBridge())
         .environment(SettingsStore())
+        .environment(EdgeClientHost())
 }

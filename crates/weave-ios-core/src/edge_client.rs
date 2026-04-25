@@ -1,0 +1,370 @@
+//! `EdgeClient` — WebSocket `/ws/edge` producer for the iOS app.
+//!
+//! Mirrors the pattern of `UiClient` but in the opposite direction: the iPad
+//! announces itself as an edge with `Hello`, replies to server `Ping` with
+//! `Pong`, and forwards locally-observed Nuimo state via `DeviceState`
+//! frames. Inbound `ConfigFull` / `ConfigPatch` frames are decoded but
+//! ignored at this MVP — mappings still flow into the app via `/ws/ui`
+//! (`UiClient`).
+//!
+//! `device_id` for Nuimos is the `peripheral.identifier.uuidString` from
+//! CoreBluetooth (lowercased UUID), not the BLE MAC the Linux edge-agent
+//! uses. CoreBluetooth hides MAC on iOS, and uniqueness is preserved by
+//! `(edge_id, device_id)` in `weave-contracts::DeviceStateEntry`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::tungstenite::protocol::Message;
+use weave_contracts::{EdgeToServer, ServerToEdge};
+
+use crate::WeaveError;
+
+/// Swift-implemented callback for edge connection state.
+///
+/// Inbound frames (`ConfigFull`, `Ping`, …) are handled internally for now;
+/// we only surface connection liveness to Swift.
+#[uniffi::export(with_foreign)]
+pub trait EdgeEventSink: Send + Sync {
+    fn on_connection_changed(&self, connected: bool);
+}
+
+/// Internal command from public methods to the WS outbox loop.
+enum OutboundCommand {
+    DeviceState {
+        device_type: String,
+        device_id: String,
+        property: String,
+        value_json: String,
+    },
+}
+
+#[derive(uniffi::Object)]
+pub struct EdgeClient {
+    shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
+    outbox_tx: mpsc::Sender<OutboundCommand>,
+}
+
+const OUTBOX_CAPACITY: usize = 64;
+
+#[uniffi::export(async_runtime = "tokio")]
+impl EdgeClient {
+    /// Connect to weave-server's `/ws/edge`. `server_url` accepts the same
+    /// shape as `UiClient::connect` (`http(s)://` or `ws(s)://` base); we
+    /// derive `ws[s]://host:port/ws/edge`.
+    #[uniffi::constructor]
+    pub async fn connect(
+        server_url: String,
+        edge_id: String,
+        capabilities: Vec<String>,
+        sink: Arc<dyn EdgeEventSink>,
+    ) -> Result<Arc<Self>, WeaveError> {
+        let base = normalize_base(&server_url)?;
+        let ws_url = derive_edge_ws_url(&base)?;
+
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+        let (outbox_tx, outbox_rx) = mpsc::channel::<OutboundCommand>(OUTBOX_CAPACITY);
+
+        tokio::spawn(run_ws_loop(
+            ws_url,
+            edge_id,
+            capabilities,
+            sink,
+            shutdown_rx,
+            outbox_rx,
+        ));
+
+        Ok(Arc::new(Self {
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            outbox_tx,
+        }))
+    }
+
+    /// Signal the WS loop to exit and release its sink reference.
+    pub async fn shutdown(&self) {
+        let tx = self.shutdown_tx.lock().await.take();
+        if let Some(tx) = tx {
+            let _ = tx.send(()).await;
+        }
+    }
+
+    /// Push a `DeviceState` frame. Cached internally so that a subsequent
+    /// reconnect replays the latest value for each `(device_id, property)`
+    /// — same behavior as the Linux edge-agent's `spawn_device_state_pump`.
+    ///
+    /// `value_json` must be valid JSON; it is parsed eagerly so callers
+    /// learn about malformed values at the call site.
+    pub async fn publish_device_state(
+        &self,
+        device_type: String,
+        device_id: String,
+        property: String,
+        value_json: String,
+    ) -> Result<(), WeaveError> {
+        serde_json::from_str::<serde_json::Value>(&value_json).map_err(|e| {
+            WeaveError::ParseFailed {
+                message: format!("publish_device_state value_json: {e}"),
+            }
+        })?;
+
+        self.outbox_tx
+            .send(OutboundCommand::DeviceState {
+                device_type,
+                device_id,
+                property,
+                value_json,
+            })
+            .await
+            .map_err(|e| WeaveError::Network {
+                message: format!("edge outbox closed: {e}"),
+            })
+    }
+}
+
+// ----- WebSocket loop -----------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ws_loop(
+    url: String,
+    edge_id: String,
+    capabilities: Vec<String>,
+    sink: Arc<dyn EdgeEventSink>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+    mut outbox_rx: mpsc::Receiver<OutboundCommand>,
+) {
+    let mut backoff = Duration::from_millis(500);
+    let max_backoff = Duration::from_secs(15);
+    // Last-write-wins replay cache, keyed by (device_type, device_id, property).
+    let mut state_cache: HashMap<(String, String, String), serde_json::Value> = HashMap::new();
+    let version = env!("CARGO_PKG_VERSION").to_string();
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            res = tokio_tungstenite::connect_async(&url) => {
+                match res {
+                    Ok((mut ws, _resp)) => {
+                        tracing::info!(url = %url, "ws/edge connected");
+                        sink.on_connection_changed(true);
+                        backoff = Duration::from_millis(500);
+
+                        // Hello.
+                        let hello = EdgeToServer::Hello {
+                            edge_id: edge_id.clone(),
+                            version: version.clone(),
+                            capabilities: capabilities.clone(),
+                        };
+                        if !send_frame(&mut ws, &hello).await {
+                            sink.on_connection_changed(false);
+                            continue;
+                        }
+
+                        // Replay cached state.
+                        let mut replay_failed = false;
+                        for ((device_type, device_id, property), value) in &state_cache {
+                            let frame = EdgeToServer::DeviceState {
+                                device_type: device_type.clone(),
+                                device_id: device_id.clone(),
+                                property: property.clone(),
+                                value: value.clone(),
+                            };
+                            if !send_frame(&mut ws, &frame).await {
+                                replay_failed = true;
+                                break;
+                            }
+                        }
+                        if replay_failed {
+                            sink.on_connection_changed(false);
+                            continue;
+                        }
+
+                        // Steady-state loop.
+                        loop {
+                            tokio::select! {
+                                _ = shutdown_rx.recv() => {
+                                    let _ = ws.send(Message::Close(None)).await;
+                                    sink.on_connection_changed(false);
+                                    return;
+                                }
+                                cmd = outbox_rx.recv() => {
+                                    let Some(cmd) = cmd else { break; };
+                                    match cmd {
+                                        OutboundCommand::DeviceState {
+                                            device_type, device_id, property, value_json,
+                                        } => {
+                                            let value: serde_json::Value =
+                                                serde_json::from_str(&value_json)
+                                                    .unwrap_or(serde_json::Value::Null);
+                                            state_cache.insert(
+                                                (device_type.clone(), device_id.clone(), property.clone()),
+                                                value.clone(),
+                                            );
+                                            let frame = EdgeToServer::DeviceState {
+                                                device_type, device_id, property, value,
+                                            };
+                                            if !send_frame(&mut ws, &frame).await {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                msg = ws.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Text(text))) => {
+                                            match serde_json::from_str::<ServerToEdge>(&text) {
+                                                Ok(ServerToEdge::Ping) => {
+                                                    if !send_frame(&mut ws, &EdgeToServer::Pong).await {
+                                                        break;
+                                                    }
+                                                }
+                                                Ok(other) => {
+                                                    let kind = server_to_edge_kind(&other);
+                                                    tracing::debug!(kind, "ws/edge inbound (ignored, MVP)");
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        payload = %text,
+                                                        "ws/edge: invalid frame"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Some(Ok(Message::Ping(p))) => {
+                                            let _ = ws.send(Message::Pong(p)).await;
+                                        }
+                                        Some(Ok(_)) => {}
+                                        Some(Err(e)) => {
+                                            tracing::warn!(error = %e, "ws/edge read error");
+                                            break;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                        sink.on_connection_changed(false);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, url = %url, "ws/edge connect failed");
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+async fn send_frame(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    frame: &EdgeToServer,
+) -> bool {
+    let Ok(json) = serde_json::to_string(frame) else {
+        return true;
+    };
+    ws.send(Message::Text(json)).await.is_ok()
+}
+
+fn server_to_edge_kind(frame: &ServerToEdge) -> &'static str {
+    match frame {
+        ServerToEdge::ConfigFull { .. } => "config_full",
+        ServerToEdge::ConfigPatch { .. } => "config_patch",
+        ServerToEdge::TargetSwitch { .. } => "target_switch",
+        ServerToEdge::GlyphsUpdate { .. } => "glyphs_update",
+        ServerToEdge::Ping => "ping",
+    }
+}
+
+// ----- URL helpers --------------------------------------------------------
+// Duplicated from ui_client.rs to keep the two clients independent. If a
+// third client appears, fold these into a shared `url_util` module.
+
+fn normalize_base(url: &str) -> Result<String, WeaveError> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(WeaveError::Network {
+            message: "empty server URL".into(),
+        });
+    }
+    if !(trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ws://")
+        || trimmed.starts_with("wss://"))
+    {
+        return Err(WeaveError::Network {
+            message: format!("server URL must have a scheme: {trimmed}"),
+        });
+    }
+    let base = trimmed
+        .replacen("ws://", "http://", 1)
+        .replacen("wss://", "https://", 1);
+    Ok(base)
+}
+
+fn derive_edge_ws_url(http_base: &str) -> Result<String, WeaveError> {
+    let ws_base = http_base
+        .replacen("http://", "ws://", 1)
+        .replacen("https://", "wss://", 1);
+    Ok(format!("{ws_base}/ws/edge"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_edge_appends_ws_edge_path() {
+        assert_eq!(
+            derive_edge_ws_url("http://host:3100").unwrap(),
+            "ws://host:3100/ws/edge"
+        );
+        assert_eq!(
+            derive_edge_ws_url("https://host").unwrap(),
+            "wss://host/ws/edge"
+        );
+    }
+
+    #[test]
+    fn hello_frame_serializes_with_snake_case_tag() {
+        let hello = EdgeToServer::Hello {
+            edge_id: "ios-ipad".into(),
+            version: "0.5.3".into(),
+            capabilities: vec!["nuimo:ble".into()],
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert!(json.contains("\"type\":\"hello\""));
+        assert!(json.contains("\"edge_id\":\"ios-ipad\""));
+        assert!(json.contains("\"capabilities\":[\"nuimo:ble\"]"));
+    }
+
+    #[test]
+    fn device_state_frame_serializes() {
+        let frame = EdgeToServer::DeviceState {
+            device_type: "nuimo".into(),
+            device_id: "abc-123".into(),
+            property: "connected".into(),
+            value: serde_json::json!(true),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"type\":\"device_state\""));
+        assert!(json.contains("\"device_type\":\"nuimo\""));
+        assert!(json.contains("\"value\":true"));
+    }
+
+    #[test]
+    fn pong_frame_serializes_as_unit_variant() {
+        let json = serde_json::to_string(&EdgeToServer::Pong).unwrap();
+        assert!(json.contains("\"type\":\"pong\""));
+    }
+}

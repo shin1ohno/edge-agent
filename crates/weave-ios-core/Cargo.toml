@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
 nuimo-protocol = { version = "0.5", path = "../nuimo-protocol" }
+weave-contracts = { version = "0.5", path = "../weave-contracts" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
