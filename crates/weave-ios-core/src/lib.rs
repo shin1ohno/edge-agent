@@ -214,6 +214,41 @@ pub fn led_matrix_uuid() -> String {
     np::LED_MATRIX.to_string()
 }
 
+/// Project a `NuimoEvent` into the JSON shape weave-web's `DevicesPane`
+/// expects in a `device_state { property: "input", value: ... }` frame.
+///
+/// Returns `None` for events that are not user inputs (battery / RSSI /
+/// connect / disconnect — those are forwarded as their own
+/// `device_state` properties on the Swift side).
+///
+/// Mirrors `crates/edge-agent/src/main.rs::input_event_json` so the iPad
+/// emits the same input names the routing engine and UI already consume.
+/// If that function evolves, update this one in lockstep.
+#[uniffi::export]
+pub fn nuimo_input_event_json(event: NuimoEvent) -> Option<String> {
+    use serde_json::json;
+    let value = match event {
+        NuimoEvent::ButtonDown => json!({"input": "press"}),
+        NuimoEvent::ButtonUp => json!({"input": "release"}),
+        NuimoEvent::Rotate { delta, .. } => json!({"input": "rotate", "delta": delta}),
+        NuimoEvent::SwipeUp => json!({"input": "swipe_up"}),
+        NuimoEvent::SwipeDown => json!({"input": "swipe_down"}),
+        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => json!({"input": "swipe_left"}),
+        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => json!({"input": "swipe_right"}),
+        NuimoEvent::TouchTop => json!({"input": "touch_top"}),
+        NuimoEvent::TouchBottom => json!({"input": "touch_bottom"}),
+        NuimoEvent::TouchLeft => json!({"input": "touch_left"}),
+        NuimoEvent::TouchRight => json!({"input": "touch_right"}),
+        NuimoEvent::LongTouchTop => json!({"input": "long_touch_top"}),
+        NuimoEvent::LongTouchBottom => json!({"input": "long_touch_bottom"}),
+        NuimoEvent::LongTouchLeft => json!({"input": "long_touch_left"}),
+        NuimoEvent::LongTouchRight => json!({"input": "long_touch_right"}),
+        NuimoEvent::Hover { proximity } => json!({"input": "hover", "proximity": proximity}),
+        NuimoEvent::BatteryLevel { .. } => return None,
+    };
+    Some(value.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Host-side sanity tests (don't exercise the FFI, just the wrapping logic).
 // ---------------------------------------------------------------------------
@@ -264,5 +299,39 @@ mod tests {
     #[test]
     fn service_uuid_matches_gatt_constant() {
         assert_eq!(nuimo_service_uuid(), np::NUIMO_SERVICE.to_string());
+    }
+
+    #[test]
+    fn input_event_json_button_down_serializes_as_press() {
+        let json = nuimo_input_event_json(NuimoEvent::ButtonDown).unwrap();
+        assert_eq!(json, r#"{"input":"press"}"#);
+    }
+
+    #[test]
+    fn input_event_json_rotate_includes_delta() {
+        let json = nuimo_input_event_json(NuimoEvent::Rotate {
+            delta: 0.25,
+            rotation: 1.5,
+        })
+        .unwrap();
+        assert!(json.contains(r#""input":"rotate""#));
+        assert!(json.contains(r#""delta":0.25"#));
+    }
+
+    #[test]
+    fn input_event_json_fly_collapses_to_swipe() {
+        assert_eq!(
+            nuimo_input_event_json(NuimoEvent::FlyLeft).unwrap(),
+            r#"{"input":"swipe_left"}"#
+        );
+        assert_eq!(
+            nuimo_input_event_json(NuimoEvent::FlyRight).unwrap(),
+            r#"{"input":"swipe_right"}"#
+        );
+    }
+
+    #[test]
+    fn input_event_json_battery_returns_none() {
+        assert!(nuimo_input_event_json(NuimoEvent::BatteryLevel { level: 80 }).is_none());
     }
 }

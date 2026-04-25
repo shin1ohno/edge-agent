@@ -109,11 +109,13 @@ final class BleBridge: NSObject {
         if recentEvents.count > maxRecentEvents {
             recentEvents.removeLast(recentEvents.count - maxRecentEvents)
         }
-        // Battery is the only event we forward to /ws/edge today. Other
-        // events would need a contract decision (DeviceState input vs. a
-        // dedicated input stream) before we publish them.
-        if case .batteryLevel(let level) = event {
+        // Battery has its own /ws/edge property; everything else is an
+        // input the routing engine + weave-web's DevicesPane consumes.
+        switch event {
+        case .batteryLevel(let level):
             publishBattery(peripheralID: peripheralID, level: level)
+        default:
+            publishInput(peripheralID: peripheralID, event: event)
         }
     }
 
@@ -128,6 +130,13 @@ final class BleBridge: NSObject {
         guard let edgeHost = self.edgeHost else { return }
         Task { @MainActor in
             await edgeHost.publishNuimoBattery(deviceID: peripheralID, level: level)
+        }
+    }
+
+    private func publishInput(peripheralID: UUID, event: NuimoEvent) {
+        guard let edgeHost = self.edgeHost else { return }
+        Task { @MainActor in
+            await edgeHost.publishNuimoInput(deviceID: peripheralID, event: event)
         }
     }
 }
