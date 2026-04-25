@@ -31,10 +31,16 @@ final class BleBridge: NSObject {
     private var central: CBCentralManager!
     private let nuimoServiceUUID: CBUUID
 
-    override init() {
+    /// Optional sink for outbound `/ws/edge` `DeviceState` frames. Set at
+    /// construction time so device connect / disconnect / battery events
+    /// reach weave-server. `nil` in unit-test fixtures and in `#Preview`s.
+    private weak var edgeHost: EdgeClientHost?
+
+    init(edgeHost: EdgeClientHost? = nil) {
         // Canonical service UUID comes from the Rust core so Swift doesn't
         // drift if the GATT spec is bumped.
         self.nuimoServiceUUID = CBUUID(string: nuimoServiceUuid())
+        self.edgeHost = edgeHost
         super.init()
         self.central = CBCentralManager(
             delegate: self,
@@ -85,6 +91,26 @@ final class BleBridge: NSObject {
         if recentEvents.count > maxRecentEvents {
             recentEvents.removeLast(recentEvents.count - maxRecentEvents)
         }
+        // Battery is the only event we forward to /ws/edge today. Other
+        // events would need a contract decision (DeviceState input vs. a
+        // dedicated input stream) before we publish them.
+        if case .batteryLevel(let level) = event {
+            publishBattery(peripheralID: peripheralID, level: level)
+        }
+    }
+
+    private func publishConnected(peripheralID: UUID, isConnected: Bool) {
+        guard let edgeHost = self.edgeHost else { return }
+        Task { @MainActor in
+            await edgeHost.publishNuimoConnected(deviceID: peripheralID, isConnected: isConnected)
+        }
+    }
+
+    private func publishBattery(peripheralID: UUID, level: UInt8) {
+        guard let edgeHost = self.edgeHost else { return }
+        Task { @MainActor in
+            await edgeHost.publishNuimoBattery(deviceID: peripheralID, level: level)
+        }
     }
 }
 
@@ -123,6 +149,7 @@ extension BleBridge: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         devices[peripheral.identifier]?.handleConnected()
+        publishConnected(peripheralID: peripheral.identifier, isConnected: true)
     }
 
     func centralManager(
@@ -131,6 +158,7 @@ extension BleBridge: CBCentralManagerDelegate {
         error: Error?
     ) {
         devices[peripheral.identifier]?.handleDisconnected()
+        publishConnected(peripheralID: peripheral.identifier, isConnected: false)
     }
 
     func centralManager(
@@ -139,6 +167,7 @@ extension BleBridge: CBCentralManagerDelegate {
         error: Error?
     ) {
         devices[peripheral.identifier]?.handleDisconnected()
+        publishConnected(peripheralID: peripheral.identifier, isConnected: false)
     }
 }
 

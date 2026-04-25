@@ -9,7 +9,9 @@
 
 uniffi::setup_scaffolding!();
 
+mod edge_client;
 mod ui_client;
+pub use edge_client::{EdgeClient, EdgeEventSink};
 pub use ui_client::{UiClient, UiEventSink};
 
 use nuimo_protocol as np;
