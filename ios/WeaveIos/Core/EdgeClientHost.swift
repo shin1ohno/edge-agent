@@ -80,6 +80,15 @@ final class EdgeClientHost {
         await publish(deviceID: deviceID, property: "battery", valueJSON: String(level))
     }
 
+    /// Publish `nuimo / <id> / input = { input: "<name>", … }`. No-op if
+    /// the event has no `input` projection (battery, etc.) or no client.
+    /// The JSON shape comes from `nuimo_input_event_json` in
+    /// `weave-ios-core` so it stays in sync with the Linux edge-agent.
+    func publishNuimoInput(deviceID: UUID, event: NuimoEvent) async {
+        guard let json = nuimoInputEventJson(event: event) else { return }
+        await publish(deviceID: deviceID, property: "input", valueJSON: json)
+    }
+
     private func publish(deviceID: UUID, property: String, valueJSON: String) async {
         guard let client = self.client else { return }
         let id = deviceID.uuidString.lowercased()
