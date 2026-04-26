@@ -3,9 +3,10 @@
 //! Mirrors the pattern of `UiClient` but in the opposite direction: the iPad
 //! announces itself as an edge with `Hello`, replies to server `Ping` with
 //! `Pong`, and forwards locally-observed Nuimo state via `DeviceState`
-//! frames. Inbound `ConfigFull` / `ConfigPatch` frames are decoded but
-//! ignored at this MVP — mappings still flow into the app via `/ws/ui`
-//! (`UiClient`).
+//! frames. Inbound `ConfigFull` / `ConfigPatch` frames feed a local
+//! `RoutingEngine` so on-device adapters (added in subsequent PRs) can act
+//! on Nuimo input without a server round-trip — matching the Linux/Mac
+//! edge-agent's adapter model.
 //!
 //! `device_id` for Nuimos is the `peripheral.identifier.uuidString` from
 //! CoreBluetooth (lowercased UUID), not the BLE MAC the Linux edge-agent
@@ -16,10 +17,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use edge_core::RoutingEngine;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
-use weave_contracts::{EdgeToServer, ServerToEdge};
+use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
 use crate::WeaveError;
 
@@ -46,6 +48,10 @@ enum OutboundCommand {
 pub struct EdgeClient {
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     outbox_tx: mpsc::Sender<OutboundCommand>,
+    /// Held so the routing engine outlives the WS loop. Read by the
+    /// adapter-dispatch surface added in the follow-up `ios_media` PR.
+    #[allow(dead_code)]
+    engine: Arc<RoutingEngine>,
 }
 
 const OUTBOX_CAPACITY: usize = 64;
@@ -67,6 +73,7 @@ impl EdgeClient {
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let (outbox_tx, outbox_rx) = mpsc::channel::<OutboundCommand>(OUTBOX_CAPACITY);
+        let engine = Arc::new(RoutingEngine::new());
 
         tokio::spawn(run_ws_loop(
             ws_url,
@@ -75,11 +82,13 @@ impl EdgeClient {
             sink,
             shutdown_rx,
             outbox_rx,
+            engine.clone(),
         ));
 
         Ok(Arc::new(Self {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             outbox_tx,
+            engine,
         }))
     }
 
@@ -134,6 +143,7 @@ async fn run_ws_loop(
     sink: Arc<dyn EdgeEventSink>,
     mut shutdown_rx: mpsc::Receiver<()>,
     mut outbox_rx: mpsc::Receiver<OutboundCommand>,
+    engine: Arc<RoutingEngine>,
 ) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
@@ -221,8 +231,7 @@ async fn run_ws_loop(
                                                     }
                                                 }
                                                 Ok(other) => {
-                                                    let kind = server_to_edge_kind(&other);
-                                                    tracing::debug!(kind, "ws/edge inbound (ignored, MVP)");
+                                                    apply_inbound_frame(&engine, other).await;
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(
@@ -276,13 +285,68 @@ async fn send_frame(
     ws.send(Message::Text(json)).await.is_ok()
 }
 
-fn server_to_edge_kind(frame: &ServerToEdge) -> &'static str {
+/// Apply an inbound `ServerToEdge` frame (other than `Ping`, handled by the
+/// WS loop directly) to the local routing engine. Returns immediately when
+/// the frame does not affect routing state — `GlyphsUpdate` and
+/// `TargetSwitch` are not yet wired to a feedback layer on iOS.
+///
+/// Extracted as a free async fn so unit tests can exercise the
+/// frame-to-engine plumbing without standing up a WebSocket server.
+async fn apply_inbound_frame(engine: &RoutingEngine, frame: ServerToEdge) {
     match frame {
-        ServerToEdge::ConfigFull { .. } => "config_full",
-        ServerToEdge::ConfigPatch { .. } => "config_patch",
-        ServerToEdge::TargetSwitch { .. } => "target_switch",
-        ServerToEdge::GlyphsUpdate { .. } => "glyphs_update",
-        ServerToEdge::Ping => "ping",
+        ServerToEdge::ConfigFull { config } => {
+            let count = config.mappings.len();
+            engine.replace_all(config.mappings).await;
+            tracing::info!(mapping_count = count, "ws/edge: config_full applied");
+        }
+        ServerToEdge::ConfigPatch {
+            mapping_id,
+            op,
+            mapping,
+        } => match (op, mapping) {
+            (PatchOp::Upsert, Some(m)) => {
+                engine.upsert_mapping(m).await;
+                tracing::info!(%mapping_id, "ws/edge: mapping upserted");
+            }
+            (PatchOp::Delete, _) => {
+                engine.remove_mapping(&mapping_id).await;
+                tracing::info!(%mapping_id, "ws/edge: mapping deleted");
+            }
+            (PatchOp::Upsert, None) => {
+                tracing::warn!(%mapping_id, "ws/edge: upsert without mapping payload");
+            }
+        },
+        ServerToEdge::TargetSwitch {
+            mapping_id,
+            service_target,
+        } => {
+            // Server-pushed active-target change. Update the matching
+            // mapping's `service_target` so subsequent `route` calls use
+            // the new target. Engine has no direct setter, so we read,
+            // mutate, and re-upsert.
+            let mut snapshot = engine.snapshot().await;
+            if let Some(m) = snapshot.iter_mut().find(|m| m.mapping_id == mapping_id) {
+                m.service_target = service_target.clone();
+                let updated = m.clone();
+                engine.upsert_mapping(updated).await;
+                tracing::info!(%mapping_id, %service_target, "ws/edge: target_switch applied");
+            } else {
+                tracing::warn!(%mapping_id, "ws/edge: target_switch for unknown mapping");
+            }
+        }
+        ServerToEdge::GlyphsUpdate { glyphs } => {
+            // Glyph rendering is not yet wired on iOS — log and skip.
+            // PR introducing on-device LED feedback will surface this to a
+            // GlyphRegistry alongside the engine.
+            tracing::debug!(
+                count = glyphs.len(),
+                "ws/edge: glyphs_update (not yet rendered)"
+            );
+        }
+        ServerToEdge::Ping => {
+            // Caller handles Pong reply directly to keep the WS handle scoped.
+            unreachable!("apply_inbound_frame must not be called with Ping");
+        }
     }
 }
 
@@ -322,6 +386,161 @@ fn derive_edge_ws_url(http_base: &str) -> Result<String, WeaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edge_core::{InputPrimitive, Intent};
+    use std::collections::BTreeMap;
+    use uuid::Uuid;
+    use weave_contracts::{EdgeConfig, Mapping, Route};
+
+    fn ios_media_mapping(device_id: &str) -> Mapping {
+        Mapping {
+            mapping_id: Uuid::new_v4(),
+            edge_id: "ipad".into(),
+            device_type: "nuimo".into(),
+            device_id: device_id.into(),
+            service_type: "ios_media".into(),
+            service_target: "default".into(),
+            routes: vec![Route {
+                input: "press".into(),
+                intent: "play_pause".into(),
+                params: BTreeMap::new(),
+            }],
+            feedback: vec![],
+            active: true,
+            target_candidates: vec![],
+            target_switch_on: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_full_replaces_engine_state() {
+        let engine = RoutingEngine::new();
+        let mapping = ios_media_mapping("nuimo-1");
+        let config = EdgeConfig {
+            edge_id: "ipad".into(),
+            mappings: vec![mapping.clone()],
+            glyphs: vec![],
+        };
+
+        apply_inbound_frame(&engine, ServerToEdge::ConfigFull { config }).await;
+
+        let intents = engine
+            .route("nuimo", "nuimo-1", &InputPrimitive::Press)
+            .await;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].service_type, "ios_media");
+        assert!(matches!(intents[0].intent, Intent::PlayPause));
+    }
+
+    #[tokio::test]
+    async fn config_full_clears_prior_mappings() {
+        let engine = RoutingEngine::new();
+        let first = ios_media_mapping("nuimo-1");
+        engine.replace_all(vec![first]).await;
+
+        let config = EdgeConfig {
+            edge_id: "ipad".into(),
+            mappings: vec![],
+            glyphs: vec![],
+        };
+        apply_inbound_frame(&engine, ServerToEdge::ConfigFull { config }).await;
+
+        let intents = engine
+            .route("nuimo", "nuimo-1", &InputPrimitive::Press)
+            .await;
+        assert!(
+            intents.is_empty(),
+            "config_full with no mappings must clear engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_patch_upsert_adds_mapping() {
+        let engine = RoutingEngine::new();
+        let mapping = ios_media_mapping("nuimo-1");
+        let mapping_id = mapping.mapping_id;
+
+        apply_inbound_frame(
+            &engine,
+            ServerToEdge::ConfigPatch {
+                mapping_id,
+                op: PatchOp::Upsert,
+                mapping: Some(mapping),
+            },
+        )
+        .await;
+
+        let intents = engine
+            .route("nuimo", "nuimo-1", &InputPrimitive::Press)
+            .await;
+        assert_eq!(intents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn config_patch_delete_removes_mapping() {
+        let engine = RoutingEngine::new();
+        let mapping = ios_media_mapping("nuimo-1");
+        let mapping_id = mapping.mapping_id;
+        engine.replace_all(vec![mapping]).await;
+
+        apply_inbound_frame(
+            &engine,
+            ServerToEdge::ConfigPatch {
+                mapping_id,
+                op: PatchOp::Delete,
+                mapping: None,
+            },
+        )
+        .await;
+
+        let intents = engine
+            .route("nuimo", "nuimo-1", &InputPrimitive::Press)
+            .await;
+        assert!(intents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn target_switch_updates_service_target() {
+        let engine = RoutingEngine::new();
+        let mapping = ios_media_mapping("nuimo-1");
+        let mapping_id = mapping.mapping_id;
+        engine.replace_all(vec![mapping]).await;
+
+        apply_inbound_frame(
+            &engine,
+            ServerToEdge::TargetSwitch {
+                mapping_id,
+                service_target: "alt".into(),
+            },
+        )
+        .await;
+
+        let snapshot = engine.snapshot().await;
+        let updated = snapshot
+            .iter()
+            .find(|m| m.mapping_id == mapping_id)
+            .expect("mapping must remain present");
+        assert_eq!(updated.service_target, "alt");
+    }
+
+    #[tokio::test]
+    async fn target_switch_for_unknown_mapping_is_noop() {
+        let engine = RoutingEngine::new();
+        let mapping = ios_media_mapping("nuimo-1");
+        engine.replace_all(vec![mapping.clone()]).await;
+
+        apply_inbound_frame(
+            &engine,
+            ServerToEdge::TargetSwitch {
+                mapping_id: Uuid::new_v4(),
+                service_target: "phantom".into(),
+            },
+        )
+        .await;
+
+        let snapshot = engine.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].service_target, "default");
+    }
 
     #[test]
     fn derive_edge_appends_ws_edge_path() {
