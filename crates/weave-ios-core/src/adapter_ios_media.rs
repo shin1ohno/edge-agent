@@ -33,6 +33,34 @@ pub enum IosMediaIntent {
     SeekAbsolute { seconds: f64 },
 }
 
+/// Coarse playback-state classification used by `NowPlayingInfo`. Mirrors
+/// the meaningful values of `MPMusicPlaybackState`; transient values
+/// (`.interrupted`, `.seekingForward`, `.seekingBackward`) collapse into
+/// `Playing` since the UI doesn't differentiate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PlaybackState {
+    Stopped,
+    Playing,
+    Paused,
+}
+
+/// Snapshot of what's currently playing in Apple Music on the iPad.
+/// Forwarded to weave-server over `EdgeToServer::State` with
+/// `service_type = "ios_media"`, `property = "now_playing"`.
+///
+/// Optional fields collapse to `null` in the JSON value when the
+/// underlying `MPMediaItem` did not provide them (no metadata, no
+/// queue, etc.).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct NowPlayingInfo {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub position_seconds: f64,
+    pub state: PlaybackState,
+}
+
 /// Errors returned across the FFI to Swift dispatchers, and back from the
 /// adapter into edge-core's command-result reporting path.
 #[derive(Debug, Error, uniffi::Error)]
