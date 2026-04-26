@@ -133,10 +133,17 @@ final class BleBridge: NSObject {
         }
     }
 
+    /// Forward an input event two ways:
+    ///   1. publish as `DeviceState` so weave-web's DevicesPane reflects
+    ///      the live input stream (existing behavior),
+    ///   2. route through the Rust engine so any matching mapping
+    ///      dispatches an intent on this iPad — e.g., Apple Music
+    ///      play/pause via `IosMediaDispatcher`.
     private func publishInput(peripheralID: UUID, event: NuimoEvent) {
         guard let edgeHost = self.edgeHost else { return }
         Task { @MainActor in
             await edgeHost.publishNuimoInput(deviceID: peripheralID, event: event)
+            await edgeHost.routeNuimoInput(deviceID: peripheralID, event: event)
         }
     }
 }

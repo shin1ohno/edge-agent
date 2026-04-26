@@ -9,11 +9,14 @@
 
 uniffi::setup_scaffolding!();
 
+mod adapter_ios_media;
 mod edge_client;
 mod ui_client;
+pub use adapter_ios_media::{IosMediaCallback, IosMediaError, IosMediaIntent};
 pub use edge_client::{EdgeClient, EdgeEventSink};
 pub use ui_client::{UiClient, UiEventSink};
 
+use edge_core::{Direction, InputPrimitive, TouchArea};
 use nuimo_protocol as np;
 use thiserror::Error;
 use uuid::Uuid;
@@ -212,6 +215,61 @@ pub fn nuimo_service_uuid() -> String {
 #[uniffi::export]
 pub fn led_matrix_uuid() -> String {
     np::LED_MATRIX.to_string()
+}
+
+/// Project a `NuimoEvent` into the structured `InputPrimitive` the routing
+/// engine consumes. Returns `None` for events that are not routing inputs
+/// (battery — handled as a separate device-state property).
+///
+/// Stays in lockstep with `nuimo_input_event_json` (which produces the
+/// JSON wire form for the Web UI). Both should be updated together when
+/// the input vocabulary changes.
+pub(crate) fn nuimo_event_to_input_primitive(event: &NuimoEvent) -> Option<InputPrimitive> {
+    Some(match event {
+        NuimoEvent::ButtonDown => InputPrimitive::Press,
+        NuimoEvent::ButtonUp => InputPrimitive::Release,
+        NuimoEvent::Rotate { delta, .. } => InputPrimitive::Rotate { delta: *delta },
+        NuimoEvent::SwipeUp => InputPrimitive::Swipe {
+            direction: Direction::Up,
+        },
+        NuimoEvent::SwipeDown => InputPrimitive::Swipe {
+            direction: Direction::Down,
+        },
+        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => InputPrimitive::Swipe {
+            direction: Direction::Left,
+        },
+        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => InputPrimitive::Swipe {
+            direction: Direction::Right,
+        },
+        NuimoEvent::TouchTop => InputPrimitive::Touch {
+            area: TouchArea::Top,
+        },
+        NuimoEvent::TouchBottom => InputPrimitive::Touch {
+            area: TouchArea::Bottom,
+        },
+        NuimoEvent::TouchLeft => InputPrimitive::Touch {
+            area: TouchArea::Left,
+        },
+        NuimoEvent::TouchRight => InputPrimitive::Touch {
+            area: TouchArea::Right,
+        },
+        NuimoEvent::LongTouchTop => InputPrimitive::LongTouch {
+            area: TouchArea::Top,
+        },
+        NuimoEvent::LongTouchBottom => InputPrimitive::LongTouch {
+            area: TouchArea::Bottom,
+        },
+        NuimoEvent::LongTouchLeft => InputPrimitive::LongTouch {
+            area: TouchArea::Left,
+        },
+        NuimoEvent::LongTouchRight => InputPrimitive::LongTouch {
+            area: TouchArea::Right,
+        },
+        NuimoEvent::Hover { proximity } => InputPrimitive::Hover {
+            proximity: *proximity,
+        },
+        NuimoEvent::BatteryLevel { .. } => return None,
+    })
 }
 
 /// Project a `NuimoEvent` into the JSON shape weave-web's `DevicesPane`
