@@ -1,4 +1,5 @@
 @preconcurrency import SwiftUI
+import UIKit
 
 @main
 struct WeaveIosApp: App {
@@ -20,6 +21,19 @@ struct WeaveIosApp: App {
                 .environment(settings)
                 .environment(ui)
                 .environment(edge)
+                .onAppear {
+                    // The MPVolumeView slider trick used by IosMediaDispatcher
+                    // for volume / mute requires the view to be inside a
+                    // UIWindow's hierarchy. Defer one runloop hop so the
+                    // window is fully up before we look it up.
+                    DispatchQueue.main.async {
+                        guard let scene = UIApplication.shared.connectedScenes
+                                .compactMap({ $0 as? UIWindowScene })
+                                .first,
+                              let window = scene.windows.first else { return }
+                        edge.attachIosMediaVolumeView(to: window)
+                    }
+                }
         }
     }
 }

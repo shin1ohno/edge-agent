@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UIKit
 import os
 
 private let edgeLogger = Logger(subsystem: "com.shin1ohno.weave.WeaveIos", category: "EdgeClient")
@@ -87,6 +88,14 @@ final class EdgeClientHost {
     func publishNowPlayingSnapshot(info: NowPlayingInfo) async throws {
         guard let client = self.client else { return }
         try await client.publishNowPlaying(info: info)
+    }
+
+    /// Plumb the SwiftUI scene's UIWindow into the iOS-media dispatcher
+    /// so the embedded `MPVolumeView` can take effect for volume / mute
+    /// intents. Idempotent — the dispatcher only attaches on the first
+    /// non-nil window.
+    func attachIosMediaVolumeView(to window: UIWindow) {
+        iosMediaDispatcher.attachVolumeView(to: window)
     }
 
     /// Publish `nuimo / <id> / connected = true|false`. No-op if no client.
