@@ -19,11 +19,13 @@ use std::time::Duration;
 
 use edge_core::{RoutingEngine, ServiceAdapter};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
 use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback, NowPlayingInfo, PlaybackState};
+use crate::feedback_pump::{run_feedback_pump, LedFeedbackSink, StateUpdate};
+use crate::glyph_registry::GlyphRegistry;
 use crate::{nuimo_event_to_input_primitive, NuimoEvent, WeaveError};
 
 /// Swift-implemented callback for edge connection state.
@@ -63,9 +65,28 @@ pub struct EdgeClient {
     /// `register_ios_media_callback`; absent until then, in which case
     /// `ios_media`-typed routing produces a debug log and no dispatch.
     ios_media_adapter: StdMutex<Option<Arc<IosMediaAdapter>>>,
+    /// Named LED glyphs pushed by weave-server in `ConfigFull` /
+    /// `GlyphsUpdate`. Consumed by the feedback pump to render
+    /// `FeedbackPlan::NamedGlyph(name)` against the 9x9 grid.
+    /// Held on the struct so the registry outlives the WS loop and
+    /// the pump task.
+    #[allow(dead_code)]
+    glyphs: Arc<GlyphRegistry>,
+    /// In-process broadcast for the feedback pump. Each `publish_*`
+    /// method writes to both the WS outbox (server-bound) and this
+    /// channel (LED-bound on the same iPad).
+    state_tx: broadcast::Sender<StateUpdate>,
+    /// Swift-registered LED write sink. The pump reads under a guard,
+    /// drops it before awaiting, and does nothing while the slot is
+    /// `None` — letting Swift register after `connect` finishes.
+    led_sink: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>>,
 }
 
 const OUTBOX_CAPACITY: usize = 64;
+/// Capacity of the in-process state broadcast that the feedback pump
+/// drains. iOS state updates are infrequent (NowPlaying changes + 5 s
+/// poll + per-volume KVO), so 64 is plenty.
+const STATE_CHANNEL_CAPACITY: usize = 64;
 
 #[uniffi::export(async_runtime = "tokio")]
 impl EdgeClient {
@@ -84,7 +105,11 @@ impl EdgeClient {
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let (outbox_tx, outbox_rx) = mpsc::channel::<OutboundCommand>(OUTBOX_CAPACITY);
+        let (state_tx, state_rx) = broadcast::channel::<StateUpdate>(STATE_CHANNEL_CAPACITY);
         let engine = Arc::new(RoutingEngine::new());
+        let glyphs = Arc::new(GlyphRegistry::new());
+        let led_sink: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> =
+            Arc::new(StdMutex::new(None));
 
         tokio::spawn(run_ws_loop(
             ws_url,
@@ -94,6 +119,16 @@ impl EdgeClient {
             shutdown_rx,
             outbox_rx,
             engine.clone(),
+            glyphs.clone(),
+        ));
+
+        // Feedback pump exits when `state_tx` (held below) is dropped —
+        // i.e., when this `EdgeClient` is dropped on shutdown.
+        tokio::spawn(run_feedback_pump(
+            state_rx,
+            engine.clone(),
+            glyphs.clone(),
+            led_sink.clone(),
         ));
 
         Ok(Arc::new(Self {
@@ -101,6 +136,9 @@ impl EdgeClient {
             outbox_tx,
             engine,
             ios_media_adapter: StdMutex::new(None),
+            glyphs,
+            state_tx,
+            led_sink,
         }))
     }
 
@@ -246,6 +284,84 @@ impl EdgeClient {
                 message: format!("edge outbox closed: {e}"),
             })
     }
+
+    /// Publish the iPad's playback state as a top-level service-state
+    /// property. Mirrors Roon's `playback` shape ("playing" / "paused"
+    /// / "stopped") so mapping-level `feedback` rules with
+    /// `state: "playback", feedback_type: "glyph"` resolve through
+    /// `FeedbackPlan::from_rules` exactly the same way they do for
+    /// Roon zones. Sent in addition to (not instead of) the existing
+    /// `now_playing` payload — that one carries title / artist / etc.
+    /// for UI display and is left untouched.
+    ///
+    /// Also published into the in-process state broadcast so the
+    /// feedback pump can drive the LED on the same iPad without a WS
+    /// round-trip.
+    pub async fn publish_playback(&self, state: String) -> Result<(), WeaveError> {
+        let value = serde_json::Value::String(state);
+        self.publish_ios_media_state("playback".into(), value).await
+    }
+
+    /// Publish the iPad's system volume as a top-level service-state
+    /// property, on the 0..=100 scale Roon's `volume` / Hue's
+    /// `brightness` use. Drives `feedback_type: "volume_bar"` rules
+    /// through the same shared resolver.
+    pub async fn publish_volume(&self, value: f64) -> Result<(), WeaveError> {
+        let value = serde_json::Value::from(value);
+        self.publish_ios_media_state("volume".into(), value).await
+    }
+
+    /// Register the Swift-side LED feedback sink. Replaces any prior
+    /// callback. Until called, the feedback pump runs but every
+    /// dispatch is a no-op (it logs nothing visible to keep the
+    /// connection-setup window clean).
+    pub fn register_led_feedback_callback(&self, sink: Arc<dyn LedFeedbackSink>) {
+        *self.led_sink.lock().expect("led sink mutex") = Some(sink);
+        tracing::info!("led feedback sink registered");
+    }
+}
+
+// Internal helpers kept outside the `#[uniffi::export]` impl block
+// because UniFFI tries to lift every pub method's parameters across
+// the FFI boundary, and `serde_json::Value` doesn't have a `Lift` impl.
+impl EdgeClient {
+    async fn publish_ios_media_state(
+        &self,
+        property: String,
+        value: serde_json::Value,
+    ) -> Result<(), WeaveError> {
+        let value_json = serde_json::to_string(&value).map_err(|e| WeaveError::ParseFailed {
+            message: format!("ios_media state serialize: {e}"),
+        })?;
+
+        // 1. WS outbox — server-bound (Web UI, history).
+        self.outbox_tx
+            .send(OutboundCommand::ServiceState {
+                service_type: "ios_media".to_string(),
+                target: "apple_music".to_string(),
+                property: property.clone(),
+                output_id: None,
+                value_json,
+            })
+            .await
+            .map_err(|e| WeaveError::Network {
+                message: format!("edge outbox closed: {e}"),
+            })?;
+
+        // 2. In-process broadcast — feedback pump on the same iPad.
+        // `send` errs only when there are no live receivers, which
+        // means the pump task has died. That's worth a warn but not a
+        // user-visible failure.
+        if let Err(e) = self.state_tx.send(StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property,
+            value,
+        }) {
+            tracing::warn!(error = %e, "feedback state broadcast: no live receivers");
+        }
+        Ok(())
+    }
 }
 
 fn now_playing_value(info: &NowPlayingInfo) -> serde_json::Value {
@@ -280,6 +396,7 @@ async fn run_ws_loop(
     mut shutdown_rx: mpsc::Receiver<()>,
     mut outbox_rx: mpsc::Receiver<OutboundCommand>,
     engine: Arc<RoutingEngine>,
+    glyphs: Arc<GlyphRegistry>,
 ) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
@@ -414,7 +531,7 @@ async fn run_ws_loop(
                                                     }
                                                 }
                                                 Ok(other) => {
-                                                    apply_inbound_frame(&engine, other).await;
+                                                    apply_inbound_frame(&engine, &glyphs, other).await;
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(
@@ -468,19 +585,22 @@ async fn send_frame(
     ws.send(Message::Text(json)).await.is_ok()
 }
 
-/// Apply an inbound `ServerToEdge` frame (other than `Ping`, handled by the
-/// WS loop directly) to the local routing engine. Returns immediately when
-/// the frame does not affect routing state — `GlyphsUpdate` and
-/// `TargetSwitch` are not yet wired to a feedback layer on iOS.
+/// Apply an inbound `ServerToEdge` frame (other than `Ping`, handled by
+/// the WS loop directly) to the local routing engine and glyph
+/// registry. Both sources of state — mappings and named glyphs —
+/// arrive over the same channel; populating both here keeps the
+/// feedback pump unblocked the moment a `ConfigFull` lands.
 ///
 /// Extracted as a free async fn so unit tests can exercise the
 /// frame-to-engine plumbing without standing up a WebSocket server.
-async fn apply_inbound_frame(engine: &RoutingEngine, frame: ServerToEdge) {
+async fn apply_inbound_frame(engine: &RoutingEngine, glyphs: &GlyphRegistry, frame: ServerToEdge) {
     match frame {
         ServerToEdge::ConfigFull { config } => {
-            let count = config.mappings.len();
+            let mapping_count = config.mappings.len();
+            let glyph_count = config.glyphs.len();
             engine.replace_all(config.mappings).await;
-            tracing::info!(mapping_count = count, "ws/edge: config_full applied");
+            glyphs.replace_all(config.glyphs).await;
+            tracing::info!(mapping_count, glyph_count, "ws/edge: config_full applied");
         }
         ServerToEdge::ConfigPatch {
             mapping_id,
@@ -517,14 +637,10 @@ async fn apply_inbound_frame(engine: &RoutingEngine, frame: ServerToEdge) {
                 tracing::warn!(%mapping_id, "ws/edge: target_switch for unknown mapping");
             }
         }
-        ServerToEdge::GlyphsUpdate { glyphs } => {
-            // Glyph rendering is not yet wired on iOS — log and skip.
-            // PR introducing on-device LED feedback will surface this to a
-            // GlyphRegistry alongside the engine.
-            tracing::debug!(
-                count = glyphs.len(),
-                "ws/edge: glyphs_update (not yet rendered)"
-            );
+        ServerToEdge::GlyphsUpdate { glyphs: incoming } => {
+            let count = incoming.len();
+            glyphs.replace_all(incoming).await;
+            tracing::info!(count, "ws/edge: glyphs_update applied");
         }
         ServerToEdge::Ping => {
             // Caller handles Pong reply directly to keep the WS handle scoped.
@@ -598,6 +714,7 @@ mod tests {
     #[tokio::test]
     async fn config_full_replaces_engine_state() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
         let config = EdgeConfig {
             edge_id: "ipad".into(),
@@ -605,7 +722,7 @@ mod tests {
             glyphs: vec![],
         };
 
-        apply_inbound_frame(&engine, ServerToEdge::ConfigFull { config }).await;
+        apply_inbound_frame(&engine, &glyphs, ServerToEdge::ConfigFull { config }).await;
 
         let intents = engine
             .route("nuimo", "nuimo-1", &InputPrimitive::Press)
@@ -618,6 +735,7 @@ mod tests {
     #[tokio::test]
     async fn config_full_clears_prior_mappings() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let first = ios_media_mapping("nuimo-1");
         engine.replace_all(vec![first]).await;
 
@@ -626,7 +744,7 @@ mod tests {
             mappings: vec![],
             glyphs: vec![],
         };
-        apply_inbound_frame(&engine, ServerToEdge::ConfigFull { config }).await;
+        apply_inbound_frame(&engine, &glyphs, ServerToEdge::ConfigFull { config }).await;
 
         let intents = engine
             .route("nuimo", "nuimo-1", &InputPrimitive::Press)
@@ -640,11 +758,13 @@ mod tests {
     #[tokio::test]
     async fn config_patch_upsert_adds_mapping() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
         let mapping_id = mapping.mapping_id;
 
         apply_inbound_frame(
             &engine,
+            &glyphs,
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Upsert,
@@ -662,12 +782,14 @@ mod tests {
     #[tokio::test]
     async fn config_patch_delete_removes_mapping() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
         let mapping_id = mapping.mapping_id;
         engine.replace_all(vec![mapping]).await;
 
         apply_inbound_frame(
             &engine,
+            &glyphs,
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Delete,
@@ -685,12 +807,14 @@ mod tests {
     #[tokio::test]
     async fn target_switch_updates_service_target() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
         let mapping_id = mapping.mapping_id;
         engine.replace_all(vec![mapping]).await;
 
         apply_inbound_frame(
             &engine,
+            &glyphs,
             ServerToEdge::TargetSwitch {
                 mapping_id,
                 service_target: "alt".into(),
@@ -709,11 +833,13 @@ mod tests {
     #[tokio::test]
     async fn target_switch_for_unknown_mapping_is_noop() {
         let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
         engine.replace_all(vec![mapping.clone()]).await;
 
         apply_inbound_frame(
             &engine,
+            &glyphs,
             ServerToEdge::TargetSwitch {
                 mapping_id: Uuid::new_v4(),
                 service_target: "phantom".into(),

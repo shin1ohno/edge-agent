@@ -10,8 +10,14 @@ struct WeaveIosApp: App {
 
     init() {
         let edgeHost = EdgeClientHost()
+        let bleBridge = BleBridge(edgeHost: edgeHost)
+        // Plumb BleBridge into EdgeClientHost so the LED feedback bridge
+        // (built on each `connect`) can resolve device-id strings to
+        // peripherals. Held weakly inside EdgeClientHost so this doesn't
+        // extend BleBridge's lifetime.
+        edgeHost.attachBleBridge(bleBridge)
         _edge = State(initialValue: edgeHost)
-        _ble = State(initialValue: BleBridge(edgeHost: edgeHost))
+        _ble = State(initialValue: bleBridge)
     }
 
     var body: some Scene {

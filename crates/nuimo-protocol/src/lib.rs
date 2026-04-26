@@ -270,6 +270,38 @@ impl Glyph {
     }
 }
 
+/// Fill direction for the volume bar.
+///
+/// `BottomUp` matches linear volumes (0..=max): zero bars = empty, max
+/// bars = full, with the bottom row lit first. `TopDown` matches dB-style
+/// volumes whose max is 0 — the topmost row represents "at 0 dB" and
+/// fewer dots below mean more attenuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeDirection {
+    BottomUp,
+    TopDown,
+}
+
+/// Volume-bar glyph, 0..=9 LEDs lit in the centre column. The bar count
+/// plus direction is the rendered unit of change; callers can dedup on
+/// the tuple so two state updates that round to the same `(bars,
+/// direction)` don't trigger a redraw.
+pub fn volume_bars(bars: u8, direction: VolumeDirection) -> Glyph {
+    let bars = bars.min(LED_ROWS as u8) as usize;
+    let mut rows = [0u16; LED_ROWS];
+    let lit_col = 1u16 << (LED_COLS / 2); // centre column (col 4 of 9)
+    for (row_idx, row) in rows.iter_mut().enumerate() {
+        let lit = match direction {
+            VolumeDirection::BottomUp => (LED_ROWS - 1 - row_idx) < bars,
+            VolumeDirection::TopDown => row_idx < bars,
+        };
+        if lit {
+            *row = lit_col;
+        }
+    }
+    Glyph { rows }
+}
+
 /// Build the 13-byte payload for the LED matrix characteristic:
 /// 11 bytes of bitmap, 1 byte brightness (0-255), 1 byte timeout (ms/100).
 pub fn build_led_payload(glyph: &Glyph, opts: &DisplayOptions) -> [u8; LED_DISPLAY_BYTES] {
@@ -288,4 +320,54 @@ pub fn build_led_payload(glyph: &Glyph, opts: &DisplayOptions) -> [u8; LED_DISPL
     out[LED_BITMAP_BYTES] = brightness;
     out[LED_BITMAP_BYTES + 1] = timeout;
     out
+}
+
+#[cfg(test)]
+mod volume_bars_tests {
+    use super::*;
+
+    #[test]
+    fn bottom_up_three_lights_bottom_three_rows() {
+        let g = volume_bars(3, VolumeDirection::BottomUp);
+        // Centre column = bit 4 = 0x10. Bottom three rows (indices 6, 7, 8) lit.
+        assert_eq!(
+            g.rows,
+            [0, 0, 0, 0, 0, 0, 0x10, 0x10, 0x10],
+            "bottom-up 3 should light rows 6..=8 in the centre column"
+        );
+    }
+
+    #[test]
+    fn top_down_three_lights_top_three_rows() {
+        let g = volume_bars(3, VolumeDirection::TopDown);
+        assert_eq!(
+            g.rows,
+            [0x10, 0x10, 0x10, 0, 0, 0, 0, 0, 0],
+            "top-down 3 should light rows 0..=2 in the centre column"
+        );
+    }
+
+    #[test]
+    fn nine_is_full_either_direction() {
+        let bu = volume_bars(9, VolumeDirection::BottomUp);
+        let td = volume_bars(9, VolumeDirection::TopDown);
+        assert_eq!(bu.rows, [0x10; LED_ROWS]);
+        assert_eq!(bu, td);
+    }
+
+    #[test]
+    fn zero_is_empty_either_direction() {
+        let bu = volume_bars(0, VolumeDirection::BottomUp);
+        let td = volume_bars(0, VolumeDirection::TopDown);
+        assert_eq!(bu.rows, [0; LED_ROWS]);
+        assert_eq!(bu, td);
+    }
+
+    #[test]
+    fn over_nine_clamps_to_full() {
+        assert_eq!(
+            volume_bars(50, VolumeDirection::BottomUp),
+            volume_bars(9, VolumeDirection::BottomUp)
+        );
+    }
 }

@@ -30,6 +30,13 @@ final class EdgeClientHost {
     /// Observes Apple Music Now Playing and forwards snapshots to
     /// weave-server. Lazily initialised on first `connect`.
     private var nowPlayingObserver: NowPlayingObserver?
+    /// Weak reference to the BleBridge passed via `attachBleBridge` so
+    /// `LedFeedbackBridge` (built on connect) can resolve device-id
+    /// strings to actual peripherals for the write call.
+    private weak var bleBridge: BleBridge?
+    /// LED feedback sink registered with the Rust feedback pump on
+    /// connect. Held so it survives the Rust callback's lifetime.
+    private var ledFeedbackBridge: LedFeedbackBridge?
     private(set) var activeURL: String?
     private(set) var activeEdgeID: String?
 
@@ -61,6 +68,15 @@ final class EdgeClientHost {
             self.activeEdgeID = edgeID
             self.lastError = nil
             client.registerIosMediaCallback(callback: self.iosMediaDispatcher)
+            if let ble = self.bleBridge {
+                let bridge = LedFeedbackBridge(ble: ble)
+                self.ledFeedbackBridge = bridge
+                client.registerLedFeedbackCallback(sink: bridge)
+            } else {
+                edgeLogger.warning(
+                    "BleBridge not attached — LED feedback will be silent until attachBleBridge() is called"
+                )
+            }
             let observer = self.nowPlayingObserver ?? NowPlayingObserver(edgeHost: self)
             self.nowPlayingObserver = observer
             observer.start()
@@ -96,6 +112,30 @@ final class EdgeClientHost {
     /// non-nil window.
     func attachIosMediaVolumeView(to window: UIWindow) {
         iosMediaDispatcher.attachVolumeView(to: window)
+    }
+
+    /// Hand the BleBridge in so `LedFeedbackBridge` (built on connect)
+    /// can resolve device-id strings to peripherals when the Rust
+    /// feedback pump fires. Called from `WeaveIosApp` once both
+    /// `BleBridge` and `EdgeClientHost` exist.
+    func attachBleBridge(_ ble: BleBridge) {
+        self.bleBridge = ble
+    }
+
+    /// Publish iPad playback state (`"playing"` / `"paused"` /
+    /// `"stopped"`) for `service_type = "ios_media"`. Drives both the
+    /// Web UI's connection card and the local feedback pump.
+    func publishPlaybackState(_ state: String) async throws {
+        guard let client = self.client else { return }
+        try await client.publishPlayback(state: state)
+    }
+
+    /// Publish iPad system volume (0..=100 percentage). Drives the
+    /// Web UI volume bar and the local feedback pump's volume_bar
+    /// rule.
+    func publishVolume(_ value: Double) async throws {
+        guard let client = self.client else { return }
+        try await client.publishVolume(value: value)
     }
 
     /// Publish `nuimo / <id> / connected = true|false`. No-op if no client.
