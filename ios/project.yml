@@ -57,6 +57,9 @@ targets:
           Weave connects to Nuimo controllers over Bluetooth Low Energy to
           bridge gestures (rotate, press, swipe) to Roon playback and Hue
           lights.
+        NSAppleMusicUsageDescription: >
+          Weave reads what is playing in Apple Music to mirror it on the
+          connected web dashboard.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shin1ohno.weave.WeaveIos
