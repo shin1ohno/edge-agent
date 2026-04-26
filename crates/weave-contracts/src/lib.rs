@@ -27,6 +27,41 @@ pub enum ServerToEdge {
     },
     /// Replace the edge's glyph set. Sent after any glyph CRUD on the server.
     GlyphsUpdate { glyphs: Vec<Glyph> },
+    /// Render a glyph on a specific device immediately. Used by the
+    /// weave-web "Test LED" affordance to verify a device's display path
+    /// without waiting for a service-state event.
+    DisplayGlyph {
+        device_type: String,
+        device_id: String,
+        /// 9-line ASCII grid (`*` = on, anything else = off). Matches
+        /// the `Glyph::pattern` shape used in `GlyphsUpdate`.
+        pattern: String,
+        /// Brightness 0.0..=1.0. Defaults to 1.0 when absent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        brightness: Option<f32>,
+        /// Auto-clear timeout in milliseconds. Defaults to a short value
+        /// when absent so test renders don't linger.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u32>,
+        /// Transition kind (`"immediate"` or `"cross_fade"`). Defaults to
+        /// cross-fade when absent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transition: Option<String>,
+    },
+    /// Server-initiated request to (re)connect a specific device. Idempotent
+    /// — already-connected devices are a no-op aside from clearing any
+    /// "paused" state that previously suppressed reconnect attempts.
+    DeviceConnect {
+        device_type: String,
+        device_id: String,
+    },
+    /// Server-initiated request to disconnect a specific device. Sets a
+    /// paused flag so the auto-reconnect loop does not immediately
+    /// re-establish the link.
+    DeviceDisconnect {
+        device_type: String,
+        device_id: String,
+    },
     /// Periodic keepalive to keep NAT/proxies open and detect half-open TCP.
     Ping,
 }
@@ -429,6 +464,95 @@ mod tests {
             ServerToEdge::ConfigFull { config } => {
                 assert_eq!(config.edge_id, "living-room");
                 assert_eq!(config.mappings.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_to_edge_display_glyph_roundtrip() {
+        let msg = ServerToEdge::DisplayGlyph {
+            device_type: "nuimo".into(),
+            device_id: "C3:81:DF:4E:FF:6A".into(),
+            pattern: "    *    \n  *****  ".into(),
+            brightness: Some(0.5),
+            timeout_ms: Some(2000),
+            transition: Some("cross_fade".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"display_glyph\""));
+        assert!(json.contains("\"device_type\":\"nuimo\""));
+        assert!(json.contains("\"brightness\":0.5"));
+
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::DisplayGlyph {
+                device_type,
+                device_id,
+                pattern,
+                brightness,
+                timeout_ms,
+                transition,
+            } => {
+                assert_eq!(device_type, "nuimo");
+                assert_eq!(device_id, "C3:81:DF:4E:FF:6A");
+                assert!(pattern.contains('*'));
+                assert_eq!(brightness, Some(0.5));
+                assert_eq!(timeout_ms, Some(2000));
+                assert_eq!(transition.as_deref(), Some("cross_fade"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Optional fields elided when None.
+        let minimal = ServerToEdge::DisplayGlyph {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            pattern: "*".into(),
+            brightness: None,
+            timeout_ms: None,
+            transition: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        assert!(!json.contains("brightness"));
+        assert!(!json.contains("timeout_ms"));
+        assert!(!json.contains("transition"));
+    }
+
+    #[test]
+    fn server_to_edge_device_connect_disconnect_roundtrip() {
+        let connect = ServerToEdge::DeviceConnect {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+        };
+        let json = serde_json::to_string(&connect).unwrap();
+        assert!(json.contains("\"type\":\"device_connect\""));
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::DeviceConnect {
+                device_type,
+                device_id,
+            } => {
+                assert_eq!(device_type, "nuimo");
+                assert_eq!(device_id, "dev-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let disconnect = ServerToEdge::DeviceDisconnect {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+        };
+        let json = serde_json::to_string(&disconnect).unwrap();
+        assert!(json.contains("\"type\":\"device_disconnect\""));
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::DeviceDisconnect {
+                device_type,
+                device_id,
+            } => {
+                assert_eq!(device_type, "nuimo");
+                assert_eq!(device_id, "dev-1");
             }
             _ => panic!("wrong variant"),
         }
