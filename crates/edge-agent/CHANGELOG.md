@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.4...edge-agent-v0.6.0) - 2026-04-26
+
+### Other
+
+- route Hue Tap Dial as a first-class input device ([#56](https://github.com/shin1ohno/edge-agent/pull/56))
+
 ## [0.5.3](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.5.2...edge-agent-v0.5.3) - 2026-04-24
 
 ### Other
