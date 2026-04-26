@@ -16,9 +16,9 @@ crate-type = ["staticlib", "cdylib", "lib"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-edge-core = { version = "0.7", path = "../edge-core" }
-nuimo-protocol = { version = "0.7", path = "../nuimo-protocol" }
-weave-contracts = { version = "0.7", path = "../weave-contracts" }
+edge-core = { version = "0.8", path = "../edge-core" }
+nuimo-protocol = { version = "0.8", path = "../nuimo-protocol" }
+weave-contracts = { version = "0.8", path = "../weave-contracts" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
