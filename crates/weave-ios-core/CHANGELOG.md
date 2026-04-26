@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.6.0...weave-ios-core-v0.7.0) - 2026-04-26
+
+### Added
+
+- publish periodic edge metrics for /ws/ui dashboards ([#59](https://github.com/shin1ohno/edge-agent/pull/59))
+
+### Other
+
+- throttle LED feedback per (device, property), not per device ([#57](https://github.com/shin1ohno/edge-agent/pull/57))
+
 ## [0.6.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.5.4...weave-ios-core-v0.6.0) - 2026-04-26
 
 ### Other
