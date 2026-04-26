@@ -125,6 +125,7 @@ final class NowPlayingObserver {
         let rawPosition = player.currentPlaybackTime
         let position = rawPosition.isFinite ? max(0, rawPosition) : 0
 
+        let outputVolume = Double(AVAudioSession.sharedInstance().outputVolume)
         let info = NowPlayingInfo(
             title: item?.title,
             artist: item?.artist,
@@ -132,11 +133,29 @@ final class NowPlayingObserver {
             durationSeconds: item?.playbackDuration,
             positionSeconds: position,
             state: state,
-            systemVolume: Double(AVAudioSession.sharedInstance().outputVolume)
+            systemVolume: outputVolume
         )
+
+        // Map the Swift PlaybackState enum to the wire-format string the
+        // Rust feedback rules consume (`"playing"` / `"paused"` /
+        // `"stopped"`). Kept in lockstep with `now_playing_value` in
+        // weave-ios-core::edge_client.
+        let playbackString: String
+        switch state {
+        case .playing: playbackString = "playing"
+        case .paused:  playbackString = "paused"
+        case .stopped: playbackString = "stopped"
+        }
 
         Task {
             do {
+                // Three concurrent publishes (in-process feedback pump
+                // sees them as separate StateUpdate frames):
+                //   1. `playback`  — string for glyph rule resolution
+                //   2. `volume`    — number for volume_bar rule
+                //   3. `now_playing` — composite object, UI-only
+                try await edgeHost.publishPlaybackState(playbackString)
+                try await edgeHost.publishVolume(outputVolume * 100.0)
                 try await edgeHost.publishNowPlayingSnapshot(info: info)
             } catch {
                 nowPlayingLogger.error(

@@ -1,0 +1,545 @@
+//! LED feedback pump for the iOS edge.
+//!
+//! Subscribes to the in-process `StateUpdate` broadcast that
+//! `EdgeClient::publish_*` writes to whenever the iPad reports new
+//! `ios_media` service state, resolves each update into a
+//! `FeedbackPlan` via the mapping's `feedback` rules (cached in the
+//! routing engine), renders the resulting 9x9 glyph through
+//! `nuimo_protocol::build_led_payload`, and hands the byte array to a
+//! Swift-implemented `LedFeedbackSink` that issues the actual BLE
+//! write through `BleBridge`.
+//!
+//! Ports the same `FeedbackPlan` semantics the Linux/Mac edge-agent
+//! uses (`crates/edge-agent/src/main.rs`), without the `#[cfg(feature
+//! = "roon")]` gate or BLE write coupling — iOS always wants
+//! feedback and the BLE call goes back through Swift.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use edge_core::RoutingEngine;
+use nuimo_protocol::{self as np, VolumeDirection};
+use tokio::sync::broadcast;
+use weave_contracts::FeedbackRule;
+
+use crate::glyph_registry::GlyphRegistry;
+
+/// State change received from any iOS edge publisher.
+///
+/// Mirrors `edge-core::StateUpdate` but kept local to avoid leaking
+/// edge-core's adapter trait surface across the crate boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct StateUpdate {
+    pub service_type: String,
+    pub target: String,
+    pub property: String,
+    pub value: serde_json::Value,
+}
+
+/// Swift-implemented BLE write sink. The pump never drives BLE
+/// directly — Swift owns CoreBluetooth — so each rendered frame goes
+/// across this callback.
+#[uniffi::export(with_foreign)]
+pub trait LedFeedbackSink: Send + Sync {
+    fn write_led(&self, device_id: String, payload: Vec<u8>);
+}
+
+/// Decision tree for "what should be drawn on the LED right now?"
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FeedbackPlan {
+    VolumeBar(u8, VolumeDirection),
+    NamedGlyph(String),
+}
+
+impl FeedbackPlan {
+    pub fn resolve(update: &StateUpdate, rules: &[FeedbackRule]) -> Option<Self> {
+        if let Some(plan) = Self::from_rules(update, rules) {
+            return Some(plan);
+        }
+        Self::from_default(update)
+    }
+
+    /// Mapping-level feedback rules (user-configured per Connection).
+    fn from_rules(update: &StateUpdate, rules: &[FeedbackRule]) -> Option<Self> {
+        for rule in rules {
+            if rule.state != update.property {
+                continue;
+            }
+            match rule.feedback_type.as_str() {
+                "glyph" => {
+                    let value_key = match &update.value {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => continue,
+                    };
+                    let glyph_name = rule
+                        .mapping
+                        .as_object()
+                        .and_then(|m| m.get(&value_key))
+                        .and_then(|v| v.as_str())?;
+                    if glyph_name == "volume_bar" {
+                        if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
+                            return Some(Self::VolumeBar(bars, dir));
+                        }
+                        continue;
+                    }
+                    return Some(Self::NamedGlyph(glyph_name.to_string()));
+                }
+                "volume_bar" => {
+                    if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
+                        return Some(Self::VolumeBar(bars, dir));
+                    }
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    /// Hardcoded fallback used when no mapping rule covers the update.
+    /// Mirrors Mac's defaults so an unconfigured mapping still produces
+    /// useful feedback.
+    fn from_default(update: &StateUpdate) -> Option<Self> {
+        match (update.property.as_str(), &update.value) {
+            ("playback", serde_json::Value::String(s)) => match s.as_str() {
+                "playing" => Some(Self::NamedGlyph("play".into())),
+                "paused" | "stopped" => Some(Self::NamedGlyph("pause".into())),
+                _ => None,
+            },
+            ("volume", _) | ("brightness", _) => {
+                volume_bar_from_value(&update.value).map(|(b, d)| Self::VolumeBar(b, d))
+            }
+            _ => None,
+        }
+    }
+
+    /// Stable identifier for "what's on the LED right now". The
+    /// `FeedbackFilter` dedups on this so two state updates that round
+    /// to the same plan don't trigger redundant BLE writes.
+    pub fn signature(&self) -> String {
+        match self {
+            Self::VolumeBar(bars, dir) => {
+                let d = match dir {
+                    VolumeDirection::BottomUp => "up",
+                    VolumeDirection::TopDown => "down",
+                };
+                format!("vol:{bars}:{d}")
+            }
+            Self::NamedGlyph(name) => name.clone(),
+        }
+    }
+
+    /// Render this plan into the 13-byte payload Nuimo's LED
+    /// characteristic expects. Returns `None` when the plan references
+    /// a glyph that's not in the registry yet — the caller skips the
+    /// write rather than blanking the LED.
+    pub async fn render(&self, registry: &GlyphRegistry) -> Option<Vec<u8>> {
+        let (glyph, transition, timeout_ms) = match self {
+            Self::VolumeBar(bars, dir) => (
+                np::volume_bars(*bars, *dir),
+                np::DisplayTransition::Immediate,
+                3000u32,
+            ),
+            Self::NamedGlyph(name) => {
+                let entry = registry.get(name).await?;
+                if entry.builtin {
+                    return None; // builtin glyphs are rendered programmatically (e.g. volume_bar)
+                }
+                (
+                    np::Glyph::from_ascii(&entry.pattern),
+                    np::DisplayTransition::CrossFade,
+                    1000u32,
+                )
+            }
+        };
+        let opts = np::DisplayOptions {
+            brightness: 1.0,
+            timeout_ms,
+            transition,
+        };
+        Some(np::build_led_payload(&glyph, &opts).to_vec())
+    }
+}
+
+/// Project a state-update value into a 9-bar fill + direction.
+///
+/// Recognises a raw 0..=100 number (Hue brightness, our iOS volume) and
+/// a Roon-style `{value, min, max, type?}` envelope. Returns `None` for
+/// other shapes so the caller can fall through.
+fn volume_bar_from_value(value: &serde_json::Value) -> Option<(u8, VolumeDirection)> {
+    match value {
+        serde_json::Value::Number(_) => {
+            let v = value.as_f64()?;
+            let ratio = (v / 100.0).clamp(0.0, 1.0);
+            let bars = (ratio * 9.0).round() as u8;
+            Some((bars, VolumeDirection::BottomUp))
+        }
+        serde_json::Value::Object(obj) => {
+            let value = obj.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max = obj.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
+            let min = obj.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let vtype = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let is_db = vtype.eq_ignore_ascii_case("db") || (max <= 0.0 && min < 0.0);
+            let span = max - min;
+            let ratio = if span > 0.0 {
+                ((value - min) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let bars = (ratio * 9.0).round() as u8;
+            let direction = if is_db {
+                VolumeDirection::TopDown
+            } else {
+                VolumeDirection::BottomUp
+            };
+            Some((bars, direction))
+        }
+        _ => None,
+    }
+}
+
+/// Throttle + dedup for BLE writes.
+///
+/// Throttle: per-target minimum gap so a continuous rotate doesn't
+/// saturate the single BLE connection. Dedup: per-target signature
+/// match — same plan as the last successful write means the visible
+/// frame won't change, so skip.
+pub(crate) struct FeedbackFilter {
+    last_at: HashMap<String, Instant>,
+    last_sig: HashMap<String, String>,
+    min_gap: Duration,
+}
+
+impl FeedbackFilter {
+    pub fn new() -> Self {
+        Self {
+            last_at: HashMap::new(),
+            last_sig: HashMap::new(),
+            min_gap: Duration::from_millis(100),
+        }
+    }
+
+    pub fn should_render(&mut self, device_id: &str, signature: &str) -> bool {
+        if self.last_sig.get(device_id).map(String::as_str) == Some(signature) {
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(prev) = self.last_at.get(device_id) {
+            if now.duration_since(*prev) < self.min_gap {
+                return false;
+            }
+        }
+        self.last_at.insert(device_id.to_string(), now);
+        self.last_sig
+            .insert(device_id.to_string(), signature.to_string());
+        true
+    }
+}
+
+/// Long-running task: drains the in-process state broadcast, resolves
+/// each update through the routing engine, and pushes the rendered
+/// frame across the Swift sink.
+///
+/// `sink` is `Arc<StdMutex<Option<...>>>` so Swift can register the
+/// callback after `connect` (the typical lifecycle in EdgeClientHost).
+pub(crate) async fn run_feedback_pump(
+    mut state_rx: broadcast::Receiver<StateUpdate>,
+    engine: Arc<RoutingEngine>,
+    glyphs: Arc<GlyphRegistry>,
+    sink: Arc<std::sync::Mutex<Option<Arc<dyn LedFeedbackSink>>>>,
+) {
+    let mut filter = FeedbackFilter::new();
+    loop {
+        match state_rx.recv().await {
+            Ok(update) => {
+                dispatch(&update, &engine, &glyphs, &sink, &mut filter).await;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(count = n, "feedback pump lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn dispatch(
+    update: &StateUpdate,
+    engine: &RoutingEngine,
+    glyphs: &GlyphRegistry,
+    sink: &std::sync::Mutex<Option<Arc<dyn LedFeedbackSink>>>,
+    filter: &mut FeedbackFilter,
+) {
+    let targets = engine
+        .feedback_targets_for(&update.service_type, &update.target)
+        .await;
+    if targets.is_empty() {
+        return;
+    }
+
+    // Snapshot the sink under the std::sync::Mutex; release the guard
+    // before any `.await` so we never hold a sync lock across a suspend
+    // point.
+    let registered = { sink.lock().expect("led sink mutex").clone() };
+    let Some(registered) = registered else {
+        // Until Swift registers the callback the pump is a no-op —
+        // expected during connection setup before EdgeClientHost
+        // hands its bridge across.
+        return;
+    };
+
+    for (_device_type, device_id, rules) in targets {
+        let Some(plan) = FeedbackPlan::resolve(update, &rules) else {
+            continue;
+        };
+        let sig = plan.signature();
+        if !filter.should_render(&device_id, &sig) {
+            continue;
+        }
+        let Some(payload) = plan.render(glyphs).await else {
+            continue;
+        };
+        registered.write_led(device_id, payload);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
+    use uuid::Uuid;
+    use weave_contracts::{Mapping, Route};
+
+    /// Test sink that records every (device_id, payload) call.
+    struct RecordingSink {
+        captured: StdMutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                captured: StdMutex::new(Vec::new()),
+            })
+        }
+
+        fn captured(&self) -> Vec<(String, Vec<u8>)> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    impl LedFeedbackSink for RecordingSink {
+        fn write_led(&self, device_id: String, payload: Vec<u8>) {
+            self.captured.lock().unwrap().push((device_id, payload));
+        }
+    }
+
+    fn ios_media_mapping_with_feedback(device_id: &str, feedback: Vec<FeedbackRule>) -> Mapping {
+        Mapping {
+            mapping_id: Uuid::new_v4(),
+            edge_id: "ipad".into(),
+            device_type: "nuimo".into(),
+            device_id: device_id.into(),
+            service_type: "ios_media".into(),
+            service_target: "apple_music".into(),
+            routes: vec![Route {
+                input: "press".into(),
+                intent: "play_pause".into(),
+                params: BTreeMap::new(),
+            }],
+            feedback,
+            active: true,
+            target_candidates: vec![],
+            target_switch_on: None,
+        }
+    }
+
+    fn glyph_rule_for_playback() -> FeedbackRule {
+        FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "glyph".into(),
+            mapping: serde_json::json!({
+                "playing": "play",
+                "paused": "pause",
+                "stopped": "pause",
+            }),
+        }
+    }
+
+    fn volume_bar_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "volume".into(),
+            feedback_type: "volume_bar".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_rules_glyph_resolves_state_value_to_named_glyph() {
+        let rules = vec![glyph_rule_for_playback()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("playing → play");
+        assert_eq!(plan, FeedbackPlan::NamedGlyph("play".into()));
+    }
+
+    #[tokio::test]
+    async fn from_rules_glyph_skips_when_value_is_not_a_string() {
+        // The PR #50 / #52 issue: now_playing carries an object, so the
+        // glyph rule cannot bind a state value and must not fire.
+        let rules = vec![glyph_rule_for_playback()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!({"nested": "playing"}),
+        };
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[tokio::test]
+    async fn from_rules_volume_bar_uses_numeric_value() {
+        let rules = vec![volume_bar_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "volume".into(),
+            value: serde_json::json!(47.5),
+        };
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("47.5 → 4 bars");
+        assert!(matches!(
+            plan,
+            FeedbackPlan::VolumeBar(4, VolumeDirection::BottomUp)
+        ));
+    }
+
+    #[tokio::test]
+    async fn from_default_playback_paused_falls_back_to_pause_glyph() {
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!("paused"),
+        };
+        let plan = FeedbackPlan::from_default(&update).expect("default plan exists");
+        assert_eq!(plan, FeedbackPlan::NamedGlyph("pause".into()));
+    }
+
+    #[tokio::test]
+    async fn signature_dedups_identical_plans() {
+        let mut filter = FeedbackFilter::new();
+        let plan = FeedbackPlan::NamedGlyph("play".into());
+        let sig = plan.signature();
+        assert!(filter.should_render("nuimo-1", &sig));
+        // Same signature → no second write.
+        assert!(!filter.should_render("nuimo-1", &sig));
+    }
+
+    #[tokio::test]
+    async fn signature_per_device_independent() {
+        let mut filter = FeedbackFilter::new();
+        let sig = "play".to_string();
+        assert!(filter.should_render("nuimo-a", &sig));
+        // Different device, same plan → still renders (its own LED).
+        assert!(filter.should_render("nuimo-b", &sig));
+    }
+
+    #[tokio::test]
+    async fn dispatch_writes_payload_via_sink_for_each_matching_device() {
+        let engine = RoutingEngine::new();
+        // Two Nuimos paired to the same iPad, both routed at the same
+        // (service_type, target).
+        engine
+            .replace_all(vec![
+                ios_media_mapping_with_feedback("nuimo-1", vec![glyph_rule_for_playback()]),
+                ios_media_mapping_with_feedback("nuimo-2", vec![glyph_rule_for_playback()]),
+            ])
+            .await;
+        let registry = GlyphRegistry::new();
+        registry
+            .replace_all(vec![weave_contracts::Glyph {
+                name: "play".into(),
+                pattern: "    *    \n   ***   \n  *****  ".into(),
+                builtin: false,
+            }])
+            .await;
+        let sink: Arc<RecordingSink> = RecordingSink::new();
+        let sink_slot: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> = Arc::new(StdMutex::new(
+            Some(sink.clone() as Arc<dyn LedFeedbackSink>),
+        ));
+        let mut filter = FeedbackFilter::new();
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+
+        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+
+        let captured = sink.captured();
+        assert_eq!(captured.len(), 2, "both Nuimos receive the play frame");
+        let device_ids: Vec<&str> = captured.iter().map(|(d, _)| d.as_str()).collect();
+        assert!(device_ids.contains(&"nuimo-1"));
+        assert!(device_ids.contains(&"nuimo-2"));
+        // 13-byte LED payload format.
+        assert_eq!(captured[0].1.len(), 13);
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_when_property_does_not_match_any_rule() {
+        let engine = RoutingEngine::new();
+        engine
+            .replace_all(vec![ios_media_mapping_with_feedback(
+                "nuimo-1",
+                vec![glyph_rule_for_playback()],
+            )])
+            .await;
+        let registry = GlyphRegistry::new();
+        let sink: Arc<RecordingSink> = RecordingSink::new();
+        let sink_slot: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> = Arc::new(StdMutex::new(
+            Some(sink.clone() as Arc<dyn LedFeedbackSink>),
+        ));
+        let mut filter = FeedbackFilter::new();
+        // `now_playing` is the property iOS used to publish object-shaped
+        // updates under. The pump must not light the LED for these — they
+        // exist for UI consumption only.
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            value: serde_json::json!({"title": "x", "state": "playing"}),
+        };
+
+        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+
+        assert!(sink.captured().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_no_op_when_sink_unregistered() {
+        let engine = RoutingEngine::new();
+        engine
+            .replace_all(vec![ios_media_mapping_with_feedback(
+                "nuimo-1",
+                vec![glyph_rule_for_playback()],
+            )])
+            .await;
+        let registry = GlyphRegistry::new();
+        let sink_slot: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> =
+            Arc::new(StdMutex::new(None));
+        let mut filter = FeedbackFilter::new();
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+
+        // No panic, no error — pump waits for register_led_feedback_callback.
+        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+    }
+}

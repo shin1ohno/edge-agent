@@ -233,6 +233,26 @@ impl RoutingEngine {
         mapping_rules_for_target(list, service_type, target)
     }
 
+    /// Find every device whose mapping owns `(service_type, target)` and
+    /// return its `(device_type, device_id, feedback_rules)`. Used by the
+    /// iOS feedback pump, which fans a single state update out to every
+    /// LED that should display it — typically 1 device, but two Nuimos
+    /// paired to the same iPad both deserve feedback.
+    pub async fn feedback_targets_for(
+        &self,
+        service_type: &str,
+        target: &str,
+    ) -> Vec<(String, String, Vec<FeedbackRule>)> {
+        let guard = self.by_device.read().await;
+        let mut out = Vec::new();
+        for ((device_type, device_id), list) in guard.iter() {
+            if let Some(rules) = mapping_rules_for_target(list, service_type, target) {
+                out.push((device_type.clone(), device_id.clone(), rules));
+            }
+        }
+        out
+    }
+
     /// Apply the given input primitive from a specific device, returning every
     /// intent it produces across all matching mappings.
     pub async fn route(
