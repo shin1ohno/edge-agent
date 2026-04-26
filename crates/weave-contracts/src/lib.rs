@@ -62,6 +62,30 @@ pub enum ServerToEdge {
         device_type: String,
         device_id: String,
     },
+    /// Server-forwarded intent dispatch. The originating edge routed an
+    /// input but lacked the adapter for `service_type`; the server
+    /// looked up an edge whose Hello capabilities include `service_type`
+    /// and forwarded the intent here. The receiving edge feeds the
+    /// payload into its existing dispatcher (same path the local
+    /// routing engine uses) so an `EdgeToServer::Command` telemetry
+    /// frame still emits with the actual outcome.
+    ///
+    /// Wire shape mirrors `EdgeToServer::Command` (intent name + params)
+    /// so receivers can reuse the same `Intent` reassembly logic both
+    /// for self-routed intents and forwarded ones.
+    DispatchIntent {
+        service_type: String,
+        service_target: String,
+        /// Snake-case intent name (`play_pause`, `volume_change`, …).
+        intent: String,
+        /// Intent parameters serialized as JSON. Shape matches the
+        /// `Intent` enum's payload after `#[serde(tag = "type")]` lifts
+        /// the discriminant out.
+        #[serde(default)]
+        params: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+    },
     /// Periodic keepalive to keep NAT/proxies open and detect half-open TCP.
     Ping,
 }
@@ -143,6 +167,25 @@ pub enum EdgeToServer {
         /// API call failed (entitlement missing, permission denied).
         #[serde(skip_serializing_if = "Option::is_none")]
         wifi: Option<u8>,
+    },
+    /// Edge routed an input locally but has no adapter for the resulting
+    /// `service_type` and asks the server to forward to a capable peer.
+    /// The server resolves a target edge from `Hello` capabilities and
+    /// re-emits as `ServerToEdge::DispatchIntent`. Wire shape mirrors
+    /// `Command` (intent name + params) so the same reassembly logic
+    /// works on both ends.
+    ///
+    /// The originating edge does NOT emit a `Command` frame for
+    /// forwarded intents — the executing edge does that after running
+    /// the adapter, so latency measurement reflects the full path.
+    DispatchIntent {
+        service_type: String,
+        service_target: String,
+        intent: String,
+        #[serde(default)]
+        params: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
     },
 }
 

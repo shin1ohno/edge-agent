@@ -19,8 +19,9 @@ use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
 use super::cache;
 use super::device_control::{DeviceControlHook, NoopDeviceControl};
+use super::intent::Intent;
 use super::registry::GlyphRegistry;
-use super::routing::RoutingEngine;
+use super::routing::{RoutedIntent, RoutingEngine};
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -37,6 +38,13 @@ pub struct WsClient {
     outbox_tx: mpsc::Sender<EdgeToServer>,
     resync_tx: broadcast::Sender<()>,
     device_control: Arc<dyn DeviceControlHook>,
+    /// Optional sender into the edge-agent's dispatcher queue. Set via
+    /// `with_intent_dispatcher` when the host wants to handle
+    /// `ServerToEdge::DispatchIntent` (cross-edge intent forwarding).
+    /// `None` causes incoming forwarded intents to be logged and
+    /// dropped — appropriate for hosts that don't have any service
+    /// adapter the server might forward into.
+    dispatch_tx: Option<mpsc::Sender<RoutedIntent>>,
 }
 
 impl WsClient {
@@ -88,7 +96,20 @@ impl WsClient {
             outbox_tx,
             resync_tx,
             device_control,
+            dispatch_tx: None,
         }
+    }
+
+    /// Wire the edge-agent's dispatcher channel so this WS client can
+    /// hand `ServerToEdge::DispatchIntent` payloads to the same
+    /// `(service_type, target)` worker pool that locally-routed intents
+    /// flow through. Without this hook, forwarded intents are logged
+    /// and dropped — fine for hosts whose adapters never receive
+    /// cross-edge work.
+    #[must_use]
+    pub fn with_intent_dispatcher(mut self, tx: mpsc::Sender<RoutedIntent>) -> Self {
+        self.dispatch_tx = Some(tx);
+        self
     }
 
     /// Get a sender for outbound `EdgeToServer` frames. Clone as many times
@@ -308,6 +329,45 @@ impl WsClient {
                         %device_id,
                         "device_disconnect failed",
                     );
+                }
+            }
+            ServerToEdge::DispatchIntent {
+                service_type,
+                service_target,
+                intent,
+                params,
+                output_id,
+            } => {
+                let Some(dispatch_tx) = self.dispatch_tx.as_ref() else {
+                    tracing::debug!(
+                        %service_type,
+                        target = %service_target,
+                        intent = %intent,
+                        "dispatch_intent: no dispatcher wired on this edge; dropping",
+                    );
+                    return Ok(());
+                };
+                let intent_obj = match Intent::reassemble(&intent, &params) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            %service_type,
+                            target = %service_target,
+                            %intent,
+                            "dispatch_intent: failed to reassemble intent payload",
+                        );
+                        return Ok(());
+                    }
+                };
+                let _ = output_id; // reserved for future zone-specific routing
+                let routed = RoutedIntent {
+                    service_type,
+                    service_target,
+                    intent: intent_obj,
+                };
+                if let Err(e) = dispatch_tx.try_send(routed) {
+                    tracing::warn!(error = %e, "dispatch_intent: dispatcher full or closed; dropping");
                 }
             }
             ServerToEdge::Ping => {
