@@ -200,13 +200,19 @@ fn volume_bar_from_value(value: &serde_json::Value) -> Option<(u8, VolumeDirecti
 
 /// Throttle + dedup for BLE writes.
 ///
-/// Throttle: per-target minimum gap so a continuous rotate doesn't
-/// saturate the single BLE connection. Dedup: per-target signature
-/// match — same plan as the last successful write means the visible
-/// frame won't change, so skip.
+/// Tracking is keyed on `(device_id, property)` so two state updates
+/// arriving in the same publish burst (e.g. `playback` then `volume`
+/// 1 ms apart from `NowPlayingObserver.publish()`) don't throttle each
+/// other — only further updates to the *same* property within the
+/// time gap get dropped.
+///
+/// Throttle: per-(device, property) minimum gap so a continuous rotate
+/// doesn't saturate the BLE connection. Dedup: per-(device, property)
+/// signature match — same plan as last write means the visible frame
+/// won't change, so skip.
 pub(crate) struct FeedbackFilter {
-    last_at: HashMap<String, Instant>,
-    last_sig: HashMap<String, String>,
+    last_at: HashMap<(String, String), Instant>,
+    last_sig: HashMap<(String, String), String>,
     min_gap: Duration,
 }
 
@@ -219,19 +225,19 @@ impl FeedbackFilter {
         }
     }
 
-    pub fn should_render(&mut self, device_id: &str, signature: &str) -> bool {
-        if self.last_sig.get(device_id).map(String::as_str) == Some(signature) {
+    pub fn should_render(&mut self, device_id: &str, property: &str, signature: &str) -> bool {
+        let key = (device_id.to_string(), property.to_string());
+        if self.last_sig.get(&key).map(String::as_str) == Some(signature) {
             return false;
         }
         let now = Instant::now();
-        if let Some(prev) = self.last_at.get(device_id) {
+        if let Some(prev) = self.last_at.get(&key) {
             if now.duration_since(*prev) < self.min_gap {
                 return false;
             }
         }
-        self.last_at.insert(device_id.to_string(), now);
-        self.last_sig
-            .insert(device_id.to_string(), signature.to_string());
+        self.last_at.insert(key.clone(), now);
+        self.last_sig.insert(key, signature.to_string());
         true
     }
 }
@@ -292,7 +298,7 @@ async fn dispatch(
             continue;
         };
         let sig = plan.signature();
-        if !filter.should_render(&device_id, &sig) {
+        if !filter.should_render(&device_id, &update.property, &sig) {
             continue;
         }
         let Some(payload) = plan.render(glyphs).await else {
@@ -433,18 +439,33 @@ mod tests {
         let mut filter = FeedbackFilter::new();
         let plan = FeedbackPlan::NamedGlyph("play".into());
         let sig = plan.signature();
-        assert!(filter.should_render("nuimo-1", &sig));
-        // Same signature → no second write.
-        assert!(!filter.should_render("nuimo-1", &sig));
+        assert!(filter.should_render("nuimo-1", "playback", &sig));
+        // Same property, same signature → no second write.
+        assert!(!filter.should_render("nuimo-1", "playback", &sig));
     }
 
     #[tokio::test]
     async fn signature_per_device_independent() {
         let mut filter = FeedbackFilter::new();
         let sig = "play".to_string();
-        assert!(filter.should_render("nuimo-a", &sig));
+        assert!(filter.should_render("nuimo-a", "playback", &sig));
         // Different device, same plan → still renders (its own LED).
-        assert!(filter.should_render("nuimo-b", &sig));
+        assert!(filter.should_render("nuimo-b", "playback", &sig));
+    }
+
+    #[tokio::test]
+    async fn different_property_does_not_throttle_volume_after_playback() {
+        // Regression: NowPlayingObserver.publish() emits playback then
+        // volume in rapid succession. With device-only throttling the
+        // volume frame got dropped because the playback write was
+        // <100 ms ago — LED stayed on the playback glyph and never
+        // showed the volume bar. Per-(device, property) keys keep the
+        // two tracks independent.
+        let mut filter = FeedbackFilter::new();
+        assert!(filter.should_render("nuimo-1", "playback", "pause"));
+        // Immediate follow-up on a different property — must NOT be
+        // throttled by the recent playback write.
+        assert!(filter.should_render("nuimo-1", "volume", "vol:5:up"));
     }
 
     #[tokio::test]
