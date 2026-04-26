@@ -143,12 +143,22 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(adapter)
     };
 
+    // intent_tx is created here (rather than later, next to the
+    // dispatcher) so the Hue bootstrap can hand it down into the Tap
+    // Dial supervisor. The receiver `intent_rx` stays parked until the
+    // dispatcher claims it below; sending into the channel before the
+    // receiver is parked is fine — `mpsc::channel` buffers up to its
+    // capacity.
+    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
+
     // Hue is brought up lazily in a background task so a transient
     // bridge outage (DHCP lease rotation, bridge reboot, internet down)
     // doesn't take the whole edge-agent with it. The watch channel lets
     // the dispatcher see the adapter the moment it appears, and the
     // bootstrap task owns state-pump spawning so Hue state forwards to
-    // `/ws/edge` as soon as the adapter is online.
+    // `/ws/edge` as soon as the adapter is online. The bootstrap also
+    // enumerates Hue Tap Dial controllers and wires their input events
+    // into the routing engine — see `run_hue_bootstrap`.
     #[cfg(feature = "hue")]
     let hue_adapter_rx: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>> = {
         let (tx, rx) = tokio::sync::watch::channel(None);
@@ -160,7 +170,11 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(hue_token::default_path);
                 let outbox = ws_outbox.clone();
                 let resync = ws_resync.clone();
-                tokio::spawn(run_hue_bootstrap(path, tx, outbox, resync));
+                let engine = engine.clone();
+                let intent_tx = intent_tx.clone();
+                tokio::spawn(run_hue_bootstrap(
+                    path, tx, outbox, resync, engine, intent_tx,
+                ));
             }
             None => {
                 tracing::info!("no [hue] section in config — hue adapter disabled");
@@ -201,7 +215,6 @@ async fn main() -> anyhow::Result<()> {
         ws_resync.subscribe(),
     );
 
-    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
     tokio::spawn(run_dispatcher(
         intent_rx,
         ws_outbox.clone(),
@@ -646,13 +659,18 @@ async fn reconnect_nuimo(device: &Arc<NuimoDevice>) {
 /// Resolve the Hue bridge and start its adapter, retrying indefinitely
 /// with exponential backoff if the bridge is unreachable. On success,
 /// publishes the adapter into the watch channel so the dispatcher picks
-/// it up, and spawns the state pump so Hue updates flow to `/ws/edge`.
+/// it up, spawns the state pump so Hue updates flow to `/ws/edge`, and
+/// brings up one input-supervisor task per discovered Hue Tap Dial so
+/// its button / rotary events route through the engine the same way
+/// Nuimo input does.
 #[cfg(feature = "hue")]
 async fn run_hue_bootstrap(
     token_path: PathBuf,
     tx: tokio::sync::watch::Sender<Option<Arc<dyn ServiceAdapter>>>,
     outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     resync: tokio::sync::broadcast::Sender<()>,
+    engine: Arc<RoutingEngine>,
+    intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
 ) {
     let mut delay = Duration::from_secs(0);
     let cap = Duration::from_secs(300);
@@ -664,9 +682,25 @@ async fn run_hue_bootstrap(
         attempt += 1;
         match try_hue_init(&token_path).await {
             Ok(adapter) => {
-                let arc: Arc<dyn ServiceAdapter> = Arc::new(adapter);
                 tracing::info!(attempt, "hue adapter online");
-                spawn_state_pump(arc.subscribe_state(), outbox.clone(), resync.subscribe());
+                spawn_state_pump(
+                    adapter.subscribe_state(),
+                    outbox.clone(),
+                    resync.subscribe(),
+                );
+
+                // Bring up Tap Dial input supervisors before publishing
+                // the dyn-Arc so the dispatcher and the input loops see
+                // a consistent adapter.
+                spawn_tap_dial_supervisors(
+                    &adapter,
+                    outbox.clone(),
+                    resync.clone(),
+                    engine.clone(),
+                    intent_tx.clone(),
+                );
+
+                let arc: Arc<dyn ServiceAdapter> = Arc::new(adapter);
                 let _ = tx.send(Some(arc));
                 return;
             }
@@ -707,6 +741,124 @@ async fn try_hue_init(token_path: &std::path::Path) -> anyhow::Result<HueAdapter
         app_key: token.app_key.clone(),
     })
     .await
+}
+
+/// Spawn one device-state pump and one event loop per Tap Dial enumerated
+/// by the Hue adapter. Idempotent — safe to call once per `HueAdapter`
+/// startup.
+#[cfg(feature = "hue")]
+fn spawn_tap_dial_supervisors(
+    adapter: &HueAdapter,
+    outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    resync: tokio::sync::broadcast::Sender<()>,
+    engine: Arc<RoutingEngine>,
+    intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
+) {
+    for td in adapter.tap_dials() {
+        let device_state_tx = spawn_device_state_pump(
+            "hue_tap_dial",
+            td.id.clone(),
+            outbox.clone(),
+            resync.subscribe(),
+        );
+        // Initial snapshot — connected/nickname/battery so weave-web has
+        // something to render before the first SSE update.
+        let initial_tx = device_state_tx.clone();
+        let id = td.id.clone();
+        let name = td.name.clone();
+        let battery = td.battery;
+        tokio::spawn(async move {
+            let _ = initial_tx
+                .send(("connected".into(), serde_json::json!(true)))
+                .await;
+            let _ = initial_tx
+                .send(("nickname".into(), serde_json::json!(name)))
+                .await;
+            if let Some(b) = battery {
+                let _ = initial_tx
+                    .send(("battery".into(), serde_json::json!(b)))
+                    .await;
+            }
+            tracing::info!(device_id = %id, battery = ?battery, "hue tap dial supervised");
+        });
+
+        let events_rx = adapter.subscribe_tap_dial_events();
+        tokio::spawn(run_hue_tap_dial_loop(
+            td.id.clone(),
+            events_rx,
+            engine.clone(),
+            intent_tx.clone(),
+            outbox.clone(),
+            device_state_tx,
+        ));
+    }
+}
+
+/// Per-Tap-Dial event loop. Filters the shared `TapDialEvent` broadcast
+/// down to one device, then routes input through the engine + emits
+/// device-state updates the same way `run_nuimo_event_loop` does. No
+/// reconnect handling — the SSE stream lives in `adapter_hue::events`
+/// and reconnects on its own.
+#[cfg(feature = "hue")]
+async fn run_hue_tap_dial_loop(
+    device_id: String,
+    mut events_rx: tokio::sync::broadcast::Receiver<adapter_hue::TapDialEvent>,
+    engine: Arc<RoutingEngine>,
+    intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
+    ws_outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    device_state_tx: tokio::sync::mpsc::Sender<(String, serde_json::Value)>,
+) {
+    let device_type = "hue_tap_dial";
+    loop {
+        match events_rx.recv().await {
+            Ok(adapter_hue::TapDialEvent::Battery {
+                device_id: did,
+                level,
+            }) if did == device_id => {
+                let _ = device_state_tx
+                    .send(("battery".into(), serde_json::json!(level)))
+                    .await;
+            }
+            Ok(adapter_hue::TapDialEvent::Input {
+                device_id: did,
+                primitive,
+            }) if did == device_id => {
+                if let Some(value) = input_primitive_json(&primitive) {
+                    emit_input_value(&ws_outbox, device_type, &device_id, value).await;
+                }
+                use edge_core::RouteOutcome;
+                match engine
+                    .route_with_mode(device_type, &device_id, &primitive)
+                    .await
+                {
+                    RouteOutcome::Normal(routed) => {
+                        for r in routed {
+                            if let Err(e) = intent_tx.try_send(r) {
+                                tracing::warn!(error = %e, "intent channel full; dropping tap dial event");
+                            }
+                        }
+                    }
+                    // Tap Dial does not participate in target-selection
+                    // mode (no LED, no long-press semantic). Log and
+                    // ignore so a stray mapping config never wedges the
+                    // pump.
+                    other => {
+                        tracing::debug!(?other, "tap dial selection-mode outcome ignored",);
+                    }
+                }
+            }
+            Ok(_) => {
+                // Event for a different Tap Dial; ignored by this loop.
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, %device_id, "tap dial event lag");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tracing::warn!(%device_id, "tap dial event channel closed; loop exiting");
+                return;
+            }
+        }
+    }
 }
 
 /// Bring up the macOS adapter, retrying indefinitely with exponential
@@ -1078,13 +1230,69 @@ async fn emit_input_device_state(
     let Some(value) = input_event_json(event) else {
         return;
     };
+    emit_input_value(outbox, "nuimo", device_id, value).await;
+}
+
+/// Generic version of `emit_input_device_state` for non-Nuimo input
+/// devices: ships the already-projected JSON value as a
+/// `DeviceState[property=input]` frame on the WS outbox.
+async fn emit_input_value(
+    outbox: &tokio::sync::mpsc::Sender<EdgeToServer>,
+    device_type: &str,
+    device_id: &str,
+    value: serde_json::Value,
+) {
     let frame = EdgeToServer::DeviceState {
-        device_type: "nuimo".to_string(),
+        device_type: device_type.to_string(),
         device_id: device_id.to_string(),
         property: "input".to_string(),
         value,
     };
     let _ = outbox.send(frame).await;
+}
+
+/// Project an `InputPrimitive` directly to the same JSON shape that
+/// `input_event_json` produces from a `NuimoEvent`. Used by per-device
+/// loops that already have an `InputPrimitive` in hand (e.g. the Hue
+/// Tap Dial supervisor) and don't want a synthetic `NuimoEvent`
+/// roundtrip just to ship one frame.
+#[cfg(feature = "hue")]
+fn input_primitive_json(p: &InputPrimitive) -> Option<serde_json::Value> {
+    use serde_json::json;
+    Some(match p {
+        InputPrimitive::Press => json!({"input": "press"}),
+        InputPrimitive::Release => json!({"input": "release"}),
+        InputPrimitive::LongPress => json!({"input": "long_press"}),
+        InputPrimitive::Rotate { delta } => json!({"input": "rotate", "delta": delta}),
+        InputPrimitive::Slide { value } => json!({"input": "slide", "value": value}),
+        InputPrimitive::Hover { proximity } => json!({"input": "hover", "proximity": proximity}),
+        InputPrimitive::Swipe { direction } => json!({
+            "input": format!("swipe_{}", match direction {
+                edge_core::Direction::Up => "up",
+                edge_core::Direction::Down => "down",
+                edge_core::Direction::Left => "left",
+                edge_core::Direction::Right => "right",
+            })
+        }),
+        InputPrimitive::Touch { area } => json!({
+            "input": format!("touch_{}", match area {
+                edge_core::TouchArea::Top => "top",
+                edge_core::TouchArea::Bottom => "bottom",
+                edge_core::TouchArea::Left => "left",
+                edge_core::TouchArea::Right => "right",
+            })
+        }),
+        InputPrimitive::LongTouch { area } => json!({
+            "input": format!("long_touch_{}", match area {
+                edge_core::TouchArea::Top => "top",
+                edge_core::TouchArea::Bottom => "bottom",
+                edge_core::TouchArea::Left => "left",
+                edge_core::TouchArea::Right => "right",
+            })
+        }),
+        InputPrimitive::Button { id } => json!({"input": format!("button_{id}")}),
+        InputPrimitive::KeyPress { .. } => return None,
+    })
 }
 
 /// Project a `NuimoEvent` into the JSON shape consumed by weave-web's

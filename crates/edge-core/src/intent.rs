@@ -6,16 +6,35 @@ use serde::{Deserialize, Serialize};
 /// dial rotate both produce `Rotate { delta }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputPrimitive {
-    Rotate { delta: f64 },
+    Rotate {
+        delta: f64,
+    },
     Press,
     Release,
     LongPress,
-    Swipe { direction: Direction },
-    Slide { value: f64 },
-    Hover { proximity: f64 },
-    Touch { area: TouchArea },
-    LongTouch { area: TouchArea },
-    KeyPress { key: u32 },
+    Swipe {
+        direction: Direction,
+    },
+    Slide {
+        value: f64,
+    },
+    Hover {
+        proximity: f64,
+    },
+    Touch {
+        area: TouchArea,
+    },
+    LongTouch {
+        area: TouchArea,
+    },
+    KeyPress {
+        key: u32,
+    },
+    /// Numbered button press from a multi-button controller (Hue Tap Dial
+    /// has 1..=4). Wire format: `"button_<id>"` (e.g. `button_1`).
+    Button {
+        id: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +112,10 @@ impl InputPrimitive {
                     | (TouchArea::Left, "long_touch_left")
                     | (TouchArea::Right, "long_touch_right")
             ),
+            (InputPrimitive::Button { id }, s) => s
+                .strip_prefix("button_")
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|parsed| parsed == *id),
             _ => false,
         }
     }
@@ -127,5 +150,22 @@ mod tests {
         assert!(s.matches_route("swipe_right"));
         assert!(!s.matches_route("swipe_left"));
         assert!(!s.matches_route("swipe_up"));
+    }
+
+    #[test]
+    fn button_id_matches_numbered_route() {
+        let b = InputPrimitive::Button { id: 1 };
+        assert!(b.matches_route("button_1"));
+        assert!(!b.matches_route("button_2"));
+        assert!(!b.matches_route("button_"));
+        assert!(!b.matches_route("press"));
+    }
+
+    #[test]
+    fn button_route_rejects_non_numeric_suffix() {
+        let b = InputPrimitive::Button { id: 3 };
+        assert!(!b.matches_route("button_x"));
+        assert!(!b.matches_route("button_3a"));
+        assert!(b.matches_route("button_3"));
     }
 }
