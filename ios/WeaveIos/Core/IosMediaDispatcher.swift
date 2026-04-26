@@ -1,5 +1,7 @@
+import AVFoundation
 import Foundation
 import MediaPlayer
+import UIKit
 import os
 
 private let mediaLogger = Logger(
@@ -7,23 +9,65 @@ private let mediaLogger = Logger(
     category: "Media"
 )
 
-/// Dispatches `IosMediaIntent`s to Apple Music (Music.app) via
-/// `MPMusicPlayerController.systemMusicPlayer`.
+/// Dispatches `IosMediaIntent`s to:
+///   - Apple Music (Music.app) for transport / seek via
+///     `MPMusicPlayerController.systemMusicPlayer`. iOS sandbox limits
+///     programmatic remote control to Music.app, so Spotify / YouTube
+///     Music / Podcasts won't react to play/pause/next/previous from
+///     this dispatcher.
+///   - System volume for volume / mute / unmute via the `MPVolumeView`
+///     internal `UISlider` trick (see [SubtleVolume][]). Affects every
+///     app that's currently playing audio, not just Music.app — so this
+///     half of the dispatcher works system-wide regardless of which
+///     player is in front.
 ///
-/// iOS sandboxes programmatic remote control such that only the built-in
-/// Music.app is reachable from a third-party app. Spotify, YouTube Music,
-/// Podcasts, etc. cannot be controlled from this dispatcher — users
-/// running those apps on the iPad should keep music control on the Mac
-/// edge.
+/// The slider trick relies on undocumented `MPVolumeView` internals
+/// (the embedded UISlider). It has been stable since 2016 across iOS
+/// versions but is theoretically subject to break on a future update.
 ///
-/// Volume / mute / brightness intents do not reach this class: the Rust
-/// `IosMediaAdapter` rejects them with `IosMediaError.unsupported` before
-/// the callback fires.
+/// MediaPlayer + AVAudioSession calls run on the main thread; UniFFI
+/// callbacks may arrive on a tokio worker, so the dispatch body hops to
+/// `DispatchQueue.main.sync`.
 ///
-/// MediaPlayer framework calls must run on the main thread; the dispatch
-/// hop is explicit because the UniFFI callback may be invoked from a
-/// tokio worker thread.
+/// [SubtleVolume]: https://github.com/andreamazz/SubtleVolume
 final class IosMediaDispatcher: IosMediaCallback, @unchecked Sendable {
+    /// Off-screen, near-invisible MPVolumeView. Must be attached to a
+    /// UIWindow's view hierarchy for the slider trick to take effect —
+    /// see `attachVolumeView(to:)`.
+    private let volumeView = MPVolumeView(
+        frame: CGRect(x: -1000, y: -1000, width: 100, height: 100)
+    )
+    /// Last non-zero volume captured at `mute` time, restored on
+    /// `unmute`. `nil` means "user hasn't muted via this path", so
+    /// `unmute` is a no-op.
+    private var mutedFromVolume: Float?
+
+    init() {
+        volumeView.alpha = 0.0001
+        volumeView.showsRouteButton = false
+        // The MPVolumeView trick requires an active audio session. The
+        // ambient category lets us coexist with whatever is currently
+        // playing instead of ducking it.
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.ambient, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            mediaLogger.error(
+                "AVAudioSession activation failed: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
+    /// Attach the volume view to the supplied window. Idempotent: a
+    /// second call with the same (or a different) window is a no-op
+    /// once we already have a superview. Called from `WeaveIosApp` once
+    /// the SwiftUI scene is on screen.
+    func attachVolumeView(to window: UIWindow) {
+        guard volumeView.superview == nil else { return }
+        window.addSubview(volumeView)
+        mediaLogger.info("MPVolumeView attached to window for slider-trick dispatch")
+    }
+
     func handleIntent(intent: IosMediaIntent) throws {
         DispatchQueue.main.sync {
             let player = MPMusicPlayerController.systemMusicPlayer
@@ -49,10 +93,44 @@ final class IosMediaDispatcher: IosMediaCallback, @unchecked Sendable {
                 player.currentPlaybackTime = max(0, player.currentPlaybackTime + seconds)
             case .seekAbsolute(let seconds):
                 player.currentPlaybackTime = max(0, seconds)
+            case .volumeSet(let value):
+                setSystemVolume(Float(max(0, min(1, value))))
+            case .volumeChange(let delta):
+                // The routing engine emits delta on a 0..100 percentage
+                // scale (Nuimo `damping=80` × rotate `0.05` → `delta=4`).
+                // AVAudioSession is 0..1, so divide.
+                let current = AVAudioSession.sharedInstance().outputVolume
+                let target = max(0, min(1, current + Float(delta) / 100))
+                setSystemVolume(target)
+            case .mute:
+                let current = AVAudioSession.sharedInstance().outputVolume
+                if current > 0 {
+                    mutedFromVolume = current
+                }
+                setSystemVolume(0)
+            case .unmute:
+                if let restore = mutedFromVolume, restore > 0 {
+                    setSystemVolume(restore)
+                    mutedFromVolume = nil
+                }
             }
             mediaLogger.debug(
                 "dispatched: \(String(describing: intent), privacy: .public)"
             )
         }
+    }
+
+    /// Drive system volume via the MPVolumeView's embedded UISlider.
+    /// No-op (with a warning log) when the slider hasn't been laid out
+    /// yet — typically because `attachVolumeView(to:)` was never called
+    /// or fires before the first layout pass completes.
+    private func setSystemVolume(_ value: Float) {
+        guard let slider = volumeView.subviews.compactMap({ $0 as? UISlider }).first else {
+            mediaLogger.warning(
+                "MPVolumeView UISlider not found — call attachVolumeView(to:) before dispatching volume intents"
+            )
+            return
+        }
+        slider.value = value
     }
 }

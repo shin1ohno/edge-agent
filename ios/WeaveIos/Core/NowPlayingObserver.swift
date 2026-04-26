@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import MediaPlayer
 import os
@@ -8,12 +9,15 @@ private let nowPlayingLogger = Logger(
 )
 
 /// Observes Apple Music's currently-playing item via
-/// `MPMusicPlayerController.systemMusicPlayer` and forwards snapshots to
-/// weave-server through `EdgeClient.publishNowPlaying`.
+/// `MPMusicPlayerController.systemMusicPlayer` and the system output
+/// volume via `AVAudioSession`, forwarding snapshots to weave-server
+/// through `EdgeClient.publishNowPlaying`.
 ///
-/// Three trigger sources:
+/// Trigger sources:
 ///   - `MPMusicPlayerControllerNowPlayingItemDidChange` (track change)
 ///   - `MPMusicPlayerControllerPlaybackStateDidChange` (play/pause/stop)
+///   - `AVAudioSession.outputVolume` KVO (volume slider, hardware
+///     buttons, or our own MPVolumeView slider trick)
 ///   - 5-second poll while playing, so the server-side position stays
 ///     within ±5s of reality without continuous traffic when paused.
 ///
@@ -24,6 +28,7 @@ final class NowPlayingObserver {
     private weak var edgeHost: EdgeClientHost?
     private var pollTimer: Timer?
     private var observers: [NSObjectProtocol] = []
+    private var volumeObservation: NSKeyValueObservation?
     private var started = false
 
     init(edgeHost: EdgeClientHost) {
@@ -60,6 +65,16 @@ final class NowPlayingObserver {
             Task { @MainActor in self?.publishIfPlaying() }
         }
 
+        // KVO on system output volume so the Web UI sees iPad volume
+        // updates from any source (hardware buttons, control center,
+        // our own MPVolumeView slider trick).
+        volumeObservation = AVAudioSession.sharedInstance().observe(
+            \.outputVolume,
+            options: [.new]
+        ) { [weak self] _, _ in
+            Task { @MainActor in self?.publish() }
+        }
+
         // Initial snapshot so the server has a value before the user
         // touches the player.
         publish()
@@ -71,6 +86,8 @@ final class NowPlayingObserver {
         started = false
         pollTimer?.invalidate()
         pollTimer = nil
+        volumeObservation?.invalidate()
+        volumeObservation = nil
         let center = NotificationCenter.default
         for obs in observers {
             center.removeObserver(obs)
@@ -114,7 +131,8 @@ final class NowPlayingObserver {
             album: item?.albumTitle,
             durationSeconds: item?.playbackDuration,
             positionSeconds: position,
-            state: state
+            state: state,
+            systemVolume: Double(AVAudioSession.sharedInstance().outputVolume)
         )
 
         Task {

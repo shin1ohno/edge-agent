@@ -249,6 +249,11 @@ impl EdgeClient {
 }
 
 fn now_playing_value(info: &NowPlayingInfo) -> serde_json::Value {
+    // Wire format keeps `volume` matching Roon's 0..100 convention so
+    // weave-web's `extractLevel` (which already reads `volume` /
+    // `brightness` / `level` keys) renders it as a percentage with no
+    // special-casing. NowPlayingInfo's `system_volume` field stays in
+    // the iOS-native 0..1 ratio for clarity at the Swift boundary.
     serde_json::json!({
         "title": info.title,
         "artist": info.artist,
@@ -260,6 +265,7 @@ fn now_playing_value(info: &NowPlayingInfo) -> serde_json::Value {
             PlaybackState::Playing => "playing",
             PlaybackState::Paused => "paused",
         },
+        "volume": info.system_volume.map(|v| v * 100.0),
     })
 }
 
@@ -729,6 +735,7 @@ mod tests {
             duration_seconds: Some(563.0),
             position_seconds: 120.5,
             state: PlaybackState::Playing,
+            system_volume: Some(0.475),
         };
         let value = now_playing_value(&info);
         assert_eq!(value["title"], "Lateralus");
@@ -737,6 +744,7 @@ mod tests {
         assert_eq!(value["duration_seconds"], 563.0);
         assert_eq!(value["position_seconds"], 120.5);
         assert_eq!(value["state"], "playing");
+        assert_eq!(value["volume"], 47.5);
     }
 
     #[test]
@@ -748,6 +756,7 @@ mod tests {
             duration_seconds: None,
             position_seconds: 0.0,
             state: PlaybackState::Stopped,
+            system_volume: None,
         };
         let value = now_playing_value(&info);
         assert!(value["title"].is_null());
@@ -756,6 +765,7 @@ mod tests {
         assert!(value["duration_seconds"].is_null());
         assert_eq!(value["position_seconds"], 0.0);
         assert_eq!(value["state"], "stopped");
+        assert!(value["volume"].is_null());
     }
 
     #[test]
@@ -767,8 +777,27 @@ mod tests {
             duration_seconds: None,
             position_seconds: 42.0,
             state: PlaybackState::Paused,
+            system_volume: None,
         };
         assert_eq!(now_playing_value(&info)["state"], "paused");
+    }
+
+    #[test]
+    fn now_playing_value_volume_zero_serializes_as_zero_not_null() {
+        let info = NowPlayingInfo {
+            title: None,
+            artist: None,
+            album: None,
+            duration_seconds: None,
+            position_seconds: 0.0,
+            state: PlaybackState::Stopped,
+            system_volume: Some(0.0),
+        };
+        let value = now_playing_value(&info);
+        assert_eq!(
+            value["volume"], 0.0,
+            "muted (Some(0.0)) must serialize as 0, not null"
+        );
     }
 
     #[test]

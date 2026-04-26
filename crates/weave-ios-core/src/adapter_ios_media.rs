@@ -18,9 +18,16 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 /// Subset of `edge-core::Intent` that an iOS edge can dispatch via
-/// `MPRemoteCommandCenter`. Volume, mute, brightness, and power intents
-/// are intentionally absent — they are rejected by the adapter with
-/// `IosMediaError::Unsupported` before reaching Swift.
+/// `MPRemoteCommandCenter` (transport / seek) or `MPVolumeView`'s
+/// internal `UISlider` (volume / mute / unmute). Brightness, color
+/// temperature, and power intents have no iOS equivalent and are
+/// rejected by the adapter with `IosMediaError::Unsupported` before
+/// reaching Swift.
+///
+/// `VolumeChange { delta }` carries the routing engine's pre-damped
+/// 0..100 percentage delta (e.g. Nuimo `damping=80` × rotate 0.05 →
+/// `delta=4.0`). The Swift dispatcher converts to AVAudioSession's
+/// 0..1 scale.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum IosMediaIntent {
     Play,
@@ -31,6 +38,10 @@ pub enum IosMediaIntent {
     Previous,
     SeekRelative { seconds: f64 },
     SeekAbsolute { seconds: f64 },
+    VolumeChange { delta: f64 },
+    VolumeSet { value: f64 },
+    Mute,
+    Unmute,
 }
 
 /// Coarse playback-state classification used by `NowPlayingInfo`. Mirrors
@@ -59,6 +70,11 @@ pub struct NowPlayingInfo {
     pub duration_seconds: Option<f64>,
     pub position_seconds: f64,
     pub state: PlaybackState,
+    /// AVAudioSession output volume at the time of capture, in 0.0..=1.0.
+    /// Forwarded to weave-server multiplied by 100 so the Web UI's
+    /// existing `extractLevel` (which expects Roon-style 0..100 volume)
+    /// renders it as a percentage without special-casing.
+    pub system_volume: Option<f64>,
 }
 
 /// Errors returned across the FFI to Swift dispatchers, and back from the
@@ -113,6 +129,11 @@ impl IosMediaAdapter {
             Intent::SeekAbsolute { seconds } => {
                 Some(IosMediaIntent::SeekAbsolute { seconds: *seconds })
             }
+            Intent::VolumeChange { delta } => Some(IosMediaIntent::VolumeChange { delta: *delta }),
+            Intent::VolumeSet { value } => Some(IosMediaIntent::VolumeSet { value: *value }),
+            Intent::Mute => Some(IosMediaIntent::Mute),
+            Intent::Unmute => Some(IosMediaIntent::Unmute),
+            // Brightness / color-temperature / power have no iOS analog.
             _ => None,
         }
     }
@@ -250,34 +271,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn volume_change_returns_unsupported_without_calling_swift() {
+    async fn volume_change_forwards_to_callback() {
         let callback = RecordingCallback::new();
         let adapter = IosMediaAdapter::new(callback.clone());
 
-        let err = adapter
-            .send_intent("default", &Intent::VolumeChange { delta: 5.0 })
+        adapter
+            .send_intent("default", &Intent::VolumeChange { delta: 4.0 })
             .await
-            .expect_err("volume must be rejected");
-        let msg = format!("{err}");
-        assert!(msg.contains("unsupported"));
-        assert!(msg.contains("volume_change"));
-        assert!(callback.captured().is_empty(), "Swift must not see volume");
+            .expect("volume_change dispatches via MPVolumeView slider trick");
+
+        assert_eq!(
+            callback.captured(),
+            vec![IosMediaIntent::VolumeChange { delta: 4.0 }]
+        );
     }
 
     #[tokio::test]
-    async fn brightness_and_power_are_unsupported() {
+    async fn volume_set_forwards_to_callback() {
+        let callback = RecordingCallback::new();
+        let adapter = IosMediaAdapter::new(callback.clone());
+
+        adapter
+            .send_intent("default", &Intent::VolumeSet { value: 0.42 })
+            .await
+            .expect("volume_set dispatches");
+
+        assert_eq!(
+            callback.captured(),
+            vec![IosMediaIntent::VolumeSet { value: 0.42 }]
+        );
+    }
+
+    #[tokio::test]
+    async fn mute_unmute_forward_to_callback() {
+        let callback = RecordingCallback::new();
+        let adapter = IosMediaAdapter::new(callback.clone());
+
+        adapter.send_intent("default", &Intent::Mute).await.unwrap();
+        adapter
+            .send_intent("default", &Intent::Unmute)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            callback.captured(),
+            vec![IosMediaIntent::Mute, IosMediaIntent::Unmute]
+        );
+    }
+
+    #[tokio::test]
+    async fn brightness_and_power_remain_unsupported() {
+        // Volume / Mute moved to forwarded list; brightness, color
+        // temperature, and power still have no iOS equivalent.
         let callback = RecordingCallback::new();
         let adapter = IosMediaAdapter::new(callback.clone());
 
         for intent in [
             Intent::BrightnessSet { value: 50.0 },
+            Intent::BrightnessChange { delta: 5.0 },
+            Intent::ColorTemperatureChange { delta: 100.0 },
             Intent::PowerToggle,
-            Intent::Mute,
+            Intent::PowerOn,
+            Intent::PowerOff,
         ] {
             let err = adapter
                 .send_intent("default", &intent)
                 .await
-                .expect_err("non-transport intent must be rejected");
+                .expect_err("non-iOS-supported intent must be rejected");
             assert!(format!("{err}").contains("unsupported"));
         }
         assert!(callback.captured().is_empty());
