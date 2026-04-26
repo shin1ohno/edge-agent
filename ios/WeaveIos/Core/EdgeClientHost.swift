@@ -37,6 +37,10 @@ final class EdgeClientHost {
     /// LED feedback sink registered with the Rust feedback pump on
     /// connect. Held so it survives the Rust callback's lifetime.
     private var ledFeedbackBridge: LedFeedbackBridge?
+    /// Server-driven device control sink registered with the Rust WS
+    /// loop on connect. Held so the bridge survives the Rust callback's
+    /// lifetime — symmetrical with `ledFeedbackBridge`.
+    private var deviceControlBridge: DeviceControlBridge?
     private(set) var activeURL: String?
     private(set) var activeEdgeID: String?
 
@@ -69,12 +73,15 @@ final class EdgeClientHost {
             self.lastError = nil
             client.registerIosMediaCallback(callback: self.iosMediaDispatcher)
             if let ble = self.bleBridge {
-                let bridge = LedFeedbackBridge(ble: ble)
-                self.ledFeedbackBridge = bridge
-                client.registerLedFeedbackCallback(sink: bridge)
+                let feedback = LedFeedbackBridge(ble: ble)
+                self.ledFeedbackBridge = feedback
+                client.registerLedFeedbackCallback(sink: feedback)
+                let control = DeviceControlBridge(ble: ble)
+                self.deviceControlBridge = control
+                client.registerDeviceControlCallback(sink: control)
             } else {
                 edgeLogger.warning(
-                    "BleBridge not attached — LED feedback will be silent until attachBleBridge() is called"
+                    "BleBridge not attached — LED feedback and device control will be silent until attachBleBridge() is called"
                 )
             }
             let observer = self.nowPlayingObserver ?? NowPlayingObserver(edgeHost: self)

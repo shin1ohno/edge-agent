@@ -10,6 +10,7 @@
 uniffi::setup_scaffolding!();
 
 mod adapter_ios_media;
+mod device_control;
 mod edge_client;
 mod feedback_pump;
 mod glyph_registry;
@@ -17,6 +18,7 @@ mod ui_client;
 pub use adapter_ios_media::{
     IosMediaCallback, IosMediaError, IosMediaIntent, NowPlayingInfo, PlaybackState,
 };
+pub use device_control::DeviceControlSink;
 pub use edge_client::{EdgeClient, EdgeEventSink};
 pub use feedback_pump::LedFeedbackSink;
 pub use ui_client::{UiClient, UiEventSink};

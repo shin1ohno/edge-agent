@@ -95,6 +95,31 @@ final class BleBridge: NSObject {
         central.connect(peripheral)
     }
 
+    /// Reconnect a previously-discovered Nuimo by its CoreBluetooth UUID.
+    ///
+    /// Used by `DeviceControlBridge` when weave-server pushes a
+    /// `ServerToEdge::DeviceConnect` for a device this app has already
+    /// paired with. If the peripheral is cached we issue `central.connect`
+    /// directly; otherwise we kick a generic scan so the discovery path
+    /// can pick the device back up — the same behavior as restart-time
+    /// reconnect.
+    func connect(by peripheralID: UUID) {
+        if let device = devices[peripheralID] {
+            connect(device.peripheral)
+            return
+        }
+        bleLogger.info("connect(by:) cache miss for id=\(peripheralID.uuidString); starting scan")
+        startScan()
+    }
+
+    /// Disconnect a peripheral by its CoreBluetooth UUID. Initiates the
+    /// disconnect via `central`; the real cleanup happens in the
+    /// `didDisconnectPeripheral` delegate callback below.
+    func disconnect(by peripheralID: UUID) {
+        guard let device = devices[peripheralID] else { return }
+        central.cancelPeripheralConnection(device.peripheral)
+    }
+
     /// Send an LED glyph to the connected peripheral. No-op if the device
     /// is not connected or hasn't discovered the LED characteristic yet.
     func writeLedPayload(_ payload: Data, to peripheralID: UUID) {
