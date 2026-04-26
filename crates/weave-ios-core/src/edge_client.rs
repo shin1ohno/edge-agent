@@ -56,6 +56,17 @@ enum OutboundCommand {
     EdgeStatus {
         wifi: Option<u8>,
     },
+    /// Forward a routed intent the iOS edge can't dispatch locally
+    /// (anything other than `ios_media`). The WS loop translates this
+    /// into `EdgeToServer::DispatchIntent` so weave-server can find an
+    /// edge with the matching capability and forward the work there.
+    DispatchIntent {
+        service_type: String,
+        service_target: String,
+        intent: String,
+        params: serde_json::Value,
+        output_id: Option<String>,
+    },
 }
 
 #[derive(uniffi::Object)]
@@ -221,12 +232,31 @@ impl EdgeClient {
                         );
                     }
                 }
-                other => {
-                    tracing::debug!(
-                        service_type = other,
-                        target = %ri.service_target,
-                        "routed intent for unsupported service_type on iOS edge"
-                    );
+                _ => {
+                    // iPad has no adapter for this service_type. Forward
+                    // the routed intent over WS so weave-server can
+                    // dispatch via a peer edge with the right capability
+                    // (typically pro for `roon` / `hue`). The executing
+                    // edge emits the `Command` telemetry frame after
+                    // running the adapter, so latency reflects the full
+                    // path and the live console row carries the actual
+                    // outcome.
+                    let (intent_name, params) = ri.intent.split();
+                    let cmd = OutboundCommand::DispatchIntent {
+                        service_type: ri.service_type.clone(),
+                        service_target: ri.service_target.clone(),
+                        intent: intent_name,
+                        params,
+                        output_id: None,
+                    };
+                    if let Err(e) = self.outbox_tx.send(cmd).await {
+                        tracing::warn!(
+                            error = %e,
+                            service_type = %ri.service_type,
+                            target = %ri.service_target,
+                            "failed to enqueue dispatch_intent for forwarding",
+                        );
+                    }
                 }
             }
         }
@@ -565,6 +595,16 @@ async fn run_ws_loop(
                                                 break;
                                             }
                                         }
+                                        OutboundCommand::DispatchIntent {
+                                            service_type, service_target, intent, params, output_id,
+                                        } => {
+                                            let frame = EdgeToServer::DispatchIntent {
+                                                service_type, service_target, intent, params, output_id,
+                                            };
+                                            if !send_frame(&mut ws, &frame).await {
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                                 msg = ws.next() => {
@@ -769,6 +809,25 @@ async fn apply_inbound_frame(
                     "ws/edge: device_disconnect dropped — no device_control sink registered",
                 );
             }
+        }
+        ServerToEdge::DispatchIntent {
+            service_type,
+            service_target,
+            intent,
+            ..
+        } => {
+            // weave-server only forwards `DispatchIntent` to edges whose
+            // Hello capabilities advertise `service_type`. iPad reports
+            // `["nuimo:ble", "ios_media"]`, so receiving anything other
+            // than ios_media here means the server made a mistake (or
+            // the capability set drifted). Log and ignore — never
+            // silently dispatch a stranger's intent.
+            tracing::warn!(
+                %service_type,
+                target = %service_target,
+                %intent,
+                "ws/edge: ignoring dispatch_intent — iOS edge has no matching adapter",
+            );
         }
         ServerToEdge::Ping => {
             // Caller handles Pong reply directly to keep the WS handle scoped.

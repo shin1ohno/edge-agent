@@ -95,6 +95,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let device_control: Arc<dyn DeviceControlHook> =
         Arc::new(DeviceMapControl::new(device_map.clone()));
+
+    // intent_tx feeds `run_dispatcher`. Created here (rather than later
+    // next to the dispatcher spawn) so we can hand a clone to `WsClient`
+    // for `ServerToEdge::DispatchIntent` — cross-edge intent forwarding
+    // pushes forwarded intents into the same dispatcher as locally-
+    // routed ones, so the resulting `EdgeToServer::Command` telemetry is
+    // identical between paths.
+    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
+
     let ws_client = WsClient::with_device_control(
         cfg.config_server_url.clone(),
         cfg.edge_id.clone(),
@@ -103,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
         glyphs.clone(),
         device_control,
-    );
+    )
+    .with_intent_dispatcher(intent_tx.clone());
     let ws_outbox = ws_client.outbox();
     let ws_resync = ws_client.resync_sender();
 
@@ -157,13 +167,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(adapter)
     };
 
-    // intent_tx is created here (rather than later, next to the
-    // dispatcher) so the Hue bootstrap can hand it down into the Tap
-    // Dial supervisor. The receiver `intent_rx` stays parked until the
-    // dispatcher claims it below; sending into the channel before the
-    // receiver is parked is fine — `mpsc::channel` buffers up to its
-    // capacity.
-    let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
+    // intent_tx / intent_rx were created earlier alongside the WsClient
+    // construction so `with_intent_dispatcher` could receive a clone.
+    // Re-use them here for the Hue Tap Dial supervisor and the
+    // dispatcher.
 
     // Hue is brought up lazily in a background task so a transient
     // bridge outage (DHCP lease rotation, bridge reboot, internet down)
@@ -1230,7 +1237,7 @@ async fn run_target_worker(
             let started = std::time::Instant::now();
             let outcome = adapter.send_intent(&target, &intent).await;
             let latency_ms = u32::try_from(started.elapsed().as_millis()).ok();
-            let (intent_name, params) = split_intent(&intent);
+            let (intent_name, params) = intent.split();
             let result = match &outcome {
                 Ok(()) => weave_contracts::CommandResult::Ok,
                 Err(e) => weave_contracts::CommandResult::Err {
@@ -1254,22 +1261,9 @@ async fn run_target_worker(
     }
 }
 
-/// Serialize an `Intent` into its snake-case tag and the remaining params
-/// object. Relies on `#[serde(tag = "type")]` on `Intent`, so the output
-/// is always a JSON object with a `"type"` key that we lift out. Payload-
-/// less variants yield `{}`.
-fn split_intent(intent: &Intent) -> (String, serde_json::Value) {
-    match serde_json::to_value(intent) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            let name = map
-                .remove("type")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
-            (name, serde_json::Value::Object(map))
-        }
-        _ => ("unknown".to_string(), serde_json::json!({})),
-    }
-}
+// `split_intent` moved to `edge_core::Intent::split` so both the Linux
+// dispatcher (here) and iOS forwarding (weave-ios-core) use the same
+// encoding for telemetry / DispatchIntent payloads.
 
 /// Append `intent` to `pending`, merging with the tail when both are the
 /// same continuous-delta kind. Preserves ordering for discrete intents.
