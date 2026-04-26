@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
-use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback};
+use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback, NowPlayingInfo, PlaybackState};
 use crate::{nuimo_event_to_input_primitive, NuimoEvent, WeaveError};
 
 /// Swift-implemented callback for edge connection state.
@@ -41,6 +41,13 @@ enum OutboundCommand {
         device_type: String,
         device_id: String,
         property: String,
+        value_json: String,
+    },
+    ServiceState {
+        service_type: String,
+        target: String,
+        property: String,
+        output_id: Option<String>,
         value_json: String,
     },
 }
@@ -212,6 +219,48 @@ impl EdgeClient {
                 message: format!("edge outbox closed: {e}"),
             })
     }
+
+    /// Publish the iPad's Apple Music Now Playing snapshot to weave-server.
+    /// Sent as `EdgeToServer::State { service_type: "ios_media", target:
+    /// "apple_music", property: "now_playing", value: {...} }` so it
+    /// surfaces in the same UI panel as Roon's now-playing data.
+    ///
+    /// Cached internally so reconnect replays the most recent snapshot.
+    pub async fn publish_now_playing(&self, info: NowPlayingInfo) -> Result<(), WeaveError> {
+        let value_json = serde_json::to_string(&now_playing_value(&info)).map_err(|e| {
+            WeaveError::ParseFailed {
+                message: format!("now_playing serialize: {e}"),
+            }
+        })?;
+
+        self.outbox_tx
+            .send(OutboundCommand::ServiceState {
+                service_type: "ios_media".to_string(),
+                target: "apple_music".to_string(),
+                property: "now_playing".to_string(),
+                output_id: None,
+                value_json,
+            })
+            .await
+            .map_err(|e| WeaveError::Network {
+                message: format!("edge outbox closed: {e}"),
+            })
+    }
+}
+
+fn now_playing_value(info: &NowPlayingInfo) -> serde_json::Value {
+    serde_json::json!({
+        "title": info.title,
+        "artist": info.artist,
+        "album": info.album,
+        "duration_seconds": info.duration_seconds,
+        "position_seconds": info.position_seconds,
+        "state": match info.state {
+            PlaybackState::Stopped => "stopped",
+            PlaybackState::Playing => "playing",
+            PlaybackState::Paused => "paused",
+        },
+    })
 }
 
 // ----- WebSocket loop -----------------------------------------------------
@@ -229,7 +278,13 @@ async fn run_ws_loop(
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
     // Last-write-wins replay cache, keyed by (device_type, device_id, property).
-    let mut state_cache: HashMap<(String, String, String), serde_json::Value> = HashMap::new();
+    let mut device_state_cache: HashMap<(String, String, String), serde_json::Value> =
+        HashMap::new();
+    // Last-write-wins replay cache for service state, keyed by
+    // (service_type, target, property, output_id). Holds the most recent
+    // payload for each so a reconnect repopulates the server's snapshot.
+    type ServiceStateKey = (String, String, String, Option<String>);
+    let mut service_state_cache: HashMap<ServiceStateKey, serde_json::Value> = HashMap::new();
     let version = env!("CARGO_PKG_VERSION").to_string();
 
     loop {
@@ -255,7 +310,7 @@ async fn run_ws_loop(
 
                         // Replay cached state.
                         let mut replay_failed = false;
-                        for ((device_type, device_id, property), value) in &state_cache {
+                        for ((device_type, device_id, property), value) in &device_state_cache {
                             let frame = EdgeToServer::DeviceState {
                                 device_type: device_type.clone(),
                                 device_id: device_id.clone(),
@@ -265,6 +320,25 @@ async fn run_ws_loop(
                             if !send_frame(&mut ws, &frame).await {
                                 replay_failed = true;
                                 break;
+                            }
+                        }
+                        if !replay_failed {
+                            for (
+                                (service_type, target, property, output_id),
+                                value,
+                            ) in &service_state_cache
+                            {
+                                let frame = EdgeToServer::State {
+                                    service_type: service_type.clone(),
+                                    target: target.clone(),
+                                    property: property.clone(),
+                                    output_id: output_id.clone(),
+                                    value: value.clone(),
+                                };
+                                if !send_frame(&mut ws, &frame).await {
+                                    replay_failed = true;
+                                    break;
+                                }
                             }
                         }
                         if replay_failed {
@@ -289,12 +363,34 @@ async fn run_ws_loop(
                                             let value: serde_json::Value =
                                                 serde_json::from_str(&value_json)
                                                     .unwrap_or(serde_json::Value::Null);
-                                            state_cache.insert(
+                                            device_state_cache.insert(
                                                 (device_type.clone(), device_id.clone(), property.clone()),
                                                 value.clone(),
                                             );
                                             let frame = EdgeToServer::DeviceState {
                                                 device_type, device_id, property, value,
+                                            };
+                                            if !send_frame(&mut ws, &frame).await {
+                                                break;
+                                            }
+                                        }
+                                        OutboundCommand::ServiceState {
+                                            service_type, target, property, output_id, value_json,
+                                        } => {
+                                            let value: serde_json::Value =
+                                                serde_json::from_str(&value_json)
+                                                    .unwrap_or(serde_json::Value::Null);
+                                            service_state_cache.insert(
+                                                (
+                                                    service_type.clone(),
+                                                    target.clone(),
+                                                    property.clone(),
+                                                    output_id.clone(),
+                                                ),
+                                                value.clone(),
+                                            );
+                                            let frame = EdgeToServer::State {
+                                                service_type, target, property, output_id, value,
                                             };
                                             if !send_frame(&mut ws, &frame).await {
                                                 break;
@@ -467,6 +563,7 @@ fn derive_edge_ws_url(http_base: &str) -> Result<String, WeaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter_ios_media::{NowPlayingInfo, PlaybackState};
     use edge_core::{InputPrimitive, Intent};
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -621,6 +718,57 @@ mod tests {
         let snapshot = engine.snapshot().await;
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].service_target, "default");
+    }
+
+    #[test]
+    fn now_playing_value_includes_all_fields_with_snake_case_state() {
+        let info = NowPlayingInfo {
+            title: Some("Lateralus".into()),
+            artist: Some("Tool".into()),
+            album: Some("Lateralus".into()),
+            duration_seconds: Some(563.0),
+            position_seconds: 120.5,
+            state: PlaybackState::Playing,
+        };
+        let value = now_playing_value(&info);
+        assert_eq!(value["title"], "Lateralus");
+        assert_eq!(value["artist"], "Tool");
+        assert_eq!(value["album"], "Lateralus");
+        assert_eq!(value["duration_seconds"], 563.0);
+        assert_eq!(value["position_seconds"], 120.5);
+        assert_eq!(value["state"], "playing");
+    }
+
+    #[test]
+    fn now_playing_value_optional_fields_serialize_as_null() {
+        let info = NowPlayingInfo {
+            title: None,
+            artist: None,
+            album: None,
+            duration_seconds: None,
+            position_seconds: 0.0,
+            state: PlaybackState::Stopped,
+        };
+        let value = now_playing_value(&info);
+        assert!(value["title"].is_null());
+        assert!(value["artist"].is_null());
+        assert!(value["album"].is_null());
+        assert!(value["duration_seconds"].is_null());
+        assert_eq!(value["position_seconds"], 0.0);
+        assert_eq!(value["state"], "stopped");
+    }
+
+    #[test]
+    fn now_playing_state_paused_serializes_to_paused_string() {
+        let info = NowPlayingInfo {
+            title: None,
+            artist: None,
+            album: None,
+            duration_seconds: None,
+            position_seconds: 42.0,
+            state: PlaybackState::Paused,
+        };
+        assert_eq!(now_playing_value(&info)["state"], "paused");
     }
 
     #[test]
