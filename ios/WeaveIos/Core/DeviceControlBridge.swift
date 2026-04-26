@@ -30,7 +30,7 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
         self.ble = ble
     }
 
-    func connectDevice(deviceType: String, deviceId: String) async {
+    func connectDevice(deviceType: String, deviceId: String) {
         guard deviceType == "nuimo" else {
             deviceControlLogger.debug(
                 "ignored connect_device for type=\(deviceType, privacy: .public)"
@@ -53,7 +53,7 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
         }
     }
 
-    func disconnectDevice(deviceType: String, deviceId: String) async {
+    func disconnectDevice(deviceType: String, deviceId: String) {
         guard deviceType == "nuimo" else {
             deviceControlLogger.debug(
                 "ignored disconnect_device for type=\(deviceType, privacy: .public)"
@@ -78,7 +78,7 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
         brightness: Float?,
         timeoutMs: UInt32?,
         transition: String?
-    ) async {
+    ) {
         guard deviceType == "nuimo" else {
             deviceControlLogger.debug(
                 "ignored display_glyph for type=\(deviceType, privacy: .public)"

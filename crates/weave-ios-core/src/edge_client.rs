@@ -717,9 +717,11 @@ async fn apply_inbound_frame(
             timeout_ms,
             transition,
         } => {
-            // Snapshot the sink under the std::sync::Mutex; release the
-            // guard before any `.await` so we never hold a sync lock
-            // across a suspend point.
+            // Snapshot the sink under the std::sync::Mutex. The trait is
+            // synchronous (UniFFI's async-foreign-trait codegen breaks
+            // Swift 6 strict concurrency), so Swift implementations
+            // dispatch their own async work — typically a
+            // `DispatchQueue.main.async` hop into BleBridge.
             let registered = { device_control.lock().expect("device control mutex").clone() };
             if let Some(sink) = registered {
                 sink.display_glyph(
@@ -729,8 +731,7 @@ async fn apply_inbound_frame(
                     brightness,
                     timeout_ms,
                     transition,
-                )
-                .await;
+                );
             } else {
                 tracing::debug!(
                     %device_type,
@@ -745,7 +746,7 @@ async fn apply_inbound_frame(
         } => {
             let registered = { device_control.lock().expect("device control mutex").clone() };
             if let Some(sink) = registered {
-                sink.connect_device(device_type, device_id).await;
+                sink.connect_device(device_type, device_id);
             } else {
                 tracing::debug!(
                     %device_type,
@@ -760,7 +761,7 @@ async fn apply_inbound_frame(
         } => {
             let registered = { device_control.lock().expect("device control mutex").clone() };
             if let Some(sink) = registered {
-                sink.disconnect_device(device_type, device_id).await;
+                sink.disconnect_device(device_type, device_id);
             } else {
                 tracing::debug!(
                     %device_type,
@@ -864,18 +865,17 @@ mod tests {
         display: StdMutex<Vec<DisplayGlyphCapture>>,
     }
 
-    #[async_trait::async_trait]
     impl DeviceControlSink for RecordingDeviceControlSink {
-        async fn connect_device(&self, device_type: String, device_id: String) {
+        fn connect_device(&self, device_type: String, device_id: String) {
             self.connect.lock().unwrap().push((device_type, device_id));
         }
-        async fn disconnect_device(&self, device_type: String, device_id: String) {
+        fn disconnect_device(&self, device_type: String, device_id: String) {
             self.disconnect
                 .lock()
                 .unwrap()
                 .push((device_type, device_id));
         }
-        async fn display_glyph(
+        fn display_glyph(
             &self,
             device_type: String,
             device_id: String,
