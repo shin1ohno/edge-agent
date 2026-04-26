@@ -16,7 +16,7 @@ pub mod pair;
 pub mod resolver;
 pub mod types;
 
-pub use adapter::{HueAdapter, HueConfig};
+pub use adapter::{HueAdapter, HueConfig, TapDialEvent};
 pub use discovery::{discover, DiscoveredBridge};
 pub use pair::{pair, PairedCredentials};
 pub use resolver::{resolve_bridge, ResolveSource};
