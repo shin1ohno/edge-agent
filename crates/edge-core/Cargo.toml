@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Transport-agnostic routing, service-adapter trait, and WebSocket client shared between the native edge-agent binary and other device hosts (iOS, future targets)."
 
 [dependencies]
-weave-contracts = { version = "0.9", path = "../weave-contracts" }
+weave-contracts = { version = "0.10", path = "../weave-contracts" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
