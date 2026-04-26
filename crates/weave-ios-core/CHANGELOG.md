@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.8.0...weave-ios-core-v0.8.1) - 2026-04-26
+
+### Other
+
+- route DeviceConnect / DeviceDisconnect / DisplayGlyph to Swift ([#62](https://github.com/shin1ohno/edge-agent/pull/62))
+
 ## [0.8.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.7.0...weave-ios-core-v0.8.0) - 2026-04-26
 
 ### Other
