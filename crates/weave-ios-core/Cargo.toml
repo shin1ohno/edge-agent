@@ -14,6 +14,7 @@ description = "UniFFI wrapper exposing edge-core and nuimo-protocol to the weave
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
+edge-core = { version = "0.5", path = "../edge-core" }
 nuimo-protocol = { version = "0.5", path = "../nuimo-protocol" }
 weave-contracts = { version = "0.5", path = "../weave-contracts" }
 serde = { workspace = true }
