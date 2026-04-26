@@ -43,7 +43,12 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
             )
             return
         }
-        await MainActor.run { [weak ble] in
+        // GCD's `DispatchQueue.main.async` (fire-and-forget) avoids
+        // Swift 6's `sending` closure constraint that `MainActor.run`
+        // imposes. `BleBridge` is non-Sendable, and even a `[weak ble]`
+        // capture trips the data-race check. This mirrors how
+        // `LedFeedbackBridge.writeLed` already does main-thread hops.
+        DispatchQueue.main.async { [weak ble] in
             ble?.connect(by: uuid)
         }
     }
@@ -61,7 +66,7 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
             )
             return
         }
-        await MainActor.run { [weak ble] in
+        DispatchQueue.main.async { [weak ble] in
             ble?.disconnect(by: uuid)
         }
     }
@@ -94,7 +99,7 @@ final class DeviceControlBridge: DeviceControlSink, @unchecked Sendable {
         )
         do {
             let payload = try buildLedPayload(glyph: glyph, opts: opts)
-            await MainActor.run { [weak ble] in
+            DispatchQueue.main.async { [weak ble] in
                 ble?.writeLedPayload(Data(payload), to: uuid)
             }
         } catch {
