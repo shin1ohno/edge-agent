@@ -666,6 +666,43 @@ async fn apply_inbound_frame(engine: &RoutingEngine, glyphs: &GlyphRegistry, fra
             glyphs.replace_all(incoming).await;
             tracing::info!(count, "ws/edge: glyphs_update applied");
         }
+        // Device-control frames are dispatched by the native `edge-agent`
+        // binary's `DeviceMapControl`. The iOS edge-agent variant drives
+        // its on-device BleBridge directly from HomeView, so these frames
+        // are accepted but not acted on here. Logging keeps the iOS log
+        // useful when the same /ws/edge endpoint relays a control frame
+        // for a non-iOS device that happens to share the connection.
+        ServerToEdge::DisplayGlyph {
+            device_type,
+            device_id,
+            ..
+        } => {
+            tracing::debug!(
+                %device_type,
+                %device_id,
+                "ws/edge: display_glyph received — ignored on iOS edge-agent",
+            );
+        }
+        ServerToEdge::DeviceConnect {
+            device_type,
+            device_id,
+        } => {
+            tracing::debug!(
+                %device_type,
+                %device_id,
+                "ws/edge: device_connect received — ignored on iOS edge-agent",
+            );
+        }
+        ServerToEdge::DeviceDisconnect {
+            device_type,
+            device_id,
+        } => {
+            tracing::debug!(
+                %device_type,
+                %device_id,
+                "ws/edge: device_disconnect received — ignored on iOS edge-agent",
+            );
+        }
         ServerToEdge::Ping => {
             // Caller handles Pong reply directly to keep the WS handle scoped.
             unreachable!("apply_inbound_frame must not be called with Ping");

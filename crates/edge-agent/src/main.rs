@@ -27,8 +27,12 @@ mod wifi;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::sync::RwLock;
 
 #[cfg(feature = "hue")]
 use adapter_hue::{HueAdapter, HueConfig};
@@ -37,8 +41,8 @@ use adapter_macos::{MacosAdapter, MacosConfig};
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
 use edge_core::{
-    GlyphRegistry, InputPrimitive, Intent, RoutedIntent, RoutingEngine, ServiceAdapter,
-    StateUpdate, WsClient,
+    DeviceControlHook, GlyphRegistry, InputPrimitive, Intent, RoutedIntent, RoutingEngine,
+    ServiceAdapter, StateUpdate, WsClient,
 };
 use nuimo::{discover, DisplayOptions, DisplayTransition, NuimoDevice, NuimoEvent, RotationMode};
 use weave_contracts::EdgeToServer;
@@ -74,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let engine = Arc::new(RoutingEngine::new());
     let glyphs = Arc::new(GlyphRegistry::new());
+    let device_map: DeviceMap = Arc::new(RwLock::new(HashMap::new()));
 
     let capabilities = {
         let mut caps = Vec::new();
@@ -88,13 +93,16 @@ async fn main() -> anyhow::Result<()> {
         }
         caps
     };
-    let ws_client = WsClient::new(
+    let device_control: Arc<dyn DeviceControlHook> =
+        Arc::new(DeviceMapControl::new(device_map.clone()));
+    let ws_client = WsClient::with_device_control(
         cfg.config_server_url.clone(),
         cfg.edge_id.clone(),
         VERSION.to_string(),
         capabilities,
         engine.clone(),
         glyphs.clone(),
+        device_control,
     );
     let ws_outbox = ws_client.outbox();
     let ws_resync = ws_client.resync_sender();
@@ -258,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
         ws_outbox: ws_outbox.clone(),
         ws_resync: ws_resync.clone(),
         intent_tx,
+        device_map: device_map.clone(),
         #[cfg(feature = "roon")]
         roon_adapter: roon_adapter.clone(),
         #[cfg(feature = "hue")]
@@ -304,6 +313,10 @@ struct NuimoDeps {
     ws_outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     ws_resync: tokio::sync::broadcast::Sender<()>,
     intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
+    /// Shared map: WS handler dispatches DisplayGlyph / DeviceConnect /
+    /// DeviceDisconnect through this. `connect_and_spawn` registers
+    /// each device on bring-up.
+    device_map: DeviceMap,
     #[cfg(feature = "roon")]
     roon_adapter: Arc<dyn ServiceAdapter>,
     #[cfg(feature = "hue")]
@@ -435,6 +448,160 @@ struct NuimoContext {
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Public-facing device handle used by `DeviceMap` and (via a
+/// `DeviceControlHook` impl) by the WS client. Wraps the underlying
+/// `NuimoDevice` plus the paused flag the auto-reconnect loop checks.
+///
+/// Methods are `&self` so the handle can be cloned and shared through an
+/// `Arc<RwLock<HashMap>>` without taking out write locks for control
+/// dispatch — the wrapper itself is cheap to clone (two `Arc`s).
+#[derive(Clone)]
+struct NuimoDeviceHandle {
+    device: Arc<NuimoDevice>,
+    /// Set by the WS handler: `true` after `DeviceDisconnect` so the
+    /// reconnect loop sleeps instead of immediately re-establishing the
+    /// link; cleared by `DeviceConnect`.
+    paused: Arc<AtomicBool>,
+}
+
+impl NuimoDeviceHandle {
+    fn new(device: Arc<NuimoDevice>) -> Self {
+        Self {
+            device,
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Re-attempt a BLE connection. Idempotent at the underlying SDK
+    /// level: connecting an already-connected device is fine. Always
+    /// clears the paused flag so the auto-reconnect loop resumes if it
+    /// was previously paused.
+    async fn manual_connect(&self) -> anyhow::Result<()> {
+        self.paused.store(false, Ordering::SeqCst);
+        self.device.connect().await?;
+        Ok(())
+    }
+
+    /// Drop the active BLE connection. The underlying SDK's `disconnect`
+    /// is infallible; the `Result` return preserves a uniform shape with
+    /// the connect / display paths.
+    async fn manual_disconnect(&self) -> anyhow::Result<()> {
+        self.device.disconnect().await;
+        Ok(())
+    }
+
+    /// Render `pattern` on the LED matrix immediately. `pattern` is the
+    /// 9-line ASCII grid shape (`*` = on) shared with `weave-contracts`
+    /// `Glyph::pattern`.
+    async fn display_glyph_now(
+        &self,
+        pattern: &str,
+        brightness: Option<f32>,
+        timeout_ms: Option<u32>,
+        transition: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let glyph = nuimo::Glyph::from_str(pattern);
+        let opts = DisplayOptions {
+            brightness: brightness.map(f64::from).unwrap_or(1.0).clamp(0.0, 1.0),
+            timeout_ms: timeout_ms.unwrap_or(2000).min(25_500),
+            transition: match transition {
+                Some("immediate") => DisplayTransition::Immediate,
+                _ => DisplayTransition::CrossFade,
+            },
+        };
+        self.device.display_glyph(&glyph, &opts).await?;
+        Ok(())
+    }
+
+    /// Set the paused flag without touching the connection state. The
+    /// reconnect loop in `run_nuimo_event_loop` consults this between
+    /// retries.
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+}
+
+/// Map of `(device_type, device_id)` to a clonable handle. The WS client
+/// dispatches `ServerToEdge::DisplayGlyph` / `DeviceConnect` /
+/// `DeviceDisconnect` frames through this map (via `DeviceControlHook`).
+///
+/// Keys use uppercased BLE addresses for Nuimo so lookup is
+/// case-insensitive against a UI request that may carry whichever form
+/// the user typed.
+type DeviceMap = Arc<RwLock<HashMap<(String, String), NuimoDeviceHandle>>>;
+
+/// `DeviceControlHook` impl backed by the live `DeviceMap`. The WS client
+/// holds it as `Arc<dyn DeviceControlHook>`; concrete dispatch happens
+/// here.
+struct DeviceMapControl {
+    map: DeviceMap,
+}
+
+#[async_trait]
+impl DeviceControlHook for DeviceMapControl {
+    async fn display_glyph(
+        &self,
+        device_type: &str,
+        device_id: &str,
+        pattern: &str,
+        brightness: Option<f32>,
+        timeout_ms: Option<u32>,
+        transition: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(handle) = self.lookup(device_type, device_id).await else {
+            tracing::warn!(device_type, device_id, "DisplayGlyph for unknown device");
+            return Ok(());
+        };
+        handle
+            .display_glyph_now(pattern, brightness, timeout_ms, transition)
+            .await
+    }
+
+    async fn connect_device(&self, device_type: &str, device_id: &str) -> anyhow::Result<()> {
+        let Some(handle) = self.lookup(device_type, device_id).await else {
+            tracing::warn!(device_type, device_id, "DeviceConnect for unknown device");
+            return Ok(());
+        };
+        handle.set_paused(false);
+        handle.manual_connect().await
+    }
+
+    async fn disconnect_device(&self, device_type: &str, device_id: &str) -> anyhow::Result<()> {
+        let Some(handle) = self.lookup(device_type, device_id).await else {
+            tracing::warn!(
+                device_type,
+                device_id,
+                "DeviceDisconnect for unknown device"
+            );
+            return Ok(());
+        };
+        handle.set_paused(true);
+        handle.manual_disconnect().await
+    }
+}
+
+impl DeviceMapControl {
+    fn new(map: DeviceMap) -> Self {
+        Self { map }
+    }
+
+    /// Case-insensitive lookup. Only `nuimo` is in the map today —
+    /// other device types get a `None` and the caller logs and returns
+    /// gracefully.
+    async fn lookup(&self, device_type: &str, device_id: &str) -> Option<NuimoDeviceHandle> {
+        if device_type != "nuimo" {
+            return None;
+        }
+        let key = (device_type.to_string(), device_id.to_ascii_uppercase());
+        self.map.read().await.get(&key).cloned()
+    }
+}
+
 /// Bring one discovered Nuimo online: connect BLE, register device-state
 /// pump, render the link glyph, and spawn the per-device feedback pumps
 /// and event loop. Returns the tracking context; dropping it does NOT
@@ -448,6 +615,17 @@ async fn connect_and_spawn(
     device.set_rotation_mode(RotationMode::Continuous).await;
     let device_id = device.id();
     tracing::info!(%device_id, "nuimo connected");
+
+    // Register the device in the shared map so `ServerToEdge::DisplayGlyph`
+    // / `DeviceConnect` / `DeviceDisconnect` dispatched by the WS handler
+    // can find it. Keyed on `(device_type, uppercased device_id)` so
+    // `DeviceMapControl::lookup` can do case-insensitive matches against
+    // user-supplied addresses.
+    let handle = NuimoDeviceHandle::new(device.clone());
+    {
+        let key = ("nuimo".to_string(), device_id.to_ascii_uppercase());
+        deps.device_map.write().await.insert(key, handle.clone());
+    }
 
     // Device-state pump for weave-web visibility. Cache + replay on every
     // ws resync so weave-server restarts don't leave the UI stuck on
@@ -527,6 +705,10 @@ async fn connect_and_spawn(
     // routed intents, drives reconnect on disconnect. One task per
     // Nuimo; tasks are fully independent so Nuimo A's reconnect never
     // blocks Nuimo B's event flow.
+    //
+    // The `paused` flag is shared with the WS-driven `DeviceMapControl`
+    // so a `ServerToEdge::DeviceDisconnect` suppresses the auto-reconnect
+    // loop until a matching `DeviceConnect` clears it.
     let event_loop = tokio::spawn(run_nuimo_event_loop(
         device.clone(),
         device_id.clone(),
@@ -535,6 +717,7 @@ async fn connect_and_spawn(
         deps.intent_tx.clone(),
         deps.glyphs.clone(),
         deps.ws_outbox.clone(),
+        handle.paused.clone(),
     ));
     handles.push(event_loop);
 
@@ -548,6 +731,7 @@ async fn connect_and_spawn(
 /// Per-device event pump. Runs forever (until the broadcast closes or
 /// the runtime shuts down). Owns reconnect on `Disconnected`, routing of
 /// input events, and selection-mode LED rendering for one Nuimo.
+#[allow(clippy::too_many_arguments)]
 async fn run_nuimo_event_loop(
     device: Arc<NuimoDevice>,
     device_id: String,
@@ -556,6 +740,7 @@ async fn run_nuimo_event_loop(
     intent_tx: tokio::sync::mpsc::Sender<RoutedIntent>,
     glyphs: Arc<GlyphRegistry>,
     ws_outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
+    paused: Arc<AtomicBool>,
 ) {
     let mut events = device.events();
     let device_type = "nuimo";
@@ -573,7 +758,7 @@ async fn run_nuimo_event_loop(
                 let _ = device_state_tx
                     .send(("connected".into(), serde_json::json!(false)))
                     .await;
-                reconnect_nuimo(&device).await;
+                reconnect_nuimo(&device, &paused).await;
                 let _ = device_state_tx
                     .send(("connected".into(), serde_json::json!(true)))
                     .await;
@@ -669,12 +854,31 @@ async fn run_nuimo_event_loop(
 
 /// Retry `device.connect()` with exponential backoff (1s → 30s cap) until
 /// it succeeds. Called when a `NuimoEvent::Disconnected` is observed.
-async fn reconnect_nuimo(device: &Arc<NuimoDevice>) {
+///
+/// The `paused` flag (shared with the WS-driven `DeviceMapControl`) is
+/// checked between every retry: while paused, the loop sleeps and rechecks
+/// rather than firing connect attempts that the user explicitly asked to
+/// suppress. When the flag clears, the next attempt fires immediately.
+async fn reconnect_nuimo(device: &Arc<NuimoDevice>, paused: &Arc<AtomicBool>) {
     let mut delay = Duration::from_secs(1);
     let cap = Duration::from_secs(30);
+    let pause_poll = Duration::from_millis(500);
     let mut attempt: u32 = 0;
     loop {
+        if paused.load(Ordering::SeqCst) {
+            // Suspend reconnect while paused. Polling keeps the loop alive
+            // so the next `DeviceConnect` is acted on immediately without
+            // spawning a separate signaling channel. Resets backoff on
+            // resume so a manual reconnect doesn't inherit a long delay
+            // from a previous failed sequence.
+            tokio::time::sleep(pause_poll).await;
+            delay = Duration::from_secs(1);
+            continue;
+        }
         tokio::time::sleep(delay).await;
+        if paused.load(Ordering::SeqCst) {
+            continue;
+        }
         attempt += 1;
         match device.connect().await {
             Ok(()) => {

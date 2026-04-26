@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
 use super::cache;
+use super::device_control::{DeviceControlHook, NoopDeviceControl};
 use super::registry::GlyphRegistry;
 use super::routing::RoutingEngine;
 
@@ -35,6 +36,7 @@ pub struct WsClient {
     outbox_rx: mpsc::Receiver<EdgeToServer>,
     outbox_tx: mpsc::Sender<EdgeToServer>,
     resync_tx: broadcast::Sender<()>,
+    device_control: Arc<dyn DeviceControlHook>,
 }
 
 impl WsClient {
@@ -45,6 +47,29 @@ impl WsClient {
         capabilities: Vec<String>,
         engine: Arc<RoutingEngine>,
         glyphs: Arc<GlyphRegistry>,
+    ) -> Self {
+        Self::with_device_control(
+            url,
+            edge_id,
+            version,
+            capabilities,
+            engine,
+            glyphs,
+            Arc::new(NoopDeviceControl),
+        )
+    }
+
+    /// Construct a `WsClient` with a host-supplied `DeviceControlHook`. The
+    /// edge-agent binary wires this to its per-device map so weave-server
+    /// can drive Connect / Disconnect / Test-LED via the WS protocol.
+    pub fn with_device_control(
+        url: String,
+        edge_id: String,
+        version: String,
+        capabilities: Vec<String>,
+        engine: Arc<RoutingEngine>,
+        glyphs: Arc<GlyphRegistry>,
+        device_control: Arc<dyn DeviceControlHook>,
     ) -> Self {
         let cache_path = cache::default_cache_path(&edge_id);
         let (outbox_tx, outbox_rx) = mpsc::channel(256);
@@ -62,6 +87,7 @@ impl WsClient {
             outbox_rx,
             outbox_tx,
             resync_tx,
+            device_control,
         }
     }
 
@@ -214,6 +240,75 @@ impl WsClient {
             ServerToEdge::GlyphsUpdate { glyphs } => {
                 tracing::info!(count = glyphs.len(), "received glyphs_update");
                 self.glyphs.replace_all(glyphs).await;
+            }
+            ServerToEdge::DisplayGlyph {
+                device_type,
+                device_id,
+                pattern,
+                brightness,
+                timeout_ms,
+                transition,
+            } => {
+                tracing::info!(
+                    %device_type,
+                    %device_id,
+                    "display_glyph",
+                );
+                if let Err(e) = self
+                    .device_control
+                    .display_glyph(
+                        &device_type,
+                        &device_id,
+                        &pattern,
+                        brightness,
+                        timeout_ms,
+                        transition.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        %device_type,
+                        %device_id,
+                        "display_glyph failed",
+                    );
+                }
+            }
+            ServerToEdge::DeviceConnect {
+                device_type,
+                device_id,
+            } => {
+                tracing::info!(%device_type, %device_id, "device_connect");
+                if let Err(e) = self
+                    .device_control
+                    .connect_device(&device_type, &device_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        %device_type,
+                        %device_id,
+                        "device_connect failed",
+                    );
+                }
+            }
+            ServerToEdge::DeviceDisconnect {
+                device_type,
+                device_id,
+            } => {
+                tracing::info!(%device_type, %device_id, "device_disconnect");
+                if let Err(e) = self
+                    .device_control
+                    .disconnect_device(&device_type, &device_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        %device_type,
+                        %device_id,
+                        "device_disconnect failed",
+                    );
+                }
             }
             ServerToEdge::Ping => {
                 // Pong is handled via the outbox channel to avoid tx contention here;
