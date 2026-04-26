@@ -34,6 +34,23 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
+# Self-diagnose missing rustup targets up front so the failure mode is one
+# clear actionable line, not a wall of `error[E0463]: can't find crate for
+# 'std'` from cargo a minute later.
+REQUIRED_TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios)
+missing_targets=()
+installed=$(rustup target list --installed 2>/dev/null || true)
+for target in "${REQUIRED_TARGETS[@]}"; do
+    if ! grep -q "^$target\$" <<<"$installed"; then
+        missing_targets+=("$target")
+    fi
+done
+if (( ${#missing_targets[@]} > 0 )); then
+    echo "error: missing rustup target(s): ${missing_targets[*]}" >&2
+    echo "Run: rustup target add ${missing_targets[*]}" >&2
+    exit 1
+fi
+
 log "building Rust staticlib for device + simulator targets"
 cargo build --target aarch64-apple-ios       "${CARGO_FLAGS[@]}"
 cargo build --target aarch64-apple-ios-sim   "${CARGO_FLAGS[@]}"
