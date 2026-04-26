@@ -23,6 +23,7 @@ mod glyphs;
 mod hue_token;
 #[cfg(feature = "hue")]
 mod pair_hue;
+mod wifi;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -102,6 +103,11 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "failed to prime from config cache");
     }
     tokio::spawn(ws_client.run());
+
+    // Periodic edge-side metrics. Spawned once at startup; the outbox
+    // channel persists across ws reconnects so frames queued during a
+    // disconnect drain the moment the next session is up.
+    tokio::spawn(run_edge_status_publisher(ws_outbox.clone()));
 
     #[cfg(feature = "roon")]
     let roon_adapter: Arc<dyn ServiceAdapter> = {
@@ -259,6 +265,33 @@ async fn main() -> anyhow::Result<()> {
     };
 
     run_nuimo_supervisor(cfg.nuimo.ble_addresses, deps).await
+}
+
+/// Periodically publish `EdgeToServer::EdgeStatus` so the server can
+/// surface edge health (wifi signal) in `/ws/ui` dashboards. The first
+/// emit fires immediately on startup; subsequent emits use a 10 s
+/// cadence. Server-side latency is tracked separately via Ping/Pong
+/// RTT and is not carried in this frame.
+///
+/// The task exits when the outbox channel is closed (process shutdown).
+/// Reconnects are transparent: the underlying mpsc channel survives
+/// ws session boundaries, so frames queued during an outage drain
+/// when the next session connects.
+async fn run_edge_status_publisher(outbox: tokio::sync::mpsc::Sender<EdgeToServer>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let wifi = wifi::measure_wifi().await;
+        if outbox
+            .send(EdgeToServer::EdgeStatus { wifi })
+            .await
+            .is_err()
+        {
+            tracing::debug!("edge status publisher: outbox closed, exiting");
+            return;
+        }
+    }
 }
 
 /// Shared context every per-device Nuimo task needs. Collected into one

@@ -52,6 +52,9 @@ enum OutboundCommand {
         output_id: Option<String>,
         value_json: String,
     },
+    EdgeStatus {
+        wifi: Option<u8>,
+    },
 }
 
 #[derive(uniffi::Object)]
@@ -311,6 +314,21 @@ impl EdgeClient {
         self.publish_ios_media_state("volume".into(), value).await
     }
 
+    /// Publish the iPad's wifi signal strength so the server can render
+    /// edge health in `/ws/ui` dashboards. `wifi` is `Some(percent)` on
+    /// the 0..=100 scale, or `None` when the host can't read signal
+    /// strength (no entitlement, no wifi adapter, fetchCurrent failed).
+    /// Swift owns the timer and the platform-API call; this method is
+    /// just the publish endpoint.
+    pub async fn publish_edge_status(&self, wifi: Option<u8>) -> Result<(), WeaveError> {
+        self.outbox_tx
+            .send(OutboundCommand::EdgeStatus { wifi })
+            .await
+            .map_err(|e| WeaveError::Network {
+                message: format!("publish_edge_status: outbox closed: {e}"),
+            })
+    }
+
     /// Register the Swift-side LED feedback sink. Replaces any prior
     /// callback. Until called, the feedback pump runs but every
     /// dispatch is a no-op (it logs nothing visible to keep the
@@ -515,6 +533,12 @@ async fn run_ws_loop(
                                             let frame = EdgeToServer::State {
                                                 service_type, target, property, output_id, value,
                                             };
+                                            if !send_frame(&mut ws, &frame).await {
+                                                break;
+                                            }
+                                        }
+                                        OutboundCommand::EdgeStatus { wifi } => {
+                                            let frame = EdgeToServer::EdgeStatus { wifi };
                                             if !send_frame(&mut ws, &frame).await {
                                                 break;
                                             }

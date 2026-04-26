@@ -97,6 +97,18 @@ pub enum EdgeToServer {
         message: String,
         severity: ErrorSeverity,
     },
+    /// Periodic edge-side metrics. Emitted on a fixed cadence (typically
+    /// every 10 s) so the server can surface edge health in `/ws/ui`
+    /// dashboards. Server-side latency is measured separately from
+    /// `Ping`/`Pong` round trips and is not carried here.
+    EdgeStatus {
+        /// Wifi signal strength normalized to 0..=100 percent. `None`
+        /// when the platform doesn't expose a signal-strength API to
+        /// user code, when the host has no wifi adapter, or when the
+        /// API call failed (entitlement missing, permission denied).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wifi: Option<u8>,
+    },
 }
 
 /// Outcome of an `EdgeToServer::Command`.
@@ -209,6 +221,20 @@ pub enum UiFrame {
         severity: ErrorSeverity,
         /// RFC3339 timestamp assigned by the server on fan-out.
         at: String,
+    },
+    /// Periodic edge metrics. Carries the latest known wifi signal
+    /// strength (edge-reported) and round-trip latency (server-measured
+    /// from `Ping`/`Pong`). Each field is `None` when unknown:
+    /// either because no measurement has arrived yet, or because the
+    /// edge cannot read the value on its platform. Emitted whenever
+    /// either field changes; UIs apply it as a partial update on the
+    /// matching `edge_id` row.
+    EdgeStatus {
+        edge_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wifi: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u32>,
     },
 }
 
@@ -462,6 +488,43 @@ mod tests {
     }
 
     #[test]
+    fn ui_frame_edge_status_roundtrip() {
+        let full = UiFrame::EdgeStatus {
+            edge_id: "air".into(),
+            wifi: Some(82),
+            latency_ms: Some(15),
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(json.contains("\"type\":\"edge_status\""));
+        assert!(json.contains("\"wifi\":82"));
+        assert!(json.contains("\"latency_ms\":15"));
+        let parsed: UiFrame = serde_json::from_str(&json).unwrap();
+        match parsed {
+            UiFrame::EdgeStatus {
+                edge_id,
+                wifi,
+                latency_ms,
+            } => {
+                assert_eq!(edge_id, "air");
+                assert_eq!(wifi, Some(82));
+                assert_eq!(latency_ms, Some(15));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // Both metrics absent → only edge_id on the wire.
+        let empty = UiFrame::EdgeStatus {
+            edge_id: "air".into(),
+            wifi: None,
+            latency_ms: None,
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.contains("\"edge_id\":\"air\""));
+        assert!(!json.contains("wifi"));
+        assert!(!json.contains("latency_ms"));
+    }
+
+    #[test]
     fn ui_frame_command_and_error_roundtrip() {
         let cmd = UiFrame::Command {
             edge_id: "air".into(),
@@ -489,6 +552,30 @@ mod tests {
         assert!(json.contains("\"type\":\"error\""));
         assert!(json.contains("\"severity\":\"warn\""));
         let _: UiFrame = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn edge_to_server_edge_status_roundtrip() {
+        let with_wifi = EdgeToServer::EdgeStatus { wifi: Some(73) };
+        let json = serde_json::to_string(&with_wifi).unwrap();
+        assert!(json.contains("\"type\":\"edge_status\""));
+        assert!(json.contains("\"wifi\":73"));
+        let parsed: EdgeToServer = serde_json::from_str(&json).unwrap();
+        match parsed {
+            EdgeToServer::EdgeStatus { wifi } => assert_eq!(wifi, Some(73)),
+            _ => panic!("wrong variant"),
+        }
+
+        // None should be elided from the wire form.
+        let no_wifi = EdgeToServer::EdgeStatus { wifi: None };
+        let json = serde_json::to_string(&no_wifi).unwrap();
+        assert!(json.contains("\"type\":\"edge_status\""));
+        assert!(!json.contains("wifi"));
+        let parsed: EdgeToServer = serde_json::from_str(&json).unwrap();
+        match parsed {
+            EdgeToServer::EdgeStatus { wifi } => assert_eq!(wifi, None),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
