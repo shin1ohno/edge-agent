@@ -46,12 +46,22 @@ final class IosMediaDispatcher: IosMediaCallback, @unchecked Sendable {
     @MainActor private var mutedFromVolume: Float?
 
     init() {
-        // The MPVolumeView trick requires an active audio session. The
-        // ambient category lets us coexist with whatever is currently
-        // playing instead of ducking it. AVAudioSession is thread-safe
-        // so this runs fine off MainActor.
+        // The MPVolumeView slider trick only persists when our audio
+        // session has enough authority to drive the system mixer.
+        // `.ambient` (the previous setting) marks our session as
+        // "secondary": iOS lets us briefly move the slider, but Apple
+        // Music's `.playback` session reasserts and snaps the system
+        // volume back to its prior value moments later — visible to
+        // the user as "rotate makes the bar climb, then it falls back."
+        //
+        // `.playback` matches Apple Music's authority level; the
+        // `.mixWithOthers` option keeps Music + Spotify from being
+        // ducked when we activate. We never produce audio frames, so
+        // `.playback` here is just a permissions hint, not a request
+        // to play.
         do {
-            try AVAudioSession.sharedInstance().setCategory(.ambient, options: [])
+            try AVAudioSession.sharedInstance()
+                .setCategory(.playback, options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             mediaLogger.error(
@@ -142,6 +152,12 @@ final class IosMediaDispatcher: IosMediaCallback, @unchecked Sendable {
     /// No-op (with a warning log) when the slider hasn't been laid out
     /// yet — typically because `attachVolumeView(to:)` was never called
     /// or fires before the first layout pass completes.
+    ///
+    /// Re-asserts `AVAudioSession.setActive(true)` before each set
+    /// because Apple Music can briefly grab audio focus on track
+    /// changes / playback transitions — without an active session, the
+    /// slider write doesn't persist (system volume snaps back when
+    /// Music's session reasserts).
     @MainActor
     private func setSystemVolume(_ value: Float) {
         guard let slider = volumeView?.subviews.compactMap({ $0 as? UISlider }).first else {
@@ -150,6 +166,7 @@ final class IosMediaDispatcher: IosMediaCallback, @unchecked Sendable {
             )
             return
         }
+        try? AVAudioSession.sharedInstance().setActive(true)
         slider.value = value
     }
 }
