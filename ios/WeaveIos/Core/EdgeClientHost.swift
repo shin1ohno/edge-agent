@@ -22,6 +22,10 @@ final class EdgeClientHost {
 
     private var client: EdgeClient?
     private var sink: EdgeClientSink?
+    /// Lazily created dispatcher for `service_type = "ios_media"`. Held
+    /// here (not on the Rust side) because UniFFI callbacks need a Swift
+    /// owner that outlives them.
+    private let iosMediaDispatcher = IosMediaDispatcher()
     private(set) var activeURL: String?
     private(set) var activeEdgeID: String?
 
@@ -29,10 +33,10 @@ final class EdgeClientHost {
     /// `BleBridge`. Mirrors `nuimo_protocol::DEVICE_NAME` lowercased.
     private let nuimoDeviceType = "nuimo"
 
-    /// Capability strings included in the `Hello` frame. iOS-as-edge can
-    /// today only host a Nuimo over BLE; it has no Roon / Hue adapters,
-    /// so we advertise a single capability flag.
-    private let capabilities = ["nuimo:ble"]
+    /// Capability strings included in the `Hello` frame. The iPad edge
+    /// hosts a Nuimo over BLE and dispatches `ios_media` intents to
+    /// Music.app via `IosMediaDispatcher`.
+    private let capabilities = ["nuimo:ble", "ios_media"]
 
     func connect(serverURL: String, edgeID: String) async {
         guard !serverURL.isEmpty, !edgeID.isEmpty else { return }
@@ -52,6 +56,7 @@ final class EdgeClientHost {
             self.activeURL = serverURL
             self.activeEdgeID = edgeID
             self.lastError = nil
+            client.registerIosMediaCallback(callback: self.iosMediaDispatcher)
             edgeLogger.info("EdgeClient connect requested: edgeID=\(edgeID, privacy: .public) url=\(serverURL, privacy: .public)")
         } catch {
             lastError = String(describing: error)
@@ -87,6 +92,21 @@ final class EdgeClientHost {
     func publishNuimoInput(deviceID: UUID, event: NuimoEvent) async {
         guard let json = nuimoInputEventJson(event: event) else { return }
         await publish(deviceID: deviceID, property: "input", valueJSON: json)
+    }
+
+    /// Route a Nuimo event through the Rust routing engine. Any intent
+    /// the engine produces is dispatched in-process — `service_type =
+    /// "ios_media"` reaches `IosMediaDispatcher` and runs against
+    /// Music.app; other service types log and skip on the iPad edge.
+    /// No-op when the EdgeClient is not connected.
+    func routeNuimoInput(deviceID: UUID, event: NuimoEvent) async {
+        guard let client = self.client else { return }
+        let id = deviceID.uuidString.lowercased()
+        await client.routeNuimoEvent(
+            deviceType: nuimoDeviceType,
+            deviceId: id,
+            event: event
+        )
     }
 
     private func publish(deviceID: UUID, property: String, valueJSON: String) async {

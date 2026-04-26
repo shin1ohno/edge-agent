@@ -14,16 +14,17 @@
 //! `(edge_id, device_id)` in `weave-contracts::DeviceStateEntry`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use edge_core::RoutingEngine;
+use edge_core::{RoutingEngine, ServiceAdapter};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
-use crate::WeaveError;
+use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback};
+use crate::{nuimo_event_to_input_primitive, NuimoEvent, WeaveError};
 
 /// Swift-implemented callback for edge connection state.
 ///
@@ -48,10 +49,13 @@ enum OutboundCommand {
 pub struct EdgeClient {
     shutdown_tx: Mutex<Option<mpsc::Sender<()>>>,
     outbox_tx: mpsc::Sender<OutboundCommand>,
-    /// Held so the routing engine outlives the WS loop. Read by the
-    /// adapter-dispatch surface added in the follow-up `ios_media` PR.
-    #[allow(dead_code)]
+    /// Mappings cache populated from inbound `ConfigFull` / `ConfigPatch`.
+    /// Read by `route_nuimo_event` to translate device input into intents.
     engine: Arc<RoutingEngine>,
+    /// Optional iOS media dispatcher. Set lazily by Swift via
+    /// `register_ios_media_callback`; absent until then, in which case
+    /// `ios_media`-typed routing produces a debug log and no dispatch.
+    ios_media_adapter: StdMutex<Option<Arc<IosMediaAdapter>>>,
 }
 
 const OUTBOX_CAPACITY: usize = 64;
@@ -89,7 +93,84 @@ impl EdgeClient {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             outbox_tx,
             engine,
+            ios_media_adapter: StdMutex::new(None),
         }))
+    }
+
+    /// Register the Swift-side `MPRemoteCommandCenter` dispatcher. Replaces
+    /// any previously-registered callback.
+    ///
+    /// Idempotent in shape: calling twice with the same callback is safe;
+    /// the second call rebuilds the adapter on top of the new callback
+    /// reference.
+    pub fn register_ios_media_callback(&self, callback: Arc<dyn IosMediaCallback>) {
+        let adapter = Arc::new(IosMediaAdapter::new(callback));
+        *self
+            .ios_media_adapter
+            .lock()
+            .expect("ios_media adapter mutex") = Some(adapter);
+        tracing::info!("ios_media adapter registered");
+    }
+
+    /// Route a Nuimo event through the local engine and dispatch any
+    /// produced intents to the registered adapter(s).
+    ///
+    /// Errors from the adapter are logged but do not propagate to Swift —
+    /// the BLE callback site doesn't have a useful response to give the
+    /// user beyond the Web UI Live Console row, which a future PR will
+    /// publish via `EdgeToServer::Command`.
+    pub async fn route_nuimo_event(
+        &self,
+        device_type: String,
+        device_id: String,
+        event: NuimoEvent,
+    ) {
+        let Some(input) = nuimo_event_to_input_primitive(&event) else {
+            return; // Battery / non-input events: nothing to route.
+        };
+
+        let routed = self.engine.route(&device_type, &device_id, &input).await;
+        if routed.is_empty() {
+            return;
+        }
+
+        // Snapshot the adapter slot under the std::sync::Mutex; release the
+        // guard before any `.await` so we never hold a sync lock across a
+        // suspend point.
+        let adapter = self
+            .ios_media_adapter
+            .lock()
+            .expect("ios_media adapter mutex")
+            .clone();
+
+        for ri in routed {
+            match ri.service_type.as_str() {
+                "ios_media" => {
+                    let Some(adapter) = adapter.as_ref() else {
+                        tracing::warn!(
+                            target = %ri.service_target,
+                            intent = ?ri.intent,
+                            "ios_media routed but no dispatcher registered"
+                        );
+                        continue;
+                    };
+                    if let Err(e) = adapter.send_intent(&ri.service_target, &ri.intent).await {
+                        tracing::warn!(
+                            target = %ri.service_target,
+                            error = %e,
+                            "ios_media dispatch failed"
+                        );
+                    }
+                }
+                other => {
+                    tracing::debug!(
+                        service_type = other,
+                        target = %ri.service_target,
+                        "routed intent for unsupported service_type on iOS edge"
+                    );
+                }
+            }
+        }
     }
 
     /// Signal the WS loop to exit and release its sink reference.
