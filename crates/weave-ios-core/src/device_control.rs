@@ -1,0 +1,50 @@
+//! Device control sink for the iOS edge.
+//!
+//! Mirrors the `LedFeedbackSink` pattern from `feedback_pump.rs`: the Rust
+//! WebSocket loop receives `ServerToEdge::DisplayGlyph` /
+//! `DeviceConnect` / `DeviceDisconnect` frames, and dispatches them
+//! across this UniFFI-exported foreign trait so Swift can drive its
+//! `BleBridge` without re-implementing the BLE stack in Rust on iOS.
+//!
+//! Async because Swift's CoreBluetooth calls are easier to wire on the
+//! main actor with `await`. Implementations can still hop synchronously
+//! and return immediately — the trait is just permissive.
+//!
+//! Linux/macOS edges don't use this trait — they have a direct in-process
+//! `DeviceControlHook` (see `crates/edge-agent/src/main.rs`).
+
+use async_trait::async_trait;
+
+/// Swift-implemented sink for server-driven device control.
+///
+/// Each method maps 1:1 to a `ServerToEdge` variant the WS loop receives.
+/// Implementations should be quick — long-running BLE work belongs on a
+/// task the implementation spawns, not inside the sink call.
+#[uniffi::export(with_foreign)]
+#[async_trait]
+pub trait DeviceControlSink: Send + Sync {
+    /// Reconnect a previously-paired device. Idempotent: already-connected
+    /// devices are a no-op aside from clearing any "paused" state that
+    /// previously suppressed reconnect attempts.
+    async fn connect_device(&self, device_type: String, device_id: String);
+
+    /// Disconnect a device. The implementation should set a paused flag
+    /// so the auto-reconnect loop does not immediately re-establish.
+    async fn disconnect_device(&self, device_type: String, device_id: String);
+
+    /// Render a glyph on the device's LED. Used by the weave-web "Test
+    /// LED" affordance to verify the display path without waiting for a
+    /// service-state event.
+    ///
+    /// `pattern` is a 9-line ASCII grid (`*` = on, anything else = off);
+    /// optional fields default at the implementation's discretion.
+    async fn display_glyph(
+        &self,
+        device_type: String,
+        device_id: String,
+        pattern: String,
+        brightness: Option<f32>,
+        timeout_ms: Option<u32>,
+        transition: Option<String>,
+    );
+}

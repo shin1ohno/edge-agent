@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
 use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback, NowPlayingInfo, PlaybackState};
+use crate::device_control::DeviceControlSink;
 use crate::feedback_pump::{run_feedback_pump, LedFeedbackSink, StateUpdate};
 use crate::glyph_registry::GlyphRegistry;
 use crate::{nuimo_event_to_input_primitive, NuimoEvent, WeaveError};
@@ -83,6 +84,12 @@ pub struct EdgeClient {
     /// drops it before awaiting, and does nothing while the slot is
     /// `None` — letting Swift register after `connect` finishes.
     led_sink: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>>,
+    /// Swift-registered server-driven device control sink. Receives
+    /// `ServerToEdge::DisplayGlyph` / `DeviceConnect` / `DeviceDisconnect`
+    /// from the WS handler and dispatches into `BleBridge`. Same
+    /// `Arc<StdMutex<Option<...>>>` pattern as `led_sink` so Swift can
+    /// register after `connect` finishes.
+    device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
 }
 
 const OUTBOX_CAPACITY: usize = 64;
@@ -113,6 +120,8 @@ impl EdgeClient {
         let glyphs = Arc::new(GlyphRegistry::new());
         let led_sink: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> =
             Arc::new(StdMutex::new(None));
+        let device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> =
+            Arc::new(StdMutex::new(None));
 
         tokio::spawn(run_ws_loop(
             ws_url,
@@ -123,6 +132,7 @@ impl EdgeClient {
             outbox_rx,
             engine.clone(),
             glyphs.clone(),
+            device_control.clone(),
         ));
 
         // Feedback pump exits when `state_tx` (held below) is dropped —
@@ -142,6 +152,7 @@ impl EdgeClient {
             glyphs,
             state_tx,
             led_sink,
+            device_control,
         }))
     }
 
@@ -337,6 +348,16 @@ impl EdgeClient {
         *self.led_sink.lock().expect("led sink mutex") = Some(sink);
         tracing::info!("led feedback sink registered");
     }
+
+    /// Register the Swift-side server-driven device control sink.
+    /// Replaces any prior callback. Until called, inbound `DisplayGlyph`
+    /// / `DeviceConnect` / `DeviceDisconnect` frames are dropped with a
+    /// debug log — the WS loop keeps running so the WebSocket session
+    /// itself stays healthy through the registration window.
+    pub fn register_device_control_callback(&self, sink: Arc<dyn DeviceControlSink>) {
+        *self.device_control.lock().expect("device control mutex") = Some(sink);
+        tracing::info!("device control sink registered");
+    }
 }
 
 // Internal helpers kept outside the `#[uniffi::export]` impl block
@@ -415,6 +436,7 @@ async fn run_ws_loop(
     mut outbox_rx: mpsc::Receiver<OutboundCommand>,
     engine: Arc<RoutingEngine>,
     glyphs: Arc<GlyphRegistry>,
+    device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
 ) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
@@ -555,7 +577,13 @@ async fn run_ws_loop(
                                                     }
                                                 }
                                                 Ok(other) => {
-                                                    apply_inbound_frame(&engine, &glyphs, other).await;
+                                                    apply_inbound_frame(
+                                                        &engine,
+                                                        &glyphs,
+                                                        &device_control,
+                                                        other,
+                                                    )
+                                                    .await;
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!(
@@ -610,14 +638,24 @@ async fn send_frame(
 }
 
 /// Apply an inbound `ServerToEdge` frame (other than `Ping`, handled by
-/// the WS loop directly) to the local routing engine and glyph
-/// registry. Both sources of state — mappings and named glyphs —
-/// arrive over the same channel; populating both here keeps the
-/// feedback pump unblocked the moment a `ConfigFull` lands.
+/// the WS loop directly) to the local routing engine, glyph registry,
+/// and Swift-registered device control sink.
+///
+/// `device_control` is the slot Swift fills via
+/// `register_device_control_callback`. While `None`, server-driven
+/// device control frames (`DisplayGlyph` / `DeviceConnect` /
+/// `DeviceDisconnect`) are dropped with a debug log — that's expected
+/// during the connection-setup window before Swift hands its sink
+/// across.
 ///
 /// Extracted as a free async fn so unit tests can exercise the
 /// frame-to-engine plumbing without standing up a WebSocket server.
-async fn apply_inbound_frame(engine: &RoutingEngine, glyphs: &GlyphRegistry, frame: ServerToEdge) {
+async fn apply_inbound_frame(
+    engine: &RoutingEngine,
+    glyphs: &GlyphRegistry,
+    device_control: &StdMutex<Option<Arc<dyn DeviceControlSink>>>,
+    frame: ServerToEdge,
+) {
     match frame {
         ServerToEdge::ConfigFull { config } => {
             let mapping_count = config.mappings.len();
@@ -666,42 +704,70 @@ async fn apply_inbound_frame(engine: &RoutingEngine, glyphs: &GlyphRegistry, fra
             glyphs.replace_all(incoming).await;
             tracing::info!(count, "ws/edge: glyphs_update applied");
         }
-        // Device-control frames are dispatched by the native `edge-agent`
-        // binary's `DeviceMapControl`. The iOS edge-agent variant drives
-        // its on-device BleBridge directly from HomeView, so these frames
-        // are accepted but not acted on here. Logging keeps the iOS log
-        // useful when the same /ws/edge endpoint relays a control frame
-        // for a non-iOS device that happens to share the connection.
+        // Device-control frames are dispatched across `device_control`
+        // into Swift, which drives `BleBridge`. The slot is filled by
+        // `register_device_control_callback`; while empty (initial
+        // connection-setup window) the frame is dropped with a debug log
+        // — same fail-soft behavior as `LedFeedbackSink`.
         ServerToEdge::DisplayGlyph {
             device_type,
             device_id,
-            ..
+            pattern,
+            brightness,
+            timeout_ms,
+            transition,
         } => {
-            tracing::debug!(
-                %device_type,
-                %device_id,
-                "ws/edge: display_glyph received — ignored on iOS edge-agent",
-            );
+            // Snapshot the sink under the std::sync::Mutex; release the
+            // guard before any `.await` so we never hold a sync lock
+            // across a suspend point.
+            let registered = { device_control.lock().expect("device control mutex").clone() };
+            if let Some(sink) = registered {
+                sink.display_glyph(
+                    device_type,
+                    device_id,
+                    pattern,
+                    brightness,
+                    timeout_ms,
+                    transition,
+                )
+                .await;
+            } else {
+                tracing::debug!(
+                    %device_type,
+                    %device_id,
+                    "ws/edge: display_glyph dropped — no device_control sink registered",
+                );
+            }
         }
         ServerToEdge::DeviceConnect {
             device_type,
             device_id,
         } => {
-            tracing::debug!(
-                %device_type,
-                %device_id,
-                "ws/edge: device_connect received — ignored on iOS edge-agent",
-            );
+            let registered = { device_control.lock().expect("device control mutex").clone() };
+            if let Some(sink) = registered {
+                sink.connect_device(device_type, device_id).await;
+            } else {
+                tracing::debug!(
+                    %device_type,
+                    %device_id,
+                    "ws/edge: device_connect dropped — no device_control sink registered",
+                );
+            }
         }
         ServerToEdge::DeviceDisconnect {
             device_type,
             device_id,
         } => {
-            tracing::debug!(
-                %device_type,
-                %device_id,
-                "ws/edge: device_disconnect received — ignored on iOS edge-agent",
-            );
+            let registered = { device_control.lock().expect("device control mutex").clone() };
+            if let Some(sink) = registered {
+                sink.disconnect_device(device_type, device_id).await;
+            } else {
+                tracing::debug!(
+                    %device_type,
+                    %device_id,
+                    "ws/edge: device_disconnect dropped — no device_control sink registered",
+                );
+            }
         }
         ServerToEdge::Ping => {
             // Caller handles Pong reply directly to keep the WS handle scoped.
@@ -772,6 +838,63 @@ mod tests {
         }
     }
 
+    /// Empty device-control slot for tests that exercise non-control
+    /// arms of `apply_inbound_frame`. Same shape `EdgeClient::connect`
+    /// constructs in production before Swift registers a sink.
+    fn empty_device_control_slot() -> Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> {
+        Arc::new(StdMutex::new(None))
+    }
+
+    /// `(device_type, device_id, pattern, brightness, timeout_ms, transition)`
+    type DisplayGlyphCapture = (
+        String,
+        String,
+        String,
+        Option<f32>,
+        Option<u32>,
+        Option<String>,
+    );
+
+    /// Recording sink that captures every dispatch so the test can
+    /// assert the WS-loop dispatched into Swift correctly.
+    #[derive(Default)]
+    struct RecordingDeviceControlSink {
+        connect: StdMutex<Vec<(String, String)>>,
+        disconnect: StdMutex<Vec<(String, String)>>,
+        display: StdMutex<Vec<DisplayGlyphCapture>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceControlSink for RecordingDeviceControlSink {
+        async fn connect_device(&self, device_type: String, device_id: String) {
+            self.connect.lock().unwrap().push((device_type, device_id));
+        }
+        async fn disconnect_device(&self, device_type: String, device_id: String) {
+            self.disconnect
+                .lock()
+                .unwrap()
+                .push((device_type, device_id));
+        }
+        async fn display_glyph(
+            &self,
+            device_type: String,
+            device_id: String,
+            pattern: String,
+            brightness: Option<f32>,
+            timeout_ms: Option<u32>,
+            transition: Option<String>,
+        ) {
+            self.display.lock().unwrap().push((
+                device_type,
+                device_id,
+                pattern,
+                brightness,
+                timeout_ms,
+                transition,
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn config_full_replaces_engine_state() {
         let engine = RoutingEngine::new();
@@ -783,7 +906,13 @@ mod tests {
             glyphs: vec![],
         };
 
-        apply_inbound_frame(&engine, &glyphs, ServerToEdge::ConfigFull { config }).await;
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &empty_device_control_slot(),
+            ServerToEdge::ConfigFull { config },
+        )
+        .await;
 
         let intents = engine
             .route("nuimo", "nuimo-1", &InputPrimitive::Press)
@@ -805,7 +934,13 @@ mod tests {
             mappings: vec![],
             glyphs: vec![],
         };
-        apply_inbound_frame(&engine, &glyphs, ServerToEdge::ConfigFull { config }).await;
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &empty_device_control_slot(),
+            ServerToEdge::ConfigFull { config },
+        )
+        .await;
 
         let intents = engine
             .route("nuimo", "nuimo-1", &InputPrimitive::Press)
@@ -826,6 +961,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            &empty_device_control_slot(),
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Upsert,
@@ -851,6 +987,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            &empty_device_control_slot(),
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Delete,
@@ -876,6 +1013,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            &empty_device_control_slot(),
             ServerToEdge::TargetSwitch {
                 mapping_id,
                 service_target: "alt".into(),
@@ -901,6 +1039,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            &empty_device_control_slot(),
             ServerToEdge::TargetSwitch {
                 mapping_id: Uuid::new_v4(),
                 service_target: "phantom".into(),
@@ -911,6 +1050,136 @@ mod tests {
         let snapshot = engine.snapshot().await;
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].service_target, "default");
+    }
+
+    #[tokio::test]
+    async fn display_glyph_dispatches_to_registered_sink() {
+        let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
+        let recorder: Arc<RecordingDeviceControlSink> =
+            Arc::new(RecordingDeviceControlSink::default());
+        let slot: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> = Arc::new(StdMutex::new(
+            Some(recorder.clone() as Arc<dyn DeviceControlSink>),
+        ));
+
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DisplayGlyph {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+                pattern: "*".into(),
+                brightness: Some(0.5),
+                timeout_ms: Some(2000),
+                transition: Some("cross_fade".into()),
+            },
+        )
+        .await;
+
+        let captured = recorder.display.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let (dt, did, pat, br, to, tr) = &captured[0];
+        assert_eq!(dt, "nuimo");
+        assert_eq!(did, "nuimo-1");
+        assert_eq!(pat, "*");
+        assert_eq!(*br, Some(0.5));
+        assert_eq!(*to, Some(2000));
+        assert_eq!(tr.as_deref(), Some("cross_fade"));
+    }
+
+    #[tokio::test]
+    async fn device_connect_dispatches_to_registered_sink() {
+        let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
+        let recorder: Arc<RecordingDeviceControlSink> =
+            Arc::new(RecordingDeviceControlSink::default());
+        let slot: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> = Arc::new(StdMutex::new(
+            Some(recorder.clone() as Arc<dyn DeviceControlSink>),
+        ));
+
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DeviceConnect {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+            },
+        )
+        .await;
+
+        let captured = recorder.connect.lock().unwrap().clone();
+        assert_eq!(captured, vec![("nuimo".to_string(), "nuimo-1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn device_disconnect_dispatches_to_registered_sink() {
+        let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
+        let recorder: Arc<RecordingDeviceControlSink> =
+            Arc::new(RecordingDeviceControlSink::default());
+        let slot: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> = Arc::new(StdMutex::new(
+            Some(recorder.clone() as Arc<dyn DeviceControlSink>),
+        ));
+
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DeviceDisconnect {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+            },
+        )
+        .await;
+
+        let captured = recorder.disconnect.lock().unwrap().clone();
+        assert_eq!(captured, vec![("nuimo".to_string(), "nuimo-1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn device_control_frames_drop_when_no_sink_registered() {
+        // No-panic guarantee: WS loop continues even without a sink so the
+        // connection-setup window stays clean.
+        let engine = RoutingEngine::new();
+        let glyphs = GlyphRegistry::new();
+        let slot = empty_device_control_slot();
+
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DisplayGlyph {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+                pattern: "*".into(),
+                brightness: None,
+                timeout_ms: None,
+                transition: None,
+            },
+        )
+        .await;
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DeviceConnect {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+            },
+        )
+        .await;
+        apply_inbound_frame(
+            &engine,
+            &glyphs,
+            &slot,
+            ServerToEdge::DeviceDisconnect {
+                device_type: "nuimo".into(),
+                device_id: "nuimo-1".into(),
+            },
+        )
+        .await;
     }
 
     #[test]
