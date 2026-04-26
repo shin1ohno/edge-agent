@@ -12,7 +12,9 @@ uniffi::setup_scaffolding!();
 mod adapter_ios_media;
 mod edge_client;
 mod ui_client;
-pub use adapter_ios_media::{IosMediaCallback, IosMediaError, IosMediaIntent};
+pub use adapter_ios_media::{
+    IosMediaCallback, IosMediaError, IosMediaIntent, NowPlayingInfo, PlaybackState,
+};
 pub use edge_client::{EdgeClient, EdgeEventSink};
 pub use ui_client::{UiClient, UiEventSink};
 

@@ -26,6 +26,9 @@ final class EdgeClientHost {
     /// here (not on the Rust side) because UniFFI callbacks need a Swift
     /// owner that outlives them.
     private let iosMediaDispatcher = IosMediaDispatcher()
+    /// Observes Apple Music Now Playing and forwards snapshots to
+    /// weave-server. Lazily initialised on first `connect`.
+    private var nowPlayingObserver: NowPlayingObserver?
     private(set) var activeURL: String?
     private(set) var activeEdgeID: String?
 
@@ -57,6 +60,9 @@ final class EdgeClientHost {
             self.activeEdgeID = edgeID
             self.lastError = nil
             client.registerIosMediaCallback(callback: self.iosMediaDispatcher)
+            let observer = self.nowPlayingObserver ?? NowPlayingObserver(edgeHost: self)
+            self.nowPlayingObserver = observer
+            observer.start()
             edgeLogger.info("EdgeClient connect requested: edgeID=\(edgeID, privacy: .public) url=\(serverURL, privacy: .public)")
         } catch {
             lastError = String(describing: error)
@@ -65,6 +71,7 @@ final class EdgeClientHost {
     }
 
     func disconnect() async {
+        nowPlayingObserver?.stop()
         if let client = self.client {
             await client.shutdown()
         }
@@ -73,6 +80,13 @@ final class EdgeClientHost {
         self.activeURL = nil
         self.activeEdgeID = nil
         self.connected = false
+    }
+
+    /// Forward a NowPlayingInfo snapshot to weave-server. No-op when not
+    /// connected; throws on outbox failures so the observer can log.
+    func publishNowPlayingSnapshot(info: NowPlayingInfo) async throws {
+        guard let client = self.client else { return }
+        try await client.publishNowPlaying(info: info)
     }
 
     /// Publish `nuimo / <id> / connected = true|false`. No-op if no client.
