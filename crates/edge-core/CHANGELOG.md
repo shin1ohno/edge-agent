@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.12.0...edge-core-v0.12.1) - 2026-04-27
+
+### Other
+
+- detect cycle gesture in iOS Nuimo route path (try_cycle_switch) ([#74](https://github.com/shin1ohno/edge-agent/pull/74))
+
 ## [0.12.0](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.11.0...edge-core-v0.12.0) - 2026-04-27
 
 ### Other
