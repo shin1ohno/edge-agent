@@ -86,6 +86,22 @@ pub enum ServerToEdge {
         #[serde(skip_serializing_if = "Option::is_none")]
         output_id: Option<String>,
     },
+    /// Incremental cycle change for one device. Sent to the edge that owns
+    /// the device whenever the server applies a cycle CRUD operation.
+    /// `op == Delete` removes the cycle on the edge (mappings revert to the
+    /// no-cycle "fire all matching" behavior).
+    DeviceCyclePatch { cycle: DeviceCycle, op: PatchOp },
+    /// Server-initiated active-connection switch for a device's cycle. The
+    /// receiving edge updates its local cycle snapshot and routes input
+    /// only through `active_mapping_id` going forward (until the next
+    /// switch). Originates from a REST `POST .../cycle/switch`, an
+    /// `EdgeToServer::SwitchActiveConnection` from a peer edge that
+    /// observed the cycle gesture, or an automatic advance.
+    SwitchActiveConnection {
+        device_type: String,
+        device_id: String,
+        active_mapping_id: Uuid,
+    },
     /// Periodic keepalive to keep NAT/proxies open and detect half-open TCP.
     Ping,
 }
@@ -187,6 +203,17 @@ pub enum EdgeToServer {
         #[serde(skip_serializing_if = "Option::is_none")]
         output_id: Option<String>,
     },
+    /// The edge advanced its local cycle (typically via `cycle_gesture`
+    /// firing on the device) and asks the server to persist the new
+    /// active. Server applies the change, broadcasts
+    /// `UiFrame::DeviceCycleChanged` to web UIs, and echoes
+    /// `ServerToEdge::SwitchActiveConnection` to other edges that observe
+    /// the same device so they stay in sync.
+    SwitchActiveConnection {
+        device_type: String,
+        device_id: String,
+        active_mapping_id: Uuid,
+    },
 }
 
 /// Outcome of an `EdgeToServer::Command`.
@@ -224,6 +251,12 @@ pub struct EdgeConfig {
     /// the consumer (e.g. `volume_bar` scales with percentage).
     #[serde(default)]
     pub glyphs: Vec<Glyph>,
+    /// Device-level cycle rows for this edge's devices. Empty when no
+    /// device under this edge has an active cycle. Older edge-agents
+    /// receiving this field as unknown deserialize an empty vec via the
+    /// default annotation.
+    #[serde(default)]
+    pub device_cycles: Vec<DeviceCycle>,
 }
 
 /// A named Nuimo LED glyph. `pattern` is a 9x9 ASCII grid compatible with
@@ -314,6 +347,15 @@ pub enum UiFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         latency_ms: Option<u32>,
     },
+    /// Device-cycle CRUD broadcast. UIs replace their copy. `cycle` is
+    /// `None` when `op == Delete` (the cycle row was removed and the
+    /// device's mappings revert to the all-fire default).
+    DeviceCycleChanged {
+        device_type: String,
+        device_id: String,
+        op: PatchOp,
+        cycle: Option<DeviceCycle>,
+    },
 }
 
 /// Initial full state sent on `/ws/ui` connect. Subsequent changes arrive
@@ -325,6 +367,11 @@ pub struct UiSnapshot {
     pub device_states: Vec<DeviceStateEntry>,
     pub mappings: Vec<Mapping>,
     pub glyphs: Vec<Glyph>,
+    /// All device cycles known to the server. Empty when no device has
+    /// a cycle. `#[serde(default)]` so older clients without the field
+    /// deserialize as an empty vec.
+    #[serde(default)]
+    pub device_cycles: Vec<DeviceCycle>,
 }
 
 /// Identity + status for one connected (or previously-seen) edge.
@@ -444,6 +491,35 @@ impl Mapping {
     }
 }
 
+/// Device-level Connection cycle. When a row exists for `(device_type,
+/// device_id)`, only the mapping identified by `active_mapping_id` routes
+/// input for that device — the other mappings in `mapping_ids` sit dormant
+/// until cycled in. Mappings outside the cycle (i.e. not in `mapping_ids`)
+/// are unaffected and continue to fire normally.
+///
+/// `cycle_gesture`, if set, is the input primitive that advances the active
+/// pointer to the next entry in `mapping_ids` order. Both edge and server
+/// emit `SwitchActiveConnection` to keep state in sync; the receiver applies
+/// the change idempotently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCycle {
+    pub device_type: String,
+    pub device_id: String,
+    /// Mappings to rotate through, in cycle order. The cycle gesture
+    /// advances active to the next entry, wrapping at the end.
+    pub mapping_ids: Vec<Uuid>,
+    /// Currently-active mapping (must be one of `mapping_ids`). `None`
+    /// when the cycle is empty (transient — the server normally clears
+    /// the cycle row in that case).
+    #[serde(default)]
+    pub active_mapping_id: Option<Uuid>,
+    /// Snake-case `InputType` name (e.g. `"swipe_up"`, `"long_press"`)
+    /// that advances active. `None` = the cycle exists but only switches
+    /// via API; no on-device gesture binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_gesture: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -496,6 +572,7 @@ mod tests {
                     pattern: "    *    \n     **  ".into(),
                     builtin: false,
                 }],
+                device_cycles: vec![],
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -766,5 +843,157 @@ mod tests {
         };
         let json2 = serde_json::to_string(&msg2).unwrap();
         assert!(!json2.contains("output_id"));
+    }
+
+    #[test]
+    fn device_cycle_roundtrip() {
+        let m1 = Uuid::new_v4();
+        let m2 = Uuid::new_v4();
+        let cycle = DeviceCycle {
+            device_type: "nuimo".into(),
+            device_id: "C3:81:DF:4E:FF:6A".into(),
+            mapping_ids: vec![m1, m2],
+            active_mapping_id: Some(m1),
+            cycle_gesture: Some("swipe_up".into()),
+        };
+        let json = serde_json::to_string(&cycle).unwrap();
+        assert!(json.contains("\"device_type\":\"nuimo\""));
+        assert!(json.contains("\"cycle_gesture\":\"swipe_up\""));
+        let parsed: DeviceCycle = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cycle);
+
+        // Optional cycle_gesture elided when None.
+        let no_gesture = DeviceCycle {
+            cycle_gesture: None,
+            ..cycle.clone()
+        };
+        let json = serde_json::to_string(&no_gesture).unwrap();
+        assert!(!json.contains("cycle_gesture"));
+    }
+
+    #[test]
+    fn server_to_edge_device_cycle_patch_roundtrip() {
+        let m1 = Uuid::new_v4();
+        let msg = ServerToEdge::DeviceCyclePatch {
+            cycle: DeviceCycle {
+                device_type: "nuimo".into(),
+                device_id: "dev-1".into(),
+                mapping_ids: vec![m1],
+                active_mapping_id: Some(m1),
+                cycle_gesture: Some("swipe_up".into()),
+            },
+            op: PatchOp::Upsert,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"device_cycle_patch\""));
+        assert!(json.contains("\"op\":\"upsert\""));
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::DeviceCyclePatch { cycle, op } => {
+                assert_eq!(cycle.device_type, "nuimo");
+                assert!(matches!(op, PatchOp::Upsert));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_to_edge_switch_active_connection_roundtrip() {
+        let m1 = Uuid::new_v4();
+        let msg = ServerToEdge::SwitchActiveConnection {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            active_mapping_id: m1,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"switch_active_connection\""));
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::SwitchActiveConnection {
+                device_type,
+                device_id,
+                active_mapping_id,
+            } => {
+                assert_eq!(device_type, "nuimo");
+                assert_eq!(device_id, "dev-1");
+                assert_eq!(active_mapping_id, m1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn edge_to_server_switch_active_connection_roundtrip() {
+        let m1 = Uuid::new_v4();
+        let msg = EdgeToServer::SwitchActiveConnection {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            active_mapping_id: m1,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"switch_active_connection\""));
+        let parsed: EdgeToServer = serde_json::from_str(&json).unwrap();
+        match parsed {
+            EdgeToServer::SwitchActiveConnection {
+                active_mapping_id, ..
+            } => assert_eq!(active_mapping_id, m1),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ui_frame_device_cycle_changed_roundtrip() {
+        let m1 = Uuid::new_v4();
+        let upsert = UiFrame::DeviceCycleChanged {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            op: PatchOp::Upsert,
+            cycle: Some(DeviceCycle {
+                device_type: "nuimo".into(),
+                device_id: "dev-1".into(),
+                mapping_ids: vec![m1],
+                active_mapping_id: Some(m1),
+                cycle_gesture: Some("swipe_up".into()),
+            }),
+        };
+        let json = serde_json::to_string(&upsert).unwrap();
+        assert!(json.contains("\"type\":\"device_cycle_changed\""));
+        assert!(json.contains("\"op\":\"upsert\""));
+        let _: UiFrame = serde_json::from_str(&json).unwrap();
+
+        let delete = UiFrame::DeviceCycleChanged {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            op: PatchOp::Delete,
+            cycle: None,
+        };
+        let json = serde_json::to_string(&delete).unwrap();
+        assert!(json.contains("\"op\":\"delete\""));
+        assert!(json.contains("\"cycle\":null"));
+    }
+
+    #[test]
+    fn ui_snapshot_device_cycles_default_empty() {
+        // Older server payloads without the device_cycles field still parse.
+        let json = r#"{
+            "edges": [],
+            "service_states": [],
+            "device_states": [],
+            "mappings": [],
+            "glyphs": []
+        }"#;
+        let snap: UiSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.device_cycles.is_empty());
+    }
+
+    #[test]
+    fn edge_config_device_cycles_default_empty() {
+        // Older ConfigFull payloads without device_cycles still parse.
+        let json = r#"{
+            "edge_id": "air",
+            "mappings": []
+        }"#;
+        let cfg: EdgeConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.device_cycles.is_empty());
     }
 }

@@ -833,6 +833,28 @@ async fn apply_inbound_frame(
             // Caller handles Pong reply directly to keep the WS handle scoped.
             unreachable!("apply_inbound_frame must not be called with Ping");
         }
+        ServerToEdge::DeviceCyclePatch { cycle, op } => {
+            // Schema-only support: parsing succeeds, but local active
+            // filtering ships in the iOS edge runtime PR.
+            tracing::debug!(
+                device_type = %cycle.device_type,
+                device_id = %cycle.device_id,
+                op = ?op,
+                "device_cycle_patch received (no-op until iOS active filtering ships)"
+            );
+        }
+        ServerToEdge::SwitchActiveConnection {
+            device_type,
+            device_id,
+            active_mapping_id,
+        } => {
+            tracing::debug!(
+                %device_type,
+                %device_id,
+                %active_mapping_id,
+                "switch_active_connection received (no-op until iOS active filtering ships)"
+            );
+        }
     }
 }
 
@@ -963,6 +985,7 @@ mod tests {
             edge_id: "ipad".into(),
             mappings: vec![mapping.clone()],
             glyphs: vec![],
+            device_cycles: vec![],
         };
 
         apply_inbound_frame(
@@ -992,6 +1015,7 @@ mod tests {
             edge_id: "ipad".into(),
             mappings: vec![],
             glyphs: vec![],
+            device_cycles: vec![],
         };
         apply_inbound_frame(
             &engine,
