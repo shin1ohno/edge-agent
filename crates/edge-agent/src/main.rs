@@ -846,6 +846,23 @@ async fn run_nuimo_event_loop(
                     RouteOutcome::CancelSelection { mapping_id } => {
                         tracing::info!(%mapping_id, "target selection: cancelled");
                     }
+                    RouteOutcome::CycleSwitch {
+                        device_type: dt,
+                        device_id: did,
+                        active_mapping_id,
+                    } => {
+                        tracing::info!(
+                            %dt, %did, %active_mapping_id,
+                            "cycle gesture: advancing active connection"
+                        );
+                        let _ = ws_outbox
+                            .send(EdgeToServer::SwitchActiveConnection {
+                                device_type: dt,
+                                device_id: did,
+                                active_mapping_id,
+                            })
+                            .await;
+                    }
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1082,10 +1099,28 @@ async fn run_hue_tap_dial_loop(
                             }
                         }
                     }
-                    // Tap Dial does not participate in target-selection
-                    // mode (no LED, no long-press semantic). Log and
-                    // ignore so a stray mapping config never wedges the
-                    // pump.
+                    RouteOutcome::CycleSwitch {
+                        device_type: dt,
+                        device_id: did,
+                        active_mapping_id,
+                    } => {
+                        tracing::info!(
+                            %dt, %did, %active_mapping_id,
+                            "tap dial cycle gesture: advancing active connection"
+                        );
+                        let _ = ws_outbox
+                            .send(EdgeToServer::SwitchActiveConnection {
+                                device_type: dt,
+                                device_id: did,
+                                active_mapping_id,
+                            })
+                            .await;
+                    }
+                    // Tap Dial does not participate in legacy target-
+                    // selection mode (no LED, no long-press semantic).
+                    // Log and ignore the EnterSelection / UpdateSelection
+                    // / CommitSelection / CancelSelection family so a
+                    // stray mapping config never wedges the pump.
                     other => {
                         tracing::debug!(?other, "tap dial selection-mode outcome ignored",);
                     }
