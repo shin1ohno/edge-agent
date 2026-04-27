@@ -66,3 +66,8 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1,2"       # iPhone + iPad
         SUPPORTS_MACCATALYST: "NO"
+        # CLI builds (xcodebuild) cannot resolve the team from interactive
+        # Xcode preferences — they need it explicit. Set here so neo /
+        # any non-Xcode-running Mac can codesign without per-invocation
+        # `DEVELOPMENT_TEAM=<id>` flags. See ios-build.md.
+        DEVELOPMENT_TEAM: AL9567565U
