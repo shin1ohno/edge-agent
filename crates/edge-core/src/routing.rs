@@ -250,6 +250,39 @@ impl RoutingEngine {
         self.cycles.read().await.values().cloned().collect()
     }
 
+    /// If `input` matches the cycle gesture for the device's `DeviceCycle`,
+    /// advance `active_mapping_id` to the next entry locally and return
+    /// the new active id. Otherwise return `None` and leave state untouched.
+    ///
+    /// Callers (Nuimo / Tap Dial event loops on every platform) should
+    /// invoke this BEFORE `route()`. When it returns `Some(id)`, skip the
+    /// normal routing dispatch and instead emit
+    /// `EdgeToServer::SwitchActiveConnection { ..., active_mapping_id: id }`
+    /// so the server can persist + broadcast. This keeps cycle-gesture
+    /// detection at the engine layer (already correct) while leaving
+    /// callers free to use either `route()` or `route_with_mode()` for
+    /// non-gesture inputs.
+    pub async fn try_cycle_switch(
+        &self,
+        device_type: &str,
+        device_id: &str,
+        input: &InputPrimitive,
+    ) -> Option<Uuid> {
+        let key = (device_type.to_string(), device_id.to_string());
+        let cycle = self.cycles.read().await.get(&key).cloned()?;
+        let gesture = cycle.cycle_gesture.as_deref()?;
+        if !input.matches_route(gesture) {
+            return None;
+        }
+        let next = next_active(&cycle)?;
+        self.cycles
+            .write()
+            .await
+            .entry(key)
+            .and_modify(|c| c.active_mapping_id = Some(next));
+        Some(next)
+    }
+
     /// Fetch a cycle by device key, if any.
     pub async fn cycle_for(&self, device_type: &str, device_id: &str) -> Option<DeviceCycle> {
         let key = (device_type.to_string(), device_id.to_string());
