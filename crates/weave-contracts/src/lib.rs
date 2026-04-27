@@ -102,6 +102,24 @@ pub enum ServerToEdge {
         device_id: String,
         active_mapping_id: Uuid,
     },
+    /// Echo of a service state update originally published by another
+    /// edge. weave-server fans out `EdgeToServer::State` to every other
+    /// connected edge so locally-mapped Nuimos can render LED feedback
+    /// for services the edge itself doesn't dispatch (cross-edge
+    /// scenario: iPad maps Nuimo → Roon, but Roon adapter lives on a
+    /// peer edge). Receiver feeds this directly into its local feedback
+    /// pump as a `StateUpdate`. The `edge_id` carries the originating
+    /// edge so receivers can ignore loop-backs (server already filters
+    /// the source out, but the field is useful for diagnostics).
+    ServiceState {
+        edge_id: String,
+        service_type: String,
+        target: String,
+        property: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+        value: serde_json::Value,
+    },
     /// Periodic keepalive to keep NAT/proxies open and detect half-open TCP.
     Ping,
 }
@@ -939,6 +957,53 @@ mod tests {
             } => assert_eq!(active_mapping_id, m1),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn server_to_edge_service_state_roundtrip() {
+        let msg = ServerToEdge::ServiceState {
+            edge_id: "pro".into(),
+            service_type: "roon".into(),
+            target: "zone-living".into(),
+            property: "volume".into(),
+            output_id: Some("output-1".into()),
+            value: serde_json::json!(47),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"service_state\""));
+        assert!(json.contains("\"edge_id\":\"pro\""));
+        assert!(json.contains("\"output_id\":\"output-1\""));
+        let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerToEdge::ServiceState {
+                edge_id,
+                service_type,
+                target,
+                property,
+                output_id,
+                value,
+            } => {
+                assert_eq!(edge_id, "pro");
+                assert_eq!(service_type, "roon");
+                assert_eq!(target, "zone-living");
+                assert_eq!(property, "volume");
+                assert_eq!(output_id.as_deref(), Some("output-1"));
+                assert_eq!(value, serde_json::json!(47));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // output_id elided when None.
+        let no_output = ServerToEdge::ServiceState {
+            edge_id: "pro".into(),
+            service_type: "roon".into(),
+            target: "z".into(),
+            property: "playback".into(),
+            output_id: None,
+            value: serde_json::json!("playing"),
+        };
+        let json = serde_json::to_string(&no_output).unwrap();
+        assert!(!json.contains("output_id"));
     }
 
     #[test]
