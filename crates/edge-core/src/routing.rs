@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use weave_contracts::{FeedbackRule, Mapping, Route, TargetCandidate};
+use weave_contracts::{DeviceCycle, FeedbackRule, Mapping, Route, TargetCandidate};
 
 use super::intent::{InputPrimitive, Intent};
 
@@ -122,6 +122,15 @@ pub enum RouteOutcome {
     CancelSelection {
         mapping_id: Uuid,
     },
+    /// Cycle gesture matched on a device with a DeviceCycle. Caller updates
+    /// active locally (the engine has already done so) and sends
+    /// `EdgeToServer::SwitchActiveConnection` so the server can persist
+    /// and broadcast to peer edges + the web UI.
+    CycleSwitch {
+        device_type: String,
+        device_id: String,
+        active_mapping_id: Uuid,
+    },
 }
 
 /// Thread-safe registry of currently-active mappings, keyed by
@@ -130,6 +139,13 @@ pub enum RouteOutcome {
 pub struct RoutingEngine {
     by_device: RwLock<HashMap<(String, String), Vec<Mapping>>>,
     selection: RwLock<HashMap<(String, String), SelectionMode>>,
+    /// Device-level cycles. When present for `(device_type, device_id)`,
+    /// `route()` filters mappings to the cycle's `active_mapping_id`
+    /// (other cycle members + non-cycle mappings on that device sit
+    /// dormant), and inputs matching `cycle_gesture` short-circuit to a
+    /// `CycleSwitch` outcome that advances active locally and asks the
+    /// caller to inform the server.
+    cycles: RwLock<HashMap<(String, String), DeviceCycle>>,
 }
 
 impl RoutingEngine {
@@ -185,6 +201,59 @@ impl RoutingEngine {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Replace all device cycles. Used on `config_full` push.
+    pub async fn replace_cycles(&self, cycles: Vec<DeviceCycle>) {
+        let mut map: HashMap<(String, String), DeviceCycle> = HashMap::new();
+        for c in cycles {
+            map.insert((c.device_type.clone(), c.device_id.clone()), c);
+        }
+        *self.cycles.write().await = map;
+    }
+
+    /// Insert or replace a device cycle. Used on `device_cycle_patch` upsert.
+    pub async fn upsert_cycle(&self, cycle: DeviceCycle) {
+        let key = (cycle.device_type.clone(), cycle.device_id.clone());
+        self.cycles.write().await.insert(key, cycle);
+    }
+
+    /// Remove a device's cycle. Used on `device_cycle_patch` delete.
+    pub async fn remove_cycle(&self, device_type: &str, device_id: &str) -> bool {
+        let key = (device_type.to_string(), device_id.to_string());
+        self.cycles.write().await.remove(&key).is_some()
+    }
+
+    /// Update only the active mapping ID for an existing cycle. Returns
+    /// false if no cycle exists or `active_mapping_id` is not in the
+    /// cycle's `mapping_ids` list.
+    pub async fn set_cycle_active(
+        &self,
+        device_type: &str,
+        device_id: &str,
+        active_mapping_id: Uuid,
+    ) -> bool {
+        let key = (device_type.to_string(), device_id.to_string());
+        let mut cycles = self.cycles.write().await;
+        let Some(cycle) = cycles.get_mut(&key) else {
+            return false;
+        };
+        if !cycle.mapping_ids.contains(&active_mapping_id) {
+            return false;
+        }
+        cycle.active_mapping_id = Some(active_mapping_id);
+        true
+    }
+
+    /// Snapshot every cycle. Used to persist the local cache.
+    pub async fn cycles_snapshot(&self) -> Vec<DeviceCycle> {
+        self.cycles.read().await.values().cloned().collect()
+    }
+
+    /// Fetch a cycle by device key, if any.
+    pub async fn cycle_for(&self, device_type: &str, device_id: &str) -> Option<DeviceCycle> {
+        let key = (device_type.to_string(), device_id.to_string());
+        self.cycles.read().await.get(&key).cloned()
     }
 
     /// Feedback rules attached to whichever mapping covers the given
@@ -255,23 +324,35 @@ impl RoutingEngine {
 
     /// Apply the given input primitive from a specific device, returning every
     /// intent it produces across all matching mappings.
+    ///
+    /// When the device has a `DeviceCycle`, only the mapping identified
+    /// by `active_mapping_id` is eligible — non-active members and
+    /// non-member mappings on the same device sit dormant. Cycle-gesture
+    /// inputs are NOT short-circuited here (they would silently dispatch
+    /// nothing); use `route_with_mode` to surface a `CycleSwitch` outcome.
     pub async fn route(
         &self,
         device_type: &str,
         device_id: &str,
         input: &InputPrimitive,
     ) -> Vec<RoutedIntent> {
+        let key = (device_type.to_string(), device_id.to_string());
+        let cycle = self.cycles.read().await.get(&key).cloned();
         let guard = self.by_device.read().await;
-        let Some(mappings) = guard.get(&(device_type.to_string(), device_id.to_string())) else {
+        let Some(mappings) = guard.get(&key) else {
             return Vec::new();
         };
-        route_mappings(mappings, input)
+        let active_filter = active_filter_from_cycle(cycle.as_ref());
+        route_mappings(mappings, input, active_filter)
     }
 
-    /// Same dispatch as `route`, but also implements the target-selection
-    /// state machine (`Mapping.target_switch_on` + `target_candidates`).
-    /// Callers that want on-device target switching should use this
-    /// instead of `route`.
+    /// Same dispatch as `route`, but also implements:
+    /// - the device-level Cycle: cycle-gesture inputs short-circuit to a
+    ///   `CycleSwitch` outcome (active is advanced locally; caller relays
+    ///   to server). When a cycle exists, only the active mapping fires.
+    /// - the legacy `target_switch_on` + `target_candidates` selection
+    ///   mode for backward compat — only consulted when no cycle exists
+    ///   for the device.
     pub async fn route_with_mode(
         &self,
         device_type: &str,
@@ -279,6 +360,50 @@ impl RoutingEngine {
         input: &InputPrimitive,
     ) -> RouteOutcome {
         let key = (device_type.to_string(), device_id.to_string());
+
+        // Cycle path: takes precedence over legacy selection mode.
+        // If the input matches `cycle_gesture`, advance active locally
+        // and return a CycleSwitch outcome. Otherwise apply the active
+        // filter to mapping routing.
+        {
+            let cycles = self.cycles.read().await;
+            if let Some(cycle) = cycles.get(&key).cloned() {
+                drop(cycles);
+                if let Some(gesture) = cycle.cycle_gesture.as_deref() {
+                    if input.matches_route(gesture) {
+                        // Compute next active without holding the read
+                        // lock through the write.
+                        let next = next_active(&cycle);
+                        if let Some(next_id) = next {
+                            // Advance local state; engine is the source
+                            // of truth until server confirms.
+                            self.cycles
+                                .write()
+                                .await
+                                .entry(key.clone())
+                                .and_modify(|c| {
+                                    c.active_mapping_id = Some(next_id);
+                                });
+                            return RouteOutcome::CycleSwitch {
+                                device_type: device_type.to_string(),
+                                device_id: device_id.to_string(),
+                                active_mapping_id: next_id,
+                            };
+                        }
+                    }
+                }
+                // Non-cycle-gesture input on a cycled device: filter
+                // to the active mapping and route normally. Skip the
+                // legacy selection-mode path entirely — devices on
+                // the cycle model don't enter selection mode.
+                let active_filter = active_filter_from_cycle(Some(&cycle));
+                let guard = self.by_device.read().await;
+                let Some(mappings) = guard.get(&key) else {
+                    return RouteOutcome::Normal(Vec::new());
+                };
+                return RouteOutcome::Normal(route_mappings(mappings, input, active_filter));
+            }
+        }
 
         // Already in selection mode for this device: intercept rotate /
         // press / cancel before dispatching to normal routing.
@@ -367,8 +492,29 @@ impl RoutingEngine {
             };
         }
 
-        RouteOutcome::Normal(route_mappings(mappings, input))
+        RouteOutcome::Normal(route_mappings(mappings, input, None))
     }
+}
+
+/// Compute the next active mapping ID in the cycle order. Returns `None`
+/// when the cycle is empty or its current `active_mapping_id` does not
+/// match any entry (caller may want to reset to head, but this helper
+/// stays conservative).
+fn next_active(cycle: &DeviceCycle) -> Option<Uuid> {
+    if cycle.mapping_ids.is_empty() {
+        return None;
+    }
+    let active = cycle.active_mapping_id?;
+    let pos = cycle.mapping_ids.iter().position(|id| *id == active)?;
+    let next = (pos + 1) % cycle.mapping_ids.len();
+    Some(cycle.mapping_ids[next])
+}
+
+/// Extract the active filter UUID from a cycle if one exists. `None`
+/// means "no cycle — all matching mappings fire" (preserves backward
+/// compatibility for devices without a cycle).
+fn active_filter_from_cycle(cycle: Option<&DeviceCycle>) -> Option<Uuid> {
+    cycle.and_then(|c| c.active_mapping_id)
 }
 
 /// Look for a mapping in `list` whose primary `(service_type, target)` or
@@ -394,11 +540,24 @@ fn mapping_rules_for_target(
     None
 }
 
-fn route_mappings(mappings: &[Mapping], input: &InputPrimitive) -> Vec<RoutedIntent> {
+fn route_mappings(
+    mappings: &[Mapping],
+    input: &InputPrimitive,
+    active_filter: Option<Uuid>,
+) -> Vec<RoutedIntent> {
     let mut out = Vec::new();
     for m in mappings {
         if !m.active {
             continue;
+        }
+        // When a cycle is in effect, only the active mapping fires.
+        // Other cycle members + non-cycle mappings on this device are
+        // skipped. (The cycle's mapping_ids list is enforced on the
+        // active_filter side — only the active id will pass through.)
+        if let Some(active_id) = active_filter {
+            if m.mapping_id != active_id {
+                continue;
+            }
         }
         // Resolve the effective service_type + routes for the currently
         // active target. When the active target is a cross-service

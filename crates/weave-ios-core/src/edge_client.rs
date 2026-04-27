@@ -700,9 +700,16 @@ async fn apply_inbound_frame(
         ServerToEdge::ConfigFull { config } => {
             let mapping_count = config.mappings.len();
             let glyph_count = config.glyphs.len();
+            let cycle_count = config.device_cycles.len();
             engine.replace_all(config.mappings).await;
+            engine.replace_cycles(config.device_cycles).await;
             glyphs.replace_all(config.glyphs).await;
-            tracing::info!(mapping_count, glyph_count, "ws/edge: config_full applied");
+            tracing::info!(
+                mapping_count,
+                glyph_count,
+                cycle_count,
+                "ws/edge: config_full applied"
+            );
         }
         ServerToEdge::ConfigPatch {
             mapping_id,
@@ -833,27 +840,48 @@ async fn apply_inbound_frame(
             // Caller handles Pong reply directly to keep the WS handle scoped.
             unreachable!("apply_inbound_frame must not be called with Ping");
         }
-        ServerToEdge::DeviceCyclePatch { cycle, op } => {
-            // Schema-only support: parsing succeeds, but local active
-            // filtering ships in the iOS edge runtime PR.
-            tracing::debug!(
-                device_type = %cycle.device_type,
-                device_id = %cycle.device_id,
-                op = ?op,
-                "device_cycle_patch received (no-op until iOS active filtering ships)"
-            );
-        }
+        ServerToEdge::DeviceCyclePatch { cycle, op } => match op {
+            weave_contracts::PatchOp::Upsert => {
+                tracing::info!(
+                    device_type = %cycle.device_type,
+                    device_id = %cycle.device_id,
+                    active = ?cycle.active_mapping_id,
+                    gesture = ?cycle.cycle_gesture,
+                    "device_cycle_patch upsert (iOS)"
+                );
+                engine.upsert_cycle(cycle).await;
+            }
+            weave_contracts::PatchOp::Delete => {
+                tracing::info!(
+                    device_type = %cycle.device_type,
+                    device_id = %cycle.device_id,
+                    "device_cycle_patch delete (iOS)"
+                );
+                engine
+                    .remove_cycle(&cycle.device_type, &cycle.device_id)
+                    .await;
+            }
+        },
         ServerToEdge::SwitchActiveConnection {
             device_type,
             device_id,
             active_mapping_id,
         } => {
-            tracing::debug!(
+            tracing::info!(
                 %device_type,
                 %device_id,
                 %active_mapping_id,
-                "switch_active_connection received (no-op until iOS active filtering ships)"
+                "switch_active_connection from server (iOS)"
             );
+            let applied = engine
+                .set_cycle_active(&device_type, &device_id, active_mapping_id)
+                .await;
+            if !applied {
+                tracing::warn!(
+                    %device_type, %device_id, %active_mapping_id,
+                    "switch_active_connection: cycle missing or active not in mapping_ids — ignoring"
+                );
+            }
         }
     }
 }
