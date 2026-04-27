@@ -375,6 +375,30 @@ impl WsClient {
                 // fire-and-forget.
                 let _ = self.outbox_tx.try_send(EdgeToServer::Pong);
             }
+            ServerToEdge::DeviceCyclePatch { cycle, op } => {
+                // Schema-only support in this version: the wire frame parses,
+                // but local active-filtering is implemented in a follow-up
+                // (edge-agent runtime PR). Log so a missed cycle update is
+                // diagnosable.
+                tracing::debug!(
+                    device_type = %cycle.device_type,
+                    device_id = %cycle.device_id,
+                    op = ?op,
+                    "device_cycle_patch received (no-op until active filtering ships)"
+                );
+            }
+            ServerToEdge::SwitchActiveConnection {
+                device_type,
+                device_id,
+                active_mapping_id,
+            } => {
+                tracing::debug!(
+                    %device_type,
+                    %device_id,
+                    %active_mapping_id,
+                    "switch_active_connection received (no-op until active filtering ships)"
+                );
+            }
         }
         Ok(())
     }
@@ -401,6 +425,7 @@ impl WsClient {
             edge_id,
             mappings,
             glyphs,
+            device_cycles: Vec::new(),
         };
         if let Err(e) = cache::save(&self.cache_path, &cfg).await {
             tracing::warn!(error = %e, "failed to persist cache after patch");
