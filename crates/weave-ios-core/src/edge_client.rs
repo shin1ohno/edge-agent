@@ -152,6 +152,7 @@ impl EdgeClient {
             engine.clone(),
             glyphs.clone(),
             device_control.clone(),
+            state_tx.clone(),
         ));
 
         // Feedback pump exits when `state_tx` (held below) is dropped —
@@ -499,6 +500,7 @@ async fn run_ws_loop(
     engine: Arc<RoutingEngine>,
     glyphs: Arc<GlyphRegistry>,
     device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
+    state_tx: broadcast::Sender<StateUpdate>,
 ) {
     let mut backoff = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
@@ -663,6 +665,7 @@ async fn run_ws_loop(
                                                         &engine,
                                                         &glyphs,
                                                         &device_control,
+                                                        &state_tx,
                                                         other,
                                                     )
                                                     .await;
@@ -736,6 +739,7 @@ async fn apply_inbound_frame(
     engine: &RoutingEngine,
     glyphs: &GlyphRegistry,
     device_control: &StdMutex<Option<Arc<dyn DeviceControlSink>>>,
+    state_tx: &broadcast::Sender<StateUpdate>,
     frame: ServerToEdge,
 ) {
     match frame {
@@ -925,6 +929,39 @@ async fn apply_inbound_frame(
                 );
             }
         }
+        ServerToEdge::ServiceState {
+            edge_id: source_edge,
+            service_type,
+            target,
+            property,
+            output_id: _,
+            value,
+        } => {
+            // Cross-edge feedback echo: a peer edge published this state
+            // (typically because it executed a forwarded DispatchIntent).
+            // Push it into the local feedback channel so any Nuimo on
+            // this edge with a matching mapping renders LED feedback.
+            // The pump itself filters by mapping ownership — we don't
+            // need to gate here.
+            tracing::debug!(
+                %source_edge,
+                %service_type,
+                %target,
+                %property,
+                "service_state echo from peer edge (iOS)"
+            );
+            if let Err(e) = state_tx.send(StateUpdate {
+                service_type,
+                target,
+                property,
+                value,
+            }) {
+                tracing::trace!(
+                    error = %e,
+                    "service_state echo: no active feedback subscribers"
+                );
+            }
+        }
     }
 }
 
@@ -997,6 +1034,14 @@ mod tests {
         Arc::new(StdMutex::new(None))
     }
 
+    /// State broadcast sink for tests. The pump isn't running in unit
+    /// tests, so the channel just collects (and silently drops on
+    /// receiver-less send) — adequate for verifying the dispatch path
+    /// without exercising LED rendering.
+    fn dummy_state_tx() -> broadcast::Sender<StateUpdate> {
+        broadcast::channel(8).0
+    }
+
     /// `(device_type, device_id, pattern, brightness, timeout_ms, transition)`
     type DisplayGlyphCapture = (
         String,
@@ -1062,6 +1107,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::ConfigFull { config },
         )
         .await;
@@ -1091,6 +1137,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::ConfigFull { config },
         )
         .await;
@@ -1115,6 +1162,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Upsert,
@@ -1141,6 +1189,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::ConfigPatch {
                 mapping_id,
                 op: PatchOp::Delete,
@@ -1167,6 +1216,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::TargetSwitch {
                 mapping_id,
                 service_target: "alt".into(),
@@ -1193,6 +1243,7 @@ mod tests {
             &engine,
             &glyphs,
             &empty_device_control_slot(),
+            &dummy_state_tx(),
             ServerToEdge::TargetSwitch {
                 mapping_id: Uuid::new_v4(),
                 service_target: "phantom".into(),
@@ -1219,6 +1270,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DisplayGlyph {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),
@@ -1255,6 +1307,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DeviceConnect {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),
@@ -1280,6 +1333,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DeviceDisconnect {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),
@@ -1303,6 +1357,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DisplayGlyph {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),
@@ -1317,6 +1372,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DeviceConnect {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),
@@ -1327,6 +1383,7 @@ mod tests {
             &engine,
             &glyphs,
             &slot,
+            &dummy_state_tx(),
             ServerToEdge::DeviceDisconnect {
                 device_type: "nuimo".into(),
                 device_id: "nuimo-1".into(),

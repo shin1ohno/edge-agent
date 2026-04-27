@@ -422,6 +422,28 @@ impl WsClient {
                 }
                 self.refresh_cache().await;
             }
+            ServerToEdge::ServiceState {
+                edge_id: source_edge,
+                service_type,
+                target,
+                property,
+                ..
+            } => {
+                // Cross-edge feedback echo from a peer edge. Linux/Mac
+                // edge-agent's feedback pumps are wired per-adapter
+                // (each adapter publishes into its own broadcast
+                // channel), so plumbing imported state into a feedback
+                // pump here would require a refactor that's out of
+                // scope for the iOS-first echo work. Log for diagnosis;
+                // wire up in a follow-up.
+                tracing::debug!(
+                    %source_edge,
+                    %service_type,
+                    %target,
+                    %property,
+                    "service_state echo from peer edge (Linux/Mac feedback echo deferred)"
+                );
+            }
         }
         Ok(())
     }
