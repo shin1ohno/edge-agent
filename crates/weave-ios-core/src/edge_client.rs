@@ -67,6 +67,14 @@ enum OutboundCommand {
         params: serde_json::Value,
         output_id: Option<String>,
     },
+    /// Local cycle-gesture detection advanced the active mapping.
+    /// Translated into `EdgeToServer::SwitchActiveConnection` so the
+    /// server can persist + broadcast to peer edges + the web UI.
+    SwitchActiveConnection {
+        device_type: String,
+        device_id: String,
+        active_mapping_id: uuid::Uuid,
+    },
 }
 
 #[derive(uniffi::Object)]
@@ -198,6 +206,30 @@ impl EdgeClient {
         let Some(input) = nuimo_event_to_input_primitive(&event) else {
             return; // Battery / non-input events: nothing to route.
         };
+
+        // Cycle-gesture short-circuit: if the device has a DeviceCycle
+        // and the input matches `cycle_gesture`, the engine has already
+        // advanced active locally — relay to the server and skip normal
+        // routing for this input.
+        if let Some(active_mapping_id) = self
+            .engine
+            .try_cycle_switch(&device_type, &device_id, &input)
+            .await
+        {
+            let cmd = OutboundCommand::SwitchActiveConnection {
+                device_type: device_type.clone(),
+                device_id: device_id.clone(),
+                active_mapping_id,
+            };
+            if let Err(e) = self.outbox_tx.send(cmd).await {
+                tracing::warn!(
+                    error = %e,
+                    %device_type, %device_id, %active_mapping_id,
+                    "failed to enqueue switch_active_connection",
+                );
+            }
+            return;
+        }
 
         let routed = self.engine.route(&device_type, &device_id, &input).await;
         if routed.is_empty() {
@@ -600,6 +632,16 @@ async fn run_ws_loop(
                                         } => {
                                             let frame = EdgeToServer::DispatchIntent {
                                                 service_type, service_target, intent, params, output_id,
+                                            };
+                                            if !send_frame(&mut ws, &frame).await {
+                                                break;
+                                            }
+                                        }
+                                        OutboundCommand::SwitchActiveConnection {
+                                            device_type, device_id, active_mapping_id,
+                                        } => {
+                                            let frame = EdgeToServer::SwitchActiveConnection {
+                                                device_type, device_id, active_mapping_id,
                                             };
                                             if !send_frame(&mut ws, &frame).await {
                                                 break;
