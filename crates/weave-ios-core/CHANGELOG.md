@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.12.1...weave-ios-core-v0.13.0) - 2026-04-27
+
+### Other
+
+- weave-contracts + edge-agent: cross-edge service_state echo (iOS) ([#76](https://github.com/shin1ohno/edge-agent/pull/76))
+
 ## [0.12.1](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.12.0...weave-ios-core-v0.12.1) - 2026-04-27
 
 ### Other
