@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.13.0...edge-core-v0.13.1) - 2026-04-28
+
+### Other
+
+- skip inactive mappings in feedback rule resolver ([#78](https://github.com/shin1ohno/edge-agent/pull/78))
+
 ## [0.13.0](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.12.1...edge-core-v0.13.0) - 2026-04-27
 
 ### Other
