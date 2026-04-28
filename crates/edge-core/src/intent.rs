@@ -35,6 +35,15 @@ pub enum InputPrimitive {
     Button {
         id: u8,
     },
+    /// In-air swipe (Nuimo only): the user waves a hand left/right above
+    /// the device without touching the surface. Distinct from `Swipe`
+    /// (which involves physical contact) so route mappings can target
+    /// either independently. Nuimo only emits Left/Right; the enum reuses
+    /// `Direction` for symmetry with `Swipe` rather than introducing a
+    /// new two-variant type.
+    Fly {
+        direction: Direction,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +164,10 @@ impl InputPrimitive {
                 .strip_prefix("button_")
                 .and_then(|n| n.parse::<u8>().ok())
                 .is_some_and(|parsed| parsed == *id),
+            (InputPrimitive::Fly { direction }, s) => matches!(
+                (direction, s),
+                (Direction::Left, "fly_left") | (Direction::Right, "fly_right")
+            ),
             _ => false,
         }
     }
@@ -206,6 +219,55 @@ mod tests {
         assert!(!b.matches_route("button_x"));
         assert!(!b.matches_route("button_3a"));
         assert!(b.matches_route("button_3"));
+    }
+
+    #[test]
+    fn fly_left_matches_only_fly_left_route() {
+        let f = InputPrimitive::Fly {
+            direction: Direction::Left,
+        };
+        assert!(f.matches_route("fly_left"));
+        assert!(!f.matches_route("fly_right"));
+        assert!(!f.matches_route("swipe_left"));
+    }
+
+    #[test]
+    fn fly_right_matches_only_fly_right_route() {
+        let f = InputPrimitive::Fly {
+            direction: Direction::Right,
+        };
+        assert!(f.matches_route("fly_right"));
+        assert!(!f.matches_route("fly_left"));
+        assert!(!f.matches_route("swipe_right"));
+    }
+
+    #[test]
+    fn fly_up_down_directions_do_not_match_any_fly_route() {
+        // Nuimo doesn't emit fly_up / fly_down at the device level —
+        // those codes carry proximity (decoded as `Hover`). If a caller
+        // synthesises `Fly { Up }` / `Fly { Down }`, no route string
+        // matches: the wire vocabulary has no `fly_up` / `fly_down`.
+        for dir in [Direction::Up, Direction::Down] {
+            let f = InputPrimitive::Fly { direction: dir };
+            assert!(!f.matches_route("fly_up"));
+            assert!(!f.matches_route("fly_down"));
+            assert!(!f.matches_route("fly_left"));
+            assert!(!f.matches_route("fly_right"));
+        }
+    }
+
+    #[test]
+    fn fly_does_not_collide_with_swipe_route() {
+        let fly = InputPrimitive::Fly {
+            direction: Direction::Left,
+        };
+        let swipe = InputPrimitive::Swipe {
+            direction: Direction::Left,
+        };
+        assert!(fly.matches_route("fly_left"));
+        assert!(!fly.matches_route("swipe_left"));
+        assert!(swipe.matches_route("swipe_left"));
+        assert!(!swipe.matches_route("fly_left"));
     }
 
     #[test]

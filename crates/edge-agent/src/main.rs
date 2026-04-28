@@ -1557,6 +1557,16 @@ fn input_primitive_json(p: &InputPrimitive) -> Option<serde_json::Value> {
             })
         }),
         InputPrimitive::Button { id } => json!({"input": format!("button_{id}")}),
+        InputPrimitive::Fly { direction } => match direction {
+            edge_core::Direction::Left => json!({"input": "fly_left"}),
+            edge_core::Direction::Right => json!({"input": "fly_right"}),
+            // Nuimo doesn't emit fly_up / fly_down at the device level —
+            // the fly characteristic encodes vertical motion as
+            // proximity (decoded into `Hover` upstream). If a synthetic
+            // Fly { Up | Down } leaks in, drop it rather than coining a
+            // wire vocabulary the route side can't match.
+            edge_core::Direction::Up | edge_core::Direction::Down => return None,
+        },
         InputPrimitive::KeyPress { .. } => return None,
     })
 }
@@ -1573,8 +1583,10 @@ fn input_event_json(event: &NuimoEvent) -> Option<serde_json::Value> {
         NuimoEvent::Rotate { delta, .. } => json!({"input": "rotate", "delta": delta}),
         NuimoEvent::SwipeUp => json!({"input": "swipe_up"}),
         NuimoEvent::SwipeDown => json!({"input": "swipe_down"}),
-        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => json!({"input": "swipe_left"}),
-        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => json!({"input": "swipe_right"}),
+        NuimoEvent::SwipeLeft => json!({"input": "swipe_left"}),
+        NuimoEvent::SwipeRight => json!({"input": "swipe_right"}),
+        NuimoEvent::FlyLeft => json!({"input": "fly_left"}),
+        NuimoEvent::FlyRight => json!({"input": "fly_right"}),
         NuimoEvent::TouchTop => json!({"input": "touch_top"}),
         NuimoEvent::TouchBottom => json!({"input": "touch_bottom"}),
         NuimoEvent::TouchLeft => json!({"input": "touch_left"}),
@@ -1603,10 +1615,16 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
         NuimoEvent::SwipeDown => InputPrimitive::Swipe {
             direction: Direction::Down,
         },
-        NuimoEvent::SwipeLeft | NuimoEvent::FlyLeft => InputPrimitive::Swipe {
+        NuimoEvent::SwipeLeft => InputPrimitive::Swipe {
             direction: Direction::Left,
         },
-        NuimoEvent::SwipeRight | NuimoEvent::FlyRight => InputPrimitive::Swipe {
+        NuimoEvent::SwipeRight => InputPrimitive::Swipe {
+            direction: Direction::Right,
+        },
+        NuimoEvent::FlyLeft => InputPrimitive::Fly {
+            direction: Direction::Left,
+        },
+        NuimoEvent::FlyRight => InputPrimitive::Fly {
             direction: Direction::Right,
         },
         NuimoEvent::TouchTop => InputPrimitive::Touch {
@@ -1994,9 +2012,14 @@ mod tests {
             Some(json!({"input": "swipe_left"})),
         );
         assert_eq!(
+            input_event_json(&NuimoEvent::FlyLeft),
+            Some(json!({"input": "fly_left"})),
+            "FlyLeft is distinct from SwipeLeft on the wire",
+        );
+        assert_eq!(
             input_event_json(&NuimoEvent::FlyRight),
-            Some(json!({"input": "swipe_right"})),
-            "FlyRight collapses onto swipe_right to mirror translate_nuimo_event",
+            Some(json!({"input": "fly_right"})),
+            "FlyRight is distinct from SwipeRight on the wire",
         );
         assert_eq!(
             input_event_json(&NuimoEvent::TouchTop),
