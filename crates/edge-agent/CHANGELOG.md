@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.13.1...edge-agent-v0.14.0) - 2026-04-28
+
+### Other
+
+- split Fly from Swipe to match upstream Nuimo gesture set ([#80](https://github.com/shin1ohno/edge-agent/pull/80))
+
 ## [0.12.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.11.0...edge-agent-v0.12.0) - 2026-04-27
 
 ### Other
