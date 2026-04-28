@@ -554,12 +554,22 @@ fn active_filter_from_cycle(cycle: Option<&DeviceCycle>) -> Option<Uuid> {
 /// any `target_candidates` entry matches the given pair. Returns the
 /// mapping's `feedback` clone on hit. `None` means no mapping covers the
 /// target, letting the caller fall back to defaults.
+///
+/// Inactive mappings are skipped — only the user-selected `active` mapping
+/// for a given (device, service, target) drives feedback. Without this
+/// filter, multiple Roon zones publishing simultaneously (Roon Core fans
+/// state for every observed zone) would each match an inactive Nuimo
+/// mapping and produce competing volume_bar / glyph renders on the same
+/// LED.
 fn mapping_rules_for_target(
     list: &[Mapping],
     service_type: &str,
     target: &str,
 ) -> Option<Vec<FeedbackRule>> {
     for m in list {
+        if !m.active {
+            continue;
+        }
         if m.service_type == service_type && m.service_target == target {
             return Some(m.feedback.clone());
         }
@@ -1114,6 +1124,76 @@ mod tests {
         assert!(
             rules.is_empty(),
             "no explicit rules configured — pump will use FeedbackPlan defaults",
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_rules_for_device_target_skips_inactive_mapping() {
+        // Regression: a Nuimo configured with an active mapping for
+        // roon/zone-1 plus an inactive mapping for roon/zone-2 (the
+        // user explicitly chose zone-1 as the active target). When
+        // Roon Core publishes state for zone-2 simultaneously, the
+        // pump must NOT render feedback for zone-2 — the inactive
+        // mapping is dormant by user choice.
+        let mut active_zone1 = mapping_with_feedback();
+        active_zone1.service_target = "zone-1".into();
+        active_zone1.active = true;
+
+        let mut inactive_zone2 = mapping_with_feedback();
+        inactive_zone2.mapping_id = uuid::Uuid::new_v4();
+        inactive_zone2.service_target = "zone-2".into();
+        inactive_zone2.active = false;
+
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![active_zone1, inactive_zone2]).await;
+
+        let rules_active = engine
+            .feedback_rules_for_device_target("nuimo", "C3:81:DF:4E", "roon", "zone-1")
+            .await;
+        assert!(
+            rules_active.is_some(),
+            "active mapping for zone-1 must still produce rules"
+        );
+
+        let rules_inactive = engine
+            .feedback_rules_for_device_target("nuimo", "C3:81:DF:4E", "roon", "zone-2")
+            .await;
+        assert!(
+            rules_inactive.is_none(),
+            "inactive mapping for zone-2 must NOT produce feedback rules — \
+             dormant by user choice, no LED render",
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_targets_for_skips_inactive_mappings() {
+        // Single Nuimo with two mappings (active roon/zone-1, inactive
+        // roon/zone-2). When state arrives for zone-2, the pump must
+        // not pick up the inactive mapping's rules — otherwise both
+        // zones drive the same LED, alternating volume_bar renders.
+        let mut active_zone1 = mapping_with_feedback();
+        active_zone1.service_target = "zone-1".into();
+        active_zone1.active = true;
+
+        let mut inactive_zone2 = mapping_with_feedback();
+        inactive_zone2.mapping_id = uuid::Uuid::new_v4();
+        inactive_zone2.service_target = "zone-2".into();
+        inactive_zone2.active = false;
+
+        let engine = RoutingEngine::new();
+        engine.replace_all(vec![active_zone1, inactive_zone2]).await;
+
+        let targets_zone1 = engine.feedback_targets_for("roon", "zone-1").await;
+        assert_eq!(
+            targets_zone1.len(),
+            1,
+            "active zone-1 mapping yields one feedback target"
+        );
+
+        let targets_zone2 = engine.feedback_targets_for("roon", "zone-2").await;
+        assert!(
+            targets_zone2.is_empty(),
+            "inactive zone-2 mapping must NOT yield feedback targets"
         );
     }
 }
