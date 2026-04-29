@@ -64,14 +64,27 @@ final class NuimoDevice: NSObject, CBPeripheralDelegate {
         guard let chars = service.characteristics else { return }
 
         let ledUUID = CBUUID(string: ledMatrixUuid())
+        let batteryUUID = CBUUID(string: batteryLevelUuid())
+        var batteryCharacteristic: CBCharacteristic?
 
         for ch in chars {
             if ch.uuid == ledUUID {
                 ledCharacteristic = ch
             }
+            if ch.uuid == batteryUUID {
+                batteryCharacteristic = ch
+            }
             if ch.properties.contains(.notify) {
                 peripheral.setNotifyValue(true, for: ch)
             }
+        }
+
+        // Nuimo's Battery Level characteristic only notifies on level
+        // change. Trigger an explicit read so the first BatteryLevel
+        // event arrives at connect time — mirrors the initial read in
+        // nuimo-rs/.../backend/{macos,linux}.rs.
+        if let batt = batteryCharacteristic {
+            peripheral.readValue(for: batt)
         }
 
         if ledCharacteristic != nil, state != .ready {
