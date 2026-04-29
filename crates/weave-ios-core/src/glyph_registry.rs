@@ -43,6 +43,13 @@ impl GlyphRegistry {
         self.by_name.read().await.get(name).cloned()
     }
 
+    /// Snapshot every entry as a flat `Vec`. Used by the cache layer
+    /// to persist the registry to disk; the order is unspecified
+    /// because `replace_all` keys on `name`.
+    pub async fn snapshot(&self) -> Vec<Glyph> {
+        self.by_name.read().await.values().cloned().collect()
+    }
+
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.by_name.read().await.len()

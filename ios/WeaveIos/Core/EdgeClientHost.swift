@@ -58,6 +58,17 @@ final class EdgeClientHost {
         if activeURL == serverURL, activeEdgeID == edgeID, client != nil { return }
         await disconnect()
 
+        let cacheDirPath: String
+        do {
+            cacheDirPath = try Self.resolveCacheDir().path
+        } catch {
+            lastError = "cache dir resolve failed: \(error)"
+            edgeLogger.error(
+                "EdgeClient connect aborted — cache dir resolve failed: \(String(describing: error), privacy: .public)"
+            )
+            return
+        }
+
         let sink = EdgeClientSink(host: self)
         self.sink = sink
         do {
@@ -65,6 +76,7 @@ final class EdgeClientHost {
                 serverUrl: serverURL,
                 edgeId: edgeID,
                 capabilities: capabilities,
+                cacheDir: cacheDirPath,
                 sink: sink
             )
             self.client = client
@@ -199,6 +211,24 @@ final class EdgeClientHost {
     fileprivate func applyConnection(_ connected: Bool) {
         self.connected = connected
         edgeLogger.info("EdgeClient connection=\(connected ? "up" : "down", privacy: .public)")
+    }
+
+    /// Resolve `Library/Application Support/cache/` for the running app,
+    /// creating intermediate directories as needed. The Rust side mirrors
+    /// `mappings.json` and `glyphs.json` here so a cold start hydrates
+    /// the routing engine + glyph registry before (or without) reaching
+    /// weave-server. Failure aborts connect — same blast radius as a
+    /// failed WS handshake; the user retries.
+    private static func resolveCacheDir() throws -> URL {
+        let support = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let dir = support.appendingPathComponent("cache", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 }
 

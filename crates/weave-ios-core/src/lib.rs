@@ -10,6 +10,7 @@
 uniffi::setup_scaffolding!();
 
 mod adapter_ios_media;
+mod cache;
 mod device_control;
 mod edge_client;
 mod feedback_pump;
