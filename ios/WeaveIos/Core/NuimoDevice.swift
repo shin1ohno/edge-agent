@@ -1,6 +1,9 @@
 @preconcurrency import CoreBluetooth
 import Foundation
 import Observation
+import os
+
+private let nuimoLogger = Logger(subsystem: "com.shin1ohno.weave.WeaveIos", category: "Nuimo")
 
 /// A single paired Nuimo peripheral. Observed by views for connection state
 /// and battery.
@@ -97,8 +100,23 @@ final class NuimoDevice: NSObject, CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        if let error {
+            // Read or notify failures (insufficient permissions, encryption
+            // negotiation in progress, etc.) end up here. Log so the failure
+            // is visible during debugging instead of disappearing into a
+            // silent CoreBluetooth dropout.
+            nuimoLogger.error(
+                "didUpdateValueFor error: char=\(characteristic.uuid.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
         guard let data = characteristic.value else { return }
-        let charUUID = characteristic.uuid.uuidString.lowercased()
+        // `CBUUID.uuidString` returns the short (16/32-bit) form for any
+        // Bluetooth-assigned UUID — Battery Level (0x2A19) lands in
+        // that bucket. The Rust parser expects a canonical 128-bit
+        // string, so expand short-form UUIDs against the Bluetooth Base
+        // UUID before handing them off.
+        let charUUID = characteristic.uuid.canonical128String
 
         do {
             if let event = try parseNuimoNotification(charUuid: charUUID, data: data) {
@@ -116,5 +134,43 @@ final class NuimoDevice: NSObject, CBPeripheralDelegate {
                 print("nuimo parse error for \(charUUID): \(error)")
             }
         }
+    }
+}
+
+extension CBUUID {
+    /// `CBUUID.uuidString` returns the short (16- or 32-bit) form for any
+    /// UUID inside the Bluetooth Base UUID range — Battery Level (`0x2A19`)
+    /// is the canonical example. The Rust parser
+    /// (`weave_ios_core::parse_nuimo_notification`) calls
+    /// `Uuid::parse_str`, which only accepts a full 128-bit form. Expand
+    /// short-form UUIDs against the Bluetooth Base UUID before serializing
+    /// so the assigned-range characteristics survive the FFI hop.
+    fileprivate var canonical128String: String {
+        let bytes = [UInt8](self.data)
+        var full: [UInt8] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+            0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB,
+        ]
+        switch bytes.count {
+        case 16:
+            full = bytes
+        case 4:
+            full[0] = bytes[0]; full[1] = bytes[1]
+            full[2] = bytes[2]; full[3] = bytes[3]
+        case 2:
+            full[2] = bytes[0]; full[3] = bytes[1]
+        default:
+            // Unexpected length — fall through to base UUID, the caller
+            // will fail to match any known characteristic and ignore.
+            break
+        }
+        return String(
+            format: "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            full[0], full[1], full[2], full[3],
+            full[4], full[5],
+            full[6], full[7],
+            full[8], full[9],
+            full[10], full[11], full[12], full[13], full[14], full[15]
+        )
     }
 }
