@@ -224,6 +224,15 @@ pub fn led_matrix_uuid() -> String {
     np::LED_MATRIX.to_string()
 }
 
+/// Return the Battery Level characteristic UUID. iOS NuimoDevice uses it
+/// to issue an explicit read at connect time — Nuimo only notifies on
+/// level change, so without an initial read the first BatteryLevel event
+/// never arrives.
+#[uniffi::export]
+pub fn battery_level_uuid() -> String {
+    np::BATTERY_LEVEL.to_string()
+}
+
 /// Project a `NuimoEvent` into the structured `InputPrimitive` the routing
 /// engine consumes. Returns `None` for events that are not routing inputs
 /// (battery — handled as a separate device-state property).
@@ -364,6 +373,11 @@ mod tests {
     #[test]
     fn service_uuid_matches_gatt_constant() {
         assert_eq!(nuimo_service_uuid(), np::NUIMO_SERVICE.to_string());
+    }
+
+    #[test]
+    fn battery_level_uuid_matches_gatt_constant() {
+        assert_eq!(battery_level_uuid(), np::BATTERY_LEVEL.to_string());
     }
 
     #[test]
