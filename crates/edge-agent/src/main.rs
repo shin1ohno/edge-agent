@@ -858,10 +858,48 @@ async fn run_nuimo_event_loop(
                         let _ = ws_outbox
                             .send(EdgeToServer::SwitchActiveConnection {
                                 device_type: dt,
-                                device_id: did,
+                                device_id: did.clone(),
                                 active_mapping_id,
                             })
                             .await;
+                        // Optimistic LED hint: render the new target's
+                        // first ASCII alphanumeric letter (uppercased)
+                        // immediately, without waiting for the server's
+                        // SwitchActiveConnection echo. If the server
+                        // rejects the request the cycle won't advance
+                        // but the brief letter glyph (timeout 2 s) is
+                        // self-clearing — acceptable cosmetic blip.
+                        if did == device_id {
+                            if let Some(mapping) = engine
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .find(|m| m.mapping_id == active_mapping_id)
+                            {
+                                let label = mapping
+                                    .target_candidates
+                                    .iter()
+                                    .find(|c| c.target == mapping.service_target)
+                                    .map(|c| c.label.as_str())
+                                    .filter(|l| !l.is_empty())
+                                    .unwrap_or(mapping.service_target.as_str());
+                                let letter = label
+                                    .chars()
+                                    .find(|c| c.is_ascii_alphanumeric())
+                                    .map(|c| c.to_ascii_uppercase())
+                                    .unwrap_or('?');
+                                let _ = device
+                                    .display_glyph(
+                                        &crate::glyphs::letter_glyph(letter),
+                                        &DisplayOptions {
+                                            brightness: 1.0,
+                                            timeout_ms: 2000,
+                                            transition: DisplayTransition::CrossFade,
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             }

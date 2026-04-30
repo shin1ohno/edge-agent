@@ -6,41 +6,16 @@
 
 use nuimo::Glyph;
 
-/// Render a single ASCII char through the bundled 5x7 font (`nuimo_protocol::char_pattern`)
-/// into the 9x9 `nuimo::Glyph` Linux's BLE driver expects. Chars outside the
-/// supported set fall back to `?` (mirrors `nuimo_protocol::char_glyph`).
+/// Render a single ASCII char via the bundled 5x7 font into the 9x9
+/// `nuimo::Glyph` the Linux/Mac BLE driver expects. Chars outside the
+/// supported set fall back to `?`.
 ///
-/// Centred at row offset 1, col offset 2 — same as the iOS pump's
-/// `nuimo_protocol::char_glyph`. The two paths share the source pattern data
-/// so a font tweak lands consistently on both.
+/// `nuimo::Glyph` and `nuimo_protocol::Glyph` are distinct types; we
+/// round-trip through the ASCII grid representation (`to_ascii` →
+/// `from_str`) so the font data stays single-sourced in
+/// `nuimo_protocol::font`.
 pub fn letter_glyph(c: char) -> Glyph {
-    let pattern = nuimo_protocol::char_pattern(c)
-        .or_else(|| nuimo_protocol::char_pattern('?'))
-        .expect("font always defines '?'");
-    let mut s = String::with_capacity(9 * 10);
-    for row in 0..nuimo_protocol::LED_ROWS {
-        for col in 0..nuimo_protocol::LED_COLS {
-            let cell_row = row as i32 - 1; // (LED_ROWS - FONT_HEIGHT) / 2
-            let cell_col = col as i32 - 2; // (LED_COLS - FONT_WIDTH) / 2
-            let lit = if cell_row >= 0
-                && (cell_row as usize) < nuimo_protocol::FONT_CHAR_HEIGHT
-                && cell_col >= 0
-                && (cell_col as usize) < nuimo_protocol::FONT_CHAR_WIDTH
-            {
-                pattern[cell_row as usize]
-                    .chars()
-                    .nth(cell_col as usize)
-                    == Some('*')
-            } else {
-                false
-            };
-            s.push(if lit { '*' } else { '.' });
-        }
-        if row + 1 < nuimo_protocol::LED_ROWS {
-            s.push('\n');
-        }
-    }
-    Glyph::from_str(&s)
+    Glyph::from_str(&nuimo_protocol::char_glyph(c).to_ascii())
 }
 
 /// Wide bitmap canvas for scrolling text across the LED. One row vector

@@ -927,6 +927,47 @@ async fn apply_inbound_frame(
                     %device_type, %device_id, %active_mapping_id,
                     "switch_active_connection: cycle missing or active not in mapping_ids — ignoring"
                 );
+            } else {
+                // Render a one-off "you switched to X" hint on the LED.
+                // Pull the new active mapping's effective label, take the
+                // first ASCII alphanumeric char (uppercased), and dispatch
+                // it through the same `device_control.display_glyph` path
+                // the server uses for ServerToEdge::DisplayGlyph. No new
+                // sink, no schema bump.
+                let snapshot = engine.snapshot().await;
+                if let Some(mapping) = snapshot.iter().find(|m| m.mapping_id == active_mapping_id) {
+                    let label = mapping
+                        .target_candidates
+                        .iter()
+                        .find(|c| c.target == mapping.service_target)
+                        .map(|c| c.label.as_str())
+                        .filter(|l| !l.is_empty())
+                        .unwrap_or(mapping.service_target.as_str());
+                    let letter = label
+                        .chars()
+                        .find(|c| c.is_ascii_alphanumeric())
+                        .map(|c| c.to_ascii_uppercase())
+                        .unwrap_or('?');
+                    let pattern = nuimo_protocol::char_glyph(letter).to_ascii();
+                    let registered =
+                        { device_control.lock().expect("device control mutex").clone() };
+                    if let Some(sink) = registered {
+                        sink.display_glyph(
+                            device_type.clone(),
+                            device_id.clone(),
+                            pattern,
+                            Some(1.0),
+                            Some(2000),
+                            Some("crossfade".to_string()),
+                        );
+                    } else {
+                        tracing::debug!(
+                            %device_type,
+                            %device_id,
+                            "cycle-switch hint dropped — no device_control sink registered"
+                        );
+                    }
+                }
             }
         }
         ServerToEdge::ServiceState {
