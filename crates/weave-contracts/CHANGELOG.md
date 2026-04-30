@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.14.0...weave-contracts-v0.15.0) - 2026-04-30
+
+### Other
+
+- implement playback_glyph + brightness_bar + power_glyph + mute_glyph + pulse, add server-resolved cycle-switch label ([#87](https://github.com/shin1ohno/edge-agent/pull/87))
+
 ## [0.13.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.12.1...weave-contracts-v0.13.0) - 2026-04-27
 
 ### Other

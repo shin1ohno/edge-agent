@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.14.0...edge-agent-v0.15.0) - 2026-04-30
+
+### Added
+
+- Nuimo LED text feedback (track scroll + cycle-switch letter hint) ([#86](https://github.com/shin1ohno/edge-agent/pull/86))
+
+### Other
+
+- implement playback_glyph + brightness_bar + power_glyph + mute_glyph + pulse, add server-resolved cycle-switch label ([#87](https://github.com/shin1ohno/edge-agent/pull/87))
+
 ## [0.14.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.13.1...edge-agent-v0.14.0) - 2026-04-28
 
 ### Other
