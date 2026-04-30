@@ -1825,7 +1825,13 @@ impl FeedbackPlan {
     /// hardcoded fallback.
     fn from_rules(update: &StateUpdate, rules: &[weave_contracts::FeedbackRule]) -> Option<Self> {
         for rule in rules {
-            if rule.state != update.property {
+            // Wildcard `state == "any"` (used by `pulse` rules) matches
+            // any property; `state == "track"` aliases to the iOS
+            // `now_playing` publish so old saved rules still bind.
+            let matches = rule.state == update.property
+                || rule.state == "any"
+                || (rule.state == "track" && update.property == "now_playing");
+            if !matches {
                 continue;
             }
             match rule.feedback_type.as_str() {
@@ -1854,7 +1860,7 @@ impl FeedbackPlan {
                     }
                     return Some(Self::NamedGlyph(glyph_name.to_string()));
                 }
-                "volume_bar" => {
+                "volume_bar" | "brightness_bar" => {
                     if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
                         return Some(Self::VolumeBar(bars, dir));
                     }
@@ -1878,6 +1884,35 @@ impl FeedbackPlan {
                     {
                         return Some(Self::ScrollText(title.to_string()));
                     }
+                }
+                "playback_glyph" => {
+                    if let serde_json::Value::String(s) = &update.value {
+                        return match s.as_str() {
+                            "playing" => Some(Self::NamedGlyph("play".to_string())),
+                            "paused" | "stopped" => Some(Self::NamedGlyph("pause".to_string())),
+                            _ => None,
+                        };
+                    }
+                }
+                "power_glyph" => {
+                    if let serde_json::Value::Bool(b) = update.value {
+                        return Some(Self::NamedGlyph(if b {
+                            "light_on".to_string()
+                        } else {
+                            "light_off".to_string()
+                        }));
+                    }
+                }
+                "mute_glyph" => {
+                    if let serde_json::Value::Bool(b) = update.value {
+                        if b {
+                            return Some(Self::NamedGlyph("muted".to_string()));
+                        }
+                        continue;
+                    }
+                }
+                "pulse" => {
+                    return Some(Self::NamedGlyph("pulse".to_string()));
                 }
                 _ => continue,
             }

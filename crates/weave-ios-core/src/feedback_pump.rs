@@ -72,7 +72,18 @@ impl FeedbackPlan {
     /// Mapping-level feedback rules (user-configured per Connection).
     fn from_rules(update: &StateUpdate, rules: &[FeedbackRule]) -> Option<Self> {
         for rule in rules {
-            if rule.state != update.property {
+            // Match the rule's `state` against the live publish property.
+            // Three matching modes:
+            //   - exact equality (the typical case)
+            //   - wildcard `state == "any"` matches any property (used by
+            //     the `pulse` rule)
+            //   - alias `state == "track"` matches `property == "now_playing"`
+            //     (back-compat for rules saved before vocab.ts switched
+            //     the default to `now_playing`).
+            let matches = rule.state == update.property
+                || rule.state == "any"
+                || (rule.state == "track" && update.property == "now_playing");
+            if !matches {
                 continue;
             }
             match rule.feedback_type.as_str() {
@@ -94,16 +105,12 @@ impl FeedbackPlan {
                     }
                     return Some(Self::NamedGlyph(glyph_name.to_string()));
                 }
-                "volume_bar" => {
+                "volume_bar" | "brightness_bar" => {
                     if let Some((bars, dir)) = volume_bar_from_value(&update.value) {
                         return Some(Self::VolumeBar(bars, dir));
                     }
                 }
                 "letter" => {
-                    // The state's value must be a single-char string.
-                    // Multi-char strings would race with `track_scroll` —
-                    // explicit single-char gate keeps the two rule
-                    // types mutually exclusive.
                     let s = match &update.value {
                         serde_json::Value::String(s) => s,
                         _ => continue,
@@ -113,11 +120,9 @@ impl FeedbackPlan {
                     }
                 }
                 "track_scroll" => {
-                    // The track-scroll feedback type accepts the
-                    // `now_playing` composite — extract the title field.
-                    // Keeps iOS NowPlayingObserver's existing publish
-                    // shape (no schema bump for a separate `track`
-                    // property).
+                    // Accepts the `now_playing` composite — extract
+                    // `value.title`. Pairs with the `state == "track"`
+                    // alias above so old saved rules bind too.
                     if let Some(title) = update
                         .value
                         .as_object()
@@ -127,6 +132,42 @@ impl FeedbackPlan {
                     {
                         return Some(Self::ScrollText(title.to_string()));
                     }
+                }
+                "playback_glyph" => {
+                    if let serde_json::Value::String(s) = &update.value {
+                        return match s.as_str() {
+                            "playing" => Some(Self::NamedGlyph("play".into())),
+                            "paused" | "stopped" => Some(Self::NamedGlyph("pause".into())),
+                            _ => None,
+                        };
+                    }
+                }
+                "power_glyph" => {
+                    // `light_on` / `light_off` are seeded server-side; on
+                    // a fresh edge they may not be in the registry yet,
+                    // in which case `FeedbackPlan::render` returns None
+                    // and the caller skips the BLE write.
+                    if let serde_json::Value::Bool(b) = update.value {
+                        return Some(Self::NamedGlyph(if b {
+                            "light_on".into()
+                        } else {
+                            "light_off".into()
+                        }));
+                    }
+                }
+                "mute_glyph" => {
+                    if let serde_json::Value::Bool(b) = update.value {
+                        if b {
+                            return Some(Self::NamedGlyph("muted".into()));
+                        }
+                        // muted=false: clear the LED via auto-timeout —
+                        // returning None means "no write".
+                        continue;
+                    }
+                }
+                "pulse" => {
+                    // Wildcard pulse; renders a brief full-grid flash.
+                    return Some(Self::NamedGlyph("pulse".into()));
                 }
                 _ => continue,
             }
@@ -590,6 +631,191 @@ mod tests {
             feedback_type: "letter".into(),
             mapping: serde_json::json!({}),
         }
+    }
+
+    fn playback_glyph_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "playback".into(),
+            feedback_type: "playback_glyph".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn brightness_bar_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "brightness".into(),
+            feedback_type: "brightness_bar".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn power_glyph_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "on".into(),
+            feedback_type: "power_glyph".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn mute_glyph_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "muted".into(),
+            feedback_type: "mute_glyph".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn pulse_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "any".into(),
+            feedback_type: "pulse".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn track_scroll_rule_legacy_state() -> FeedbackRule {
+        FeedbackRule {
+            state: "track".into(),
+            feedback_type: "track_scroll".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn from_rules_playback_glyph_playing() {
+        let rules = vec![playback_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::NamedGlyph("play".into()))
+        );
+    }
+
+    #[test]
+    fn from_rules_playback_glyph_paused_maps_to_pause() {
+        let rules = vec![playback_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "x".into(),
+            property: "playback".into(),
+            value: serde_json::json!("paused"),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::NamedGlyph("pause".into()))
+        );
+    }
+
+    #[test]
+    fn from_rules_brightness_bar_from_number() {
+        let rules = vec![brightness_bar_rule()];
+        let update = StateUpdate {
+            service_type: "hue".into(),
+            target: "light-1".into(),
+            property: "brightness".into(),
+            value: serde_json::json!(50),
+        };
+        match FeedbackPlan::from_rules(&update, &rules) {
+            Some(FeedbackPlan::VolumeBar(bars, _)) => assert!((4..=5).contains(&bars)),
+            other => panic!("expected VolumeBar, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_rules_power_glyph_bool_true() {
+        let rules = vec![power_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "hue".into(),
+            target: "light-1".into(),
+            property: "on".into(),
+            value: serde_json::json!(true),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::NamedGlyph("light_on".into()))
+        );
+    }
+
+    #[test]
+    fn from_rules_power_glyph_bool_false() {
+        let rules = vec![power_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "hue".into(),
+            target: "light-1".into(),
+            property: "on".into(),
+            value: serde_json::json!(false),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::NamedGlyph("light_off".into()))
+        );
+    }
+
+    #[test]
+    fn from_rules_mute_glyph_true_renders_muted() {
+        let rules = vec![mute_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "roon".into(),
+            target: "zone-1".into(),
+            property: "muted".into(),
+            value: serde_json::json!(true),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::NamedGlyph("muted".into()))
+        );
+    }
+
+    #[test]
+    fn from_rules_mute_glyph_false_returns_none() {
+        let rules = vec![mute_glyph_rule()];
+        let update = StateUpdate {
+            service_type: "roon".into(),
+            target: "zone-1".into(),
+            property: "muted".into(),
+            value: serde_json::json!(false),
+        };
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[test]
+    fn pulse_matches_any_property() {
+        let rules = vec![pulse_rule()];
+        for property in ["playback", "volume", "brightness", "muted", "anything"] {
+            let update = StateUpdate {
+                service_type: "x".into(),
+                target: "y".into(),
+                property: property.into(),
+                value: serde_json::json!(42),
+            };
+            assert_eq!(
+                FeedbackPlan::from_rules(&update, &rules),
+                Some(FeedbackPlan::NamedGlyph("pulse".into())),
+                "pulse should match property={property}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_rules_track_state_alias_extracts_title() {
+        // Legacy rule shape (state="track") binds against the iOS
+        // `now_playing` publish via the runtime alias.
+        let rules = vec![track_scroll_rule_legacy_state()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            value: serde_json::json!({"state": "playing", "title": "Lateralus"}),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::ScrollText("Lateralus".into()))
+        );
     }
 
     #[test]

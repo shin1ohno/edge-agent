@@ -101,6 +101,15 @@ pub enum ServerToEdge {
         device_type: String,
         device_id: String,
         active_mapping_id: Uuid,
+        /// Optional human-readable label for the new active mapping's
+        /// `service_target`, resolved server-side from the StateHub's
+        /// service_state cache (Roon zone display_name, Hue light
+        /// metadata.name, hardcoded "Apple Music" for `ios_media`).
+        /// When present, edges use the first ASCII alphanumeric char
+        /// as the LED letter hint. Older servers omit the field;
+        /// receivers must treat `None` as a fallback signal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service_target_label: Option<String>,
     },
     /// Echo of a service state update originally published by another
     /// edge. weave-server fans out `EdgeToServer::State` to every other
@@ -922,20 +931,51 @@ mod tests {
             device_type: "nuimo".into(),
             device_id: "dev-1".into(),
             active_mapping_id: m1,
+            service_target_label: Some("Apple Music".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"switch_active_connection\""));
+        assert!(json.contains("\"service_target_label\":\"Apple Music\""));
         let parsed: ServerToEdge = serde_json::from_str(&json).unwrap();
         match parsed {
             ServerToEdge::SwitchActiveConnection {
                 device_type,
                 device_id,
                 active_mapping_id,
+                service_target_label,
             } => {
                 assert_eq!(device_type, "nuimo");
                 assert_eq!(device_id, "dev-1");
                 assert_eq!(active_mapping_id, m1);
+                assert_eq!(service_target_label.as_deref(), Some("Apple Music"));
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_to_edge_switch_active_connection_omits_label_when_none() {
+        let msg = ServerToEdge::SwitchActiveConnection {
+            device_type: "nuimo".into(),
+            device_id: "dev-1".into(),
+            active_mapping_id: Uuid::new_v4(),
+            service_target_label: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("service_target_label"));
+    }
+
+    #[test]
+    fn server_to_edge_switch_active_connection_back_compat_no_label() {
+        // Older servers that haven't bumped emit the frame without the
+        // `service_target_label` field. The receiver must accept it.
+        let json = r#"{"type":"switch_active_connection","device_type":"nuimo","device_id":"dev-1","active_mapping_id":"00000000-0000-0000-0000-000000000000"}"#;
+        let parsed: ServerToEdge = serde_json::from_str(json).expect("parses without label");
+        match parsed {
+            ServerToEdge::SwitchActiveConnection {
+                service_target_label,
+                ..
+            } => assert_eq!(service_target_label, None),
             _ => panic!("wrong variant"),
         }
     }
