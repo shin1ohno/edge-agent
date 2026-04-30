@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod font;
+pub use font::{char_bits, char_glyph, char_pattern, FONT_CHAR_HEIGHT, FONT_CHAR_WIDTH};
+
 // ---------------------------------------------------------------------------
 // GATT constants
 // ---------------------------------------------------------------------------
