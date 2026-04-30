@@ -912,6 +912,7 @@ async fn apply_inbound_frame(
             device_type,
             device_id,
             active_mapping_id,
+            service_target_label,
         } => {
             tracing::info!(
                 %device_type,
@@ -929,20 +930,32 @@ async fn apply_inbound_frame(
                 );
             } else {
                 // Render a one-off "you switched to X" hint on the LED.
-                // Pull the new active mapping's effective label, take the
-                // first ASCII alphanumeric char (uppercased), and dispatch
-                // it through the same `device_control.display_glyph` path
-                // the server uses for ServerToEdge::DisplayGlyph. No new
-                // sink, no schema bump.
+                // Resolution priority for the label:
+                //   1. Server-resolved `service_target_label` from the
+                //      frame (Roon zone display_name, Hue light name,
+                //      hardcoded "Apple Music" for ios_media). Most
+                //      reliable when populated.
+                //   2. The new active mapping's `target_candidates.label`
+                //      that matches its current service_target. Useful
+                //      when the user has explicitly labelled candidates.
+                //   3. The raw `service_target` string. Fine for
+                //      `apple_music` style human IDs; degrades to a hex
+                //      digit for opaque Roon/Hue UUIDs.
                 let snapshot = engine.snapshot().await;
-                if let Some(mapping) = snapshot.iter().find(|m| m.mapping_id == active_mapping_id) {
-                    let label = mapping
-                        .target_candidates
-                        .iter()
-                        .find(|c| c.target == mapping.service_target)
-                        .map(|c| c.label.as_str())
-                        .filter(|l| !l.is_empty())
-                        .unwrap_or(mapping.service_target.as_str());
+                let mapping_opt = snapshot.iter().find(|m| m.mapping_id == active_mapping_id);
+                let label_owned: Option<String> = service_target_label
+                    .filter(|l| !l.is_empty())
+                    .or_else(|| {
+                        mapping_opt.and_then(|m| {
+                            m.target_candidates
+                                .iter()
+                                .find(|c| c.target == m.service_target)
+                                .map(|c| c.label.clone())
+                                .filter(|l| !l.is_empty())
+                        })
+                    })
+                    .or_else(|| mapping_opt.map(|m| m.service_target.clone()));
+                if let Some(label) = label_owned.as_deref() {
                     let letter = label
                         .chars()
                         .find(|c| c.is_ascii_alphanumeric())

@@ -403,6 +403,7 @@ impl WsClient {
                 device_type,
                 device_id,
                 active_mapping_id,
+                service_target_label: _,
             } => {
                 tracing::info!(
                     %device_type,
