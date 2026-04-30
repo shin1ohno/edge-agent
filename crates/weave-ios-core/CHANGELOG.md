@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.14.0...weave-ios-core-v0.15.0) - 2026-04-30
+
+### Added
+
+- Nuimo LED text feedback (track scroll + cycle-switch letter hint) ([#86](https://github.com/shin1ohno/edge-agent/pull/86))
+
+### Other
+
+- implement playback_glyph + brightness_bar + power_glyph + mute_glyph + pulse, add server-resolved cycle-switch label ([#87](https://github.com/shin1ohno/edge-agent/pull/87))
+- read Nuimo battery on connect ([#82](https://github.com/shin1ohno/edge-agent/pull/82))
+
 ## [0.13.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.12.1...weave-ios-core-v0.13.0) - 2026-04-27
 
 ### Other
