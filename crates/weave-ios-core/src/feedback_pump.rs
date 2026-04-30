@@ -50,6 +50,15 @@ pub trait LedFeedbackSink: Send + Sync {
 pub(crate) enum FeedbackPlan {
     VolumeBar(u8, VolumeDirection),
     NamedGlyph(String),
+    /// Single ASCII character rendered from the bundled 5x7 font. Used
+    /// for the cycle-switch target hint ("which target did I just
+    /// pick?"). Non-ASCII / unsupported chars fall back to `'?'`.
+    Letter(char),
+    /// Horizontal scroll of an arbitrary string across the 9x9 LED.
+    /// Used for now-playing track titles. Non-ASCII chars are
+    /// filtered before scrolling; if the filtered string is empty the
+    /// renderer shows `'?'` once and stops.
+    ScrollText(String),
 }
 
 impl FeedbackPlan {
@@ -90,6 +99,35 @@ impl FeedbackPlan {
                         return Some(Self::VolumeBar(bars, dir));
                     }
                 }
+                "letter" => {
+                    // The state's value must be a single-char string.
+                    // Multi-char strings would race with `track_scroll` —
+                    // explicit single-char gate keeps the two rule
+                    // types mutually exclusive.
+                    let s = match &update.value {
+                        serde_json::Value::String(s) => s,
+                        _ => continue,
+                    };
+                    if let Some(c) = s.chars().next().filter(|_| s.chars().count() == 1) {
+                        return Some(Self::Letter(c));
+                    }
+                }
+                "track_scroll" => {
+                    // The track-scroll feedback type accepts the
+                    // `now_playing` composite — extract the title field.
+                    // Keeps iOS NowPlayingObserver's existing publish
+                    // shape (no schema bump for a separate `track`
+                    // property).
+                    if let Some(title) = update
+                        .value
+                        .as_object()
+                        .and_then(|o| o.get("title"))
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.is_empty())
+                    {
+                        return Some(Self::ScrollText(title.to_string()));
+                    }
+                }
                 _ => continue,
             }
         }
@@ -126,6 +164,12 @@ impl FeedbackPlan {
                 format!("vol:{bars}:{d}")
             }
             Self::NamedGlyph(name) => name.clone(),
+            Self::Letter(c) => format!("letter:{}", c),
+            // ScrollText has its own per-(device, property) cancel
+            // path; the dedup signature captures the source string so
+            // a second identical scroll request is a no-op while a new
+            // title (re-)launches the animation.
+            Self::ScrollText(text) => format!("scroll:{}", text),
         }
     }
 
@@ -133,6 +177,10 @@ impl FeedbackPlan {
     /// characteristic expects. Returns `None` when the plan references
     /// a glyph that's not in the registry yet — the caller skips the
     /// write rather than blanking the LED.
+    ///
+    /// `ScrollText` is NOT rendered through this entry point — it
+    /// drives its own animation task; calling `render` on it returns
+    /// `None`. The dispatch loop branches before reaching here.
     pub async fn render(&self, registry: &GlyphRegistry) -> Option<Vec<u8>> {
         let (glyph, transition, timeout_ms) = match self {
             Self::VolumeBar(bars, dir) => (
@@ -151,6 +199,14 @@ impl FeedbackPlan {
                     1000u32,
                 )
             }
+            Self::Letter(c) => (
+                np::char_glyph(*c),
+                np::DisplayTransition::CrossFade,
+                2000u32,
+            ),
+            // Animation-driven; emitted frame-by-frame from the
+            // dispatch loop, not this single-payload path.
+            Self::ScrollText(_) => return None,
         };
         let opts = np::DisplayOptions {
             brightness: 1.0,
@@ -255,10 +311,19 @@ pub(crate) async fn run_feedback_pump(
     sink: Arc<std::sync::Mutex<Option<Arc<dyn LedFeedbackSink>>>>,
 ) {
     let mut filter = FeedbackFilter::new();
+    let mut animations: HashMap<(String, String), tokio::task::JoinHandle<()>> = HashMap::new();
     loop {
         match state_rx.recv().await {
             Ok(update) => {
-                dispatch(&update, &engine, &glyphs, &sink, &mut filter).await;
+                dispatch(
+                    &update,
+                    &engine,
+                    &glyphs,
+                    &sink,
+                    &mut filter,
+                    &mut animations,
+                )
+                .await;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(count = n, "feedback pump lagged");
@@ -274,6 +339,7 @@ async fn dispatch(
     glyphs: &GlyphRegistry,
     sink: &std::sync::Mutex<Option<Arc<dyn LedFeedbackSink>>>,
     filter: &mut FeedbackFilter,
+    animations: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) {
     let targets = engine
         .feedback_targets_for(&update.service_type, &update.target)
@@ -301,10 +367,141 @@ async fn dispatch(
         if !filter.should_render(&device_id, &update.property, &sig) {
             continue;
         }
-        let Some(payload) = plan.render(glyphs).await else {
-            continue;
+
+        // Any new state for this (device, property) supersedes a
+        // previously-running scroll animation. Abort first so the
+        // single-frame paths below don't fight the animation's writes.
+        let key = (device_id.clone(), update.property.clone());
+        if let Some(prev) = animations.remove(&key) {
+            prev.abort();
+        }
+
+        match plan {
+            FeedbackPlan::ScrollText(text) => {
+                let sink_clone = registered.clone();
+                let device_id_owned = device_id;
+                let handle = tokio::spawn(async move {
+                    run_scroll_animation(text, device_id_owned, sink_clone).await;
+                });
+                animations.insert(key, handle);
+            }
+            other => {
+                if let Some(payload) = other.render(glyphs).await {
+                    registered.write_led(device_id, payload);
+                }
+            }
+        }
+    }
+}
+
+/// Composed wide bitmap for a scrolling string. One row vector per LED
+/// row, each cell holds the lit-or-dark state for that column. Wide
+/// enough to include `LED_COLS` of left/right padding so the text
+/// scrolls in from the right and out to the left.
+struct ScrollCanvas {
+    rows: [Vec<bool>; np::LED_ROWS],
+}
+
+impl ScrollCanvas {
+    /// Compose a canvas for `text`. Non-supported chars are filtered
+    /// before composition. Returns `None` if the filtered string is
+    /// empty.
+    fn from_text(text: &str) -> Option<Self> {
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|c| np::char_pattern(*c).is_some())
+            .collect();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let char_w = np::FONT_CHAR_WIDTH;
+        let gap = 1usize;
+        let pad = np::LED_COLS;
+        let body_cols = chars.len() * (char_w + gap) - gap;
+        let total_cols = pad + body_cols + pad;
+        let row_offset = (np::LED_ROWS - np::FONT_CHAR_HEIGHT) / 2;
+
+        let mut rows: [Vec<bool>; np::LED_ROWS] = std::array::from_fn(|_| vec![false; total_cols]);
+
+        let mut col_cursor = pad;
+        for c in &chars {
+            if let Some(bits) = np::char_bits(*c) {
+                for (r_idx, row_bits) in bits.iter().enumerate() {
+                    let target_row = row_offset + r_idx;
+                    for col_idx in 0..char_w {
+                        if row_bits & (1u16 << col_idx) != 0 {
+                            rows[target_row][col_cursor + col_idx] = true;
+                        }
+                    }
+                }
+            }
+            col_cursor += char_w + gap;
+        }
+
+        Some(Self { rows })
+    }
+
+    fn total_cols(&self) -> usize {
+        self.rows[0].len()
+    }
+
+    /// Extract a 9-col window starting at `start_col` and pack into a
+    /// `Glyph`. Cols beyond canvas width render as dark.
+    fn frame(&self, start_col: usize) -> np::Glyph {
+        let mut glyph_rows = [0u16; np::LED_ROWS];
+        for (r, row) in self.rows.iter().enumerate() {
+            let mut bits = 0u16;
+            for c in 0..np::LED_COLS {
+                let canvas_col = start_col + c;
+                if canvas_col < row.len() && row[canvas_col] {
+                    bits |= 1u16 << c;
+                }
+            }
+            glyph_rows[r] = bits;
+        }
+        np::Glyph { rows: glyph_rows }
+    }
+}
+
+const SCROLL_FRAME_MS: u64 = 120;
+
+async fn run_scroll_animation(text: String, device_id: String, sink: Arc<dyn LedFeedbackSink>) {
+    let Some(canvas) = ScrollCanvas::from_text(&text) else {
+        // Empty after non-ASCII filter — show '?' once and stop.
+        let glyph = np::char_glyph('?');
+        let opts = np::DisplayOptions {
+            brightness: 1.0,
+            timeout_ms: 2000,
+            transition: np::DisplayTransition::CrossFade,
         };
-        registered.write_led(device_id, payload);
+        sink.write_led(device_id, np::build_led_payload(&glyph, &opts).to_vec());
+        return;
+    };
+
+    // Number of windows to render: from start_col=0 (right edge of
+    // text just entering the LED) to start_col=total_cols-LED_COLS
+    // (left edge fully scrolled past). +1 for the final window.
+    let total_frames = canvas
+        .total_cols()
+        .saturating_sub(np::LED_COLS)
+        .saturating_add(1);
+    let mut interval = tokio::time::interval(Duration::from_millis(SCROLL_FRAME_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    for frame_idx in 0..total_frames {
+        interval.tick().await;
+        let glyph = canvas.frame(frame_idx);
+        let opts = np::DisplayOptions {
+            brightness: 1.0,
+            // Slightly longer than the frame interval so the LED
+            // doesn't blank between writes; the next write replaces
+            // before the timeout expires.
+            timeout_ms: 250,
+            transition: np::DisplayTransition::Immediate,
+        };
+        let payload = np::build_led_payload(&glyph, &opts).to_vec();
+        sink.write_led(device_id.clone(), payload);
     }
 }
 
@@ -377,6 +574,113 @@ mod tests {
             feedback_type: "volume_bar".into(),
             mapping: serde_json::json!({}),
         }
+    }
+
+    fn track_scroll_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "now_playing".into(),
+            feedback_type: "track_scroll".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    fn letter_rule() -> FeedbackRule {
+        FeedbackRule {
+            state: "target_hint".into(),
+            feedback_type: "letter".into(),
+            mapping: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn letter_signature_includes_char() {
+        assert_eq!(FeedbackPlan::Letter('A').signature(), "letter:A");
+        assert_eq!(FeedbackPlan::Letter('?').signature(), "letter:?");
+    }
+
+    #[test]
+    fn scroll_text_signature_includes_text() {
+        let plan = FeedbackPlan::ScrollText("Bohemian".into());
+        assert_eq!(plan.signature(), "scroll:Bohemian");
+    }
+
+    #[test]
+    fn from_rules_track_scroll_extracts_title() {
+        let rules = vec![track_scroll_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            value: serde_json::json!({
+                "state": "playing",
+                "title": "Lateralus",
+                "artist": "Tool",
+            }),
+        };
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("title extracted");
+        assert_eq!(plan, FeedbackPlan::ScrollText("Lateralus".into()));
+    }
+
+    #[test]
+    fn from_rules_track_scroll_skips_when_title_missing() {
+        let rules = vec![track_scroll_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            value: serde_json::json!({"state": "stopped"}),
+        };
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[test]
+    fn from_rules_letter_single_char() {
+        let rules = vec![letter_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "x".into(),
+            property: "target_hint".into(),
+            value: serde_json::json!("A"),
+        };
+        let plan = FeedbackPlan::from_rules(&update, &rules).expect("letter A");
+        assert_eq!(plan, FeedbackPlan::Letter('A'));
+    }
+
+    #[test]
+    fn from_rules_letter_rejects_multi_char() {
+        let rules = vec![letter_rule()];
+        let update = StateUpdate {
+            service_type: "ios_media".into(),
+            target: "x".into(),
+            property: "target_hint".into(),
+            value: serde_json::json!("AB"),
+        };
+        assert!(FeedbackPlan::from_rules(&update, &rules).is_none());
+    }
+
+    #[test]
+    fn scroll_canvas_filters_non_ascii_keeps_supported_chars() {
+        // "Hi 日本" → "HI " after filter (' ' is supported, lowercase
+        // upcased by char_pattern, "日本" has no font entry).
+        let canvas = ScrollCanvas::from_text("Hi 日本").expect("non-empty after filter");
+        // Not asserting exact width because of padding details, just
+        // that something was composed.
+        assert!(canvas.total_cols() > np::LED_COLS * 2);
+    }
+
+    #[test]
+    fn scroll_canvas_returns_none_for_all_non_ascii() {
+        assert!(ScrollCanvas::from_text("日本語").is_none());
+        assert!(ScrollCanvas::from_text("").is_none());
+    }
+
+    #[test]
+    fn scroll_canvas_first_frame_starts_blank_for_pad() {
+        let canvas = ScrollCanvas::from_text("A").expect("non-empty");
+        let glyph = canvas.frame(0);
+        // First LED_COLS columns of the canvas are left padding —
+        // every row in this window should be 0.
+        assert!(glyph.rows.iter().all(|&r| r == 0));
     }
 
     #[tokio::test]
@@ -499,7 +803,15 @@ mod tests {
             value: serde_json::json!("playing"),
         };
 
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
 
         let captured = sink.captured();
         assert_eq!(captured.len(), 2, "both Nuimos receive the play frame");
@@ -535,7 +847,15 @@ mod tests {
             value: serde_json::json!({"title": "x", "state": "playing"}),
         };
 
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
 
         assert!(sink.captured().is_empty());
     }
@@ -561,6 +881,14 @@ mod tests {
         };
 
         // No panic, no error — pump waits for register_led_feedback_callback.
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
     }
 }

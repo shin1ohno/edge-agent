@@ -858,10 +858,48 @@ async fn run_nuimo_event_loop(
                         let _ = ws_outbox
                             .send(EdgeToServer::SwitchActiveConnection {
                                 device_type: dt,
-                                device_id: did,
+                                device_id: did.clone(),
                                 active_mapping_id,
                             })
                             .await;
+                        // Optimistic LED hint: render the new target's
+                        // first ASCII alphanumeric letter (uppercased)
+                        // immediately, without waiting for the server's
+                        // SwitchActiveConnection echo. If the server
+                        // rejects the request the cycle won't advance
+                        // but the brief letter glyph (timeout 2 s) is
+                        // self-clearing — acceptable cosmetic blip.
+                        if did == device_id {
+                            if let Some(mapping) = engine
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .find(|m| m.mapping_id == active_mapping_id)
+                            {
+                                let label = mapping
+                                    .target_candidates
+                                    .iter()
+                                    .find(|c| c.target == mapping.service_target)
+                                    .map(|c| c.label.as_str())
+                                    .filter(|l| !l.is_empty())
+                                    .unwrap_or(mapping.service_target.as_str());
+                                let letter = label
+                                    .chars()
+                                    .find(|c| c.is_ascii_alphanumeric())
+                                    .map(|c| c.to_ascii_uppercase())
+                                    .unwrap_or('?');
+                                let _ = device
+                                    .display_glyph(
+                                        &crate::glyphs::letter_glyph(letter),
+                                        &DisplayOptions {
+                                            brightness: 1.0,
+                                            timeout_ms: 2000,
+                                            transition: DisplayTransition::CrossFade,
+                                        },
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             }
@@ -1337,6 +1375,12 @@ async fn run_feedback_pump(
     engine: Arc<RoutingEngine>,
 ) {
     let mut filter = FeedbackFilter::new();
+    // Per-property in-flight scroll animation. Linux's pump runs one
+    // task per device, so `device_id` is implicit — keying on
+    // `property` alone is sufficient. A new state update for the same
+    // property aborts the previous scroll before launching the next.
+    let mut animations: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
     loop {
         match state_rx.recv().await {
             Ok(update) => {
@@ -1359,8 +1403,25 @@ async fn run_feedback_pump(
                 };
                 if let Some(plan) = FeedbackPlan::resolve(&update, &rules) {
                     let sig = plan.signature();
-                    if filter.should_render(&update, &sig) {
-                        plan.execute(&device, &glyphs).await;
+                    if !filter.should_render(&update, &sig) {
+                        continue;
+                    }
+                    // Any new state for this property supersedes a
+                    // previously-running scroll animation.
+                    if let Some(prev) = animations.remove(&update.property) {
+                        prev.abort();
+                    }
+                    match plan {
+                        FeedbackPlan::ScrollText(text) => {
+                            let device_clone = Arc::clone(&device);
+                            let handle = tokio::spawn(async move {
+                                run_scroll_animation(text, device_clone).await;
+                            });
+                            animations.insert(update.property.clone(), handle);
+                        }
+                        other => {
+                            other.execute(&device, &glyphs).await;
+                        }
                     }
                 }
             }
@@ -1722,6 +1783,15 @@ enum FeedbackPlan {
     /// String because rule-driven plans pull names from mapping JSON at
     /// runtime — not a `&'static str` as in the hardcoded path.
     NamedGlyph(String),
+    /// Single ASCII char rendered from the bundled 5x7 font. Used for
+    /// the cycle-switch target hint. Non-ASCII / unsupported chars
+    /// fall back to `'?'`.
+    Letter(char),
+    /// Horizontal scroll of an arbitrary string across the 9x9 LED.
+    /// Used for now-playing track titles. Non-ASCII chars are
+    /// filtered before scrolling; if the filtered string is empty the
+    /// renderer shows `'?'` once and stops.
+    ScrollText(String),
 }
 
 #[cfg(feature = "roon")]
@@ -1789,6 +1859,26 @@ impl FeedbackPlan {
                         return Some(Self::VolumeBar(bars, dir));
                     }
                 }
+                "letter" => {
+                    let s = match &update.value {
+                        serde_json::Value::String(s) => s,
+                        _ => continue,
+                    };
+                    if let Some(c) = s.chars().next().filter(|_| s.chars().count() == 1) {
+                        return Some(Self::Letter(c));
+                    }
+                }
+                "track_scroll" => {
+                    if let Some(title) = update
+                        .value
+                        .as_object()
+                        .and_then(|o| o.get("title"))
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.is_empty())
+                    {
+                        return Some(Self::ScrollText(title.to_string()));
+                    }
+                }
                 _ => continue,
             }
         }
@@ -1828,9 +1918,18 @@ impl FeedbackPlan {
                 format!("vol:{bars}:{d}")
             }
             Self::NamedGlyph(name) => name.clone(),
+            Self::Letter(c) => format!("letter:{}", c),
+            Self::ScrollText(text) => format!("scroll:{}", text),
         }
     }
 
+    /// Render this plan to the device.
+    ///
+    /// Single-frame variants (`VolumeBar`, `NamedGlyph`, `Letter`) issue
+    /// one `display_glyph` call. `ScrollText` is animation-driven and is
+    /// NOT executed through this path — `run_feedback_pump` spawns a
+    /// dedicated task for it; calling `execute` on a `ScrollText` plan
+    /// is a no-op. Returns the glyph rendered (for tests and dedup).
     async fn execute(&self, device: &NuimoDevice, registry: &GlyphRegistry) {
         let (glyph, transition, timeout_ms) = match self {
             Self::VolumeBar(bars, direction) => (
@@ -1853,6 +1952,10 @@ impl FeedbackPlan {
                     1000,
                 )
             }
+            Self::Letter(c) => (glyphs::letter_glyph(*c), DisplayTransition::CrossFade, 2000),
+            // Animation handled by `run_scroll_animation` — single-frame
+            // path is a no-op.
+            Self::ScrollText(_) => return,
         };
 
         let _ = device
@@ -1862,6 +1965,53 @@ impl FeedbackPlan {
                     brightness: 1.0,
                     timeout_ms,
                     transition,
+                },
+            )
+            .await;
+    }
+}
+
+/// Per-frame interval for scroll animations. Matches the iOS pump
+/// (`weave-ios-core::feedback_pump::SCROLL_FRAME_MS`).
+#[cfg(feature = "roon")]
+const SCROLL_FRAME_MS: u64 = 120;
+
+/// Drain a scroll animation across the device's LED. Spawned per
+/// `(device, property)` from `run_feedback_pump`; aborts when a new
+/// state update lands for the same key.
+#[cfg(feature = "roon")]
+async fn run_scroll_animation(text: String, device: Arc<NuimoDevice>) {
+    let Some(canvas) = glyphs::ScrollCanvas::from_text(&text) else {
+        // Empty after non-ASCII filter — show '?' once and stop.
+        let glyph = glyphs::letter_glyph('?');
+        let _ = device
+            .display_glyph(
+                &glyph,
+                &DisplayOptions {
+                    brightness: 1.0,
+                    timeout_ms: 2000,
+                    transition: DisplayTransition::CrossFade,
+                },
+            )
+            .await;
+        return;
+    };
+    let total_frames = canvas
+        .total_cols()
+        .saturating_sub(nuimo_protocol::LED_COLS)
+        .saturating_add(1);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(SCROLL_FRAME_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    for frame_idx in 0..total_frames {
+        interval.tick().await;
+        let glyph = canvas.frame(frame_idx);
+        let _ = device
+            .display_glyph(
+                &glyph,
+                &DisplayOptions {
+                    brightness: 1.0,
+                    timeout_ms: 250,
+                    transition: DisplayTransition::Immediate,
                 },
             )
             .await;

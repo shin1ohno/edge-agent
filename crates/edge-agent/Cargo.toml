@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "hardware-support"]
 weave-contracts = { version = "0.14", path = "../weave-contracts" }
 edge-core = { version = "0.14", path = "../edge-core" }
 nuimo = "0.1.1"
+nuimo-protocol = { version = "0.14", path = "../nuimo-protocol" }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

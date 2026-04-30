@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod font;
+pub use font::{char_bits, char_glyph, char_pattern, FONT_CHAR_HEIGHT, FONT_CHAR_WIDTH};
+
 // ---------------------------------------------------------------------------
 // GATT constants
 // ---------------------------------------------------------------------------
@@ -251,6 +254,24 @@ impl Glyph {
             *row ^= 0x1FF;
         }
         Self { rows }
+    }
+
+    /// Inverse of `from_ascii`: encode the 9x9 grid back to a
+    /// newline-separated `*`/`.` string. Useful for callers that need
+    /// to round-trip a Glyph through APIs that consume the ASCII grid
+    /// shape (e.g. `nuimo::Glyph::from_str`,
+    /// `DeviceControlSink::display_glyph`).
+    pub fn to_ascii(&self) -> String {
+        let mut s = String::with_capacity(LED_ROWS * (LED_COLS + 1));
+        for (r, row_bits) in self.rows.iter().enumerate() {
+            for col in 0..LED_COLS {
+                s.push(if row_bits & (1 << col) != 0 { '*' } else { '.' });
+            }
+            if r + 1 < LED_ROWS {
+                s.push('\n');
+            }
+        }
+        s
     }
 
     /// Encode the 9x9 grid into the 11-byte bitmap Nuimo's LED characteristic

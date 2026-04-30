@@ -6,6 +6,85 @@
 
 use nuimo::Glyph;
 
+/// Render a single ASCII char via the bundled 5x7 font into the 9x9
+/// `nuimo::Glyph` the Linux/Mac BLE driver expects. Chars outside the
+/// supported set fall back to `?`.
+///
+/// `nuimo::Glyph` and `nuimo_protocol::Glyph` are distinct types; we
+/// round-trip through the ASCII grid representation (`to_ascii` →
+/// `from_str`) so the font data stays single-sourced in
+/// `nuimo_protocol::font`.
+pub fn letter_glyph(c: char) -> Glyph {
+    Glyph::from_str(&nuimo_protocol::char_glyph(c).to_ascii())
+}
+
+/// Wide bitmap canvas for scrolling text across the LED. One row vector
+/// per LED row; cells are `true` when lit. Includes `LED_COLS` of left/
+/// right padding so the text scrolls in from the right and out to the
+/// left.
+pub struct ScrollCanvas {
+    rows: [Vec<bool>; nuimo_protocol::LED_ROWS],
+}
+
+impl ScrollCanvas {
+    /// Compose a canvas for `text`. Non-supported chars are filtered
+    /// before composition. Returns `None` if the filtered string is
+    /// empty.
+    pub fn from_text(text: &str) -> Option<Self> {
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|c| nuimo_protocol::char_pattern(*c).is_some())
+            .collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let char_w = nuimo_protocol::FONT_CHAR_WIDTH;
+        let gap = 1usize;
+        let pad = nuimo_protocol::LED_COLS;
+        let body_cols = chars.len() * (char_w + gap) - gap;
+        let total_cols = pad + body_cols + pad;
+        let row_offset = (nuimo_protocol::LED_ROWS - nuimo_protocol::FONT_CHAR_HEIGHT) / 2;
+        let mut rows: [Vec<bool>; nuimo_protocol::LED_ROWS] =
+            std::array::from_fn(|_| vec![false; total_cols]);
+        let mut col_cursor = pad;
+        for c in &chars {
+            if let Some(bits) = nuimo_protocol::char_bits(*c) {
+                for (r_idx, row_bits) in bits.iter().enumerate() {
+                    let target_row = row_offset + r_idx;
+                    for col_idx in 0..char_w {
+                        if row_bits & (1u16 << col_idx) != 0 {
+                            rows[target_row][col_cursor + col_idx] = true;
+                        }
+                    }
+                }
+            }
+            col_cursor += char_w + gap;
+        }
+        Some(Self { rows })
+    }
+
+    pub fn total_cols(&self) -> usize {
+        self.rows[0].len()
+    }
+
+    /// 9-col window starting at `start_col`, packed into a `nuimo::Glyph`
+    /// via the ASCII grid round-trip.
+    pub fn frame(&self, start_col: usize) -> Glyph {
+        let mut s = String::with_capacity(9 * 10);
+        for (r, row) in self.rows.iter().enumerate() {
+            for c in 0..nuimo_protocol::LED_COLS {
+                let canvas_col = start_col + c;
+                let lit = canvas_col < row.len() && row[canvas_col];
+                s.push(if lit { '*' } else { '.' });
+            }
+            if r + 1 < nuimo_protocol::LED_ROWS {
+                s.push('\n');
+            }
+        }
+        Glyph::from_str(&s)
+    }
+}
+
 /// 3x5 digit bitmap (0-9). Rows go top → bottom, cols left → right.
 /// `*` = on, `.` = off. Kept in sync with `weave-server`'s font module so
 /// a programmatically-rendered digit pair looks identical to the seeded
