@@ -315,7 +315,15 @@ pub(crate) async fn run_feedback_pump(
     loop {
         match state_rx.recv().await {
             Ok(update) => {
-                dispatch(&update, &engine, &glyphs, &sink, &mut filter, &mut animations).await;
+                dispatch(
+                    &update,
+                    &engine,
+                    &glyphs,
+                    &sink,
+                    &mut filter,
+                    &mut animations,
+                )
+                .await;
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(count = n, "feedback pump lagged");
@@ -458,11 +466,7 @@ impl ScrollCanvas {
 
 const SCROLL_FRAME_MS: u64 = 120;
 
-async fn run_scroll_animation(
-    text: String,
-    device_id: String,
-    sink: Arc<dyn LedFeedbackSink>,
-) {
+async fn run_scroll_animation(text: String, device_id: String, sink: Arc<dyn LedFeedbackSink>) {
     let Some(canvas) = ScrollCanvas::from_text(&text) else {
         // Empty after non-ASCII filter — show '?' once and stop.
         let glyph = np::char_glyph('?');
@@ -799,7 +803,15 @@ mod tests {
             value: serde_json::json!("playing"),
         };
 
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter, &mut HashMap::new()).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
 
         let captured = sink.captured();
         assert_eq!(captured.len(), 2, "both Nuimos receive the play frame");
@@ -835,7 +847,15 @@ mod tests {
             value: serde_json::json!({"title": "x", "state": "playing"}),
         };
 
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter, &mut HashMap::new()).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
 
         assert!(sink.captured().is_empty());
     }
@@ -861,6 +881,14 @@ mod tests {
         };
 
         // No panic, no error — pump waits for register_led_feedback_callback.
-        dispatch(&update, &engine, &registry, &sink_slot, &mut filter, &mut HashMap::new()).await;
+        dispatch(
+            &update,
+            &engine,
+            &registry,
+            &sink_slot,
+            &mut filter,
+            &mut HashMap::new(),
+        )
+        .await;
     }
 }
