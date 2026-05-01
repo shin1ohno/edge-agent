@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.2...edge-agent-v0.16.3) - 2026-05-01
+
+### Other
+
+- dedup feedback per (property, target) — keep track scroll alive ([#98](https://github.com/shin1ohno/edge-agent/pull/98))
+
 ## [0.16.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.1...edge-agent-v0.16.2) - 2026-05-01
 
 ### Other
