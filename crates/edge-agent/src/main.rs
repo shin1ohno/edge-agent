@@ -2212,7 +2212,15 @@ async fn run_scroll_animation(text: String, device: Arc<NuimoDevice>) {
 #[cfg(feature = "roon")]
 struct FeedbackFilter {
     last_at: HashMap<(String, String), std::time::Instant>,
-    last_sig: HashMap<String, String>,
+    /// Last rendered signature per `(property, target)`. Keying on the
+    /// pair (rather than `target` alone) makes redundant publishes for
+    /// one property — Roon broadcasting `playback: "playing"` again
+    /// after a `next_track` even though the state didn't change — skip
+    /// without overwriting a fresh frame from a *different* property
+    /// (e.g. the `now_playing` track scroll the user actually wants
+    /// to see). Without this, a `next_track` produces a quick scroll
+    /// flash followed by the play glyph clobbering it.
+    last_sig: HashMap<(String, String), String>,
 }
 
 #[cfg(feature = "roon")]
@@ -2227,25 +2235,28 @@ impl FeedbackFilter {
     }
 
     fn should_render(&mut self, update: &StateUpdate, signature: &str) -> bool {
-        // Dedup: same visible frame as last write → skip.
-        if self.last_sig.get(&update.target).map(String::as_str) == Some(signature) {
+        let key = (update.property.clone(), update.target.clone());
+
+        // Dedup: same visible frame for this (property, target) as the
+        // last write → skip. A fresh frame for a *different* property
+        // on the same target (e.g. `now_playing` scroll on top of a
+        // stale `playback: playing` glyph) is allowed through.
+        if self.last_sig.get(&key).map(String::as_str) == Some(signature) {
             return false;
         }
 
         // Throttle continuous volume writes to protect BLE bandwidth.
         if matches!(update.property.as_str(), "volume") {
-            let key = (update.property.clone(), update.target.clone());
             let now = std::time::Instant::now();
             if let Some(last) = self.last_at.get(&key) {
                 if now.duration_since(*last) < Self::MIN_GAP {
                     return false;
                 }
             }
-            self.last_at.insert(key, now);
+            self.last_at.insert(key.clone(), now);
         }
 
-        self.last_sig
-            .insert(update.target.clone(), signature.to_string());
+        self.last_sig.insert(key, signature.to_string());
         true
     }
 }
@@ -2785,5 +2796,71 @@ mod tests {
             None,
             "non-object value has no field to read",
         );
+    }
+
+    #[cfg(feature = "roon")]
+    fn state_update_with_target(
+        property: &str,
+        target: &str,
+        value: serde_json::Value,
+    ) -> StateUpdate {
+        StateUpdate {
+            service_type: "roon".into(),
+            target: target.into(),
+            property: property.into(),
+            output_id: None,
+            value,
+        }
+    }
+
+    /// A track skip on Roon publishes both `playback: playing` (state
+    /// unchanged) and `now_playing: {...}` (track changed). Before this
+    /// fix the `last_sig` was keyed by target alone, so the playback
+    /// glyph's signature would clobber the dedup slot of the now_playing
+    /// scroll → user saw the play icon flash over the track-name scroll.
+    /// With per-(property, target) keying, each property's dedup is
+    /// independent: `playback: playing` matches its own prior signature
+    /// and is skipped; `now_playing` renders the scroll uninterrupted.
+    #[cfg(feature = "roon")]
+    #[test]
+    fn feedback_filter_dedupes_per_property_target_pair() {
+        let mut f = FeedbackFilter::new();
+        let zone = "1601ee91";
+        // Initial playback render — first observation, must render.
+        assert!(f.should_render(
+            &state_update_with_target("playback", zone, json!("playing")),
+            "glyph:play"
+        ));
+        // Now_playing scroll — different property, must render.
+        assert!(f.should_render(
+            &state_update_with_target("now_playing", zone, json!({"title": "Veins"})),
+            "scroll:Veins",
+        ));
+        // Roon re-broadcasts playback (state unchanged after skip);
+        // dedup keyed by (property=playback, target) should skip rather
+        // than overwriting the now_playing scroll signature.
+        assert!(
+            !f.should_render(
+                &state_update_with_target("playback", zone, json!("playing")),
+                "glyph:play"
+            ),
+            "playback redraw with unchanged value must be deduped per-property",
+        );
+        // Now_playing for a NEW track must render — different signature
+        // for the same (now_playing, target) key.
+        assert!(f.should_render(
+            &state_update_with_target(
+                "now_playing",
+                zone,
+                json!({"title": "When Will They Shoot?"})
+            ),
+            "scroll:When Will They Shoot?",
+        ));
+        // Genuine playback transition (playing → paused) must render —
+        // signature for (playback, target) changed.
+        assert!(f.should_render(
+            &state_update_with_target("playback", zone, json!("paused")),
+            "glyph:pause",
+        ));
     }
 }
