@@ -14,6 +14,7 @@
 //! `(edge_id, device_id)` in `weave-contracts::DeviceStateEntry`.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeToServer, PatchOp, ServerToEdge};
 
 use crate::adapter_ios_media::{IosMediaAdapter, IosMediaCallback, NowPlayingInfo, PlaybackState};
+use crate::cache::{hydrate_from_cache, persist_cache};
 use crate::device_control::DeviceControlSink;
 use crate::feedback_pump::{run_feedback_pump, LedFeedbackSink, StateUpdate};
 use crate::glyph_registry::GlyphRegistry;
@@ -109,6 +111,12 @@ pub struct EdgeClient {
     /// `Arc<StdMutex<Option<...>>>` pattern as `led_sink` so Swift can
     /// register after `connect` finishes.
     device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
+    /// Application Support directory the Swift host computed for this
+    /// app. Mappings + glyphs are persisted under it as JSON so a
+    /// cold start can route Nuimo input before (or without) reaching
+    /// the server.
+    #[allow(dead_code)]
+    cache_dir: Arc<PathBuf>,
 }
 
 const OUTBOX_CAPACITY: usize = 64;
@@ -127,6 +135,7 @@ impl EdgeClient {
         server_url: String,
         edge_id: String,
         capabilities: Vec<String>,
+        cache_dir: String,
         sink: Arc<dyn EdgeEventSink>,
     ) -> Result<Arc<Self>, WeaveError> {
         let base = normalize_base(&server_url)?;
@@ -137,10 +146,19 @@ impl EdgeClient {
         let (state_tx, state_rx) = broadcast::channel::<StateUpdate>(STATE_CHANNEL_CAPACITY);
         let engine = Arc::new(RoutingEngine::new());
         let glyphs = Arc::new(GlyphRegistry::new());
+        let cache_dir: Arc<PathBuf> = Arc::new(PathBuf::from(cache_dir));
         let led_sink: Arc<StdMutex<Option<Arc<dyn LedFeedbackSink>>>> =
             Arc::new(StdMutex::new(None));
         let device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>> =
             Arc::new(StdMutex::new(None));
+
+        // Hydrate from disk before the WS loop spawns so any Nuimo
+        // input that arrives before `ConfigFull` already has the
+        // last-known mapping set to route against. Decode failures
+        // are logged inside `hydrate_from_cache` and leave both
+        // structures empty — the same effective state as a fresh
+        // install, which the WS connect will repopulate.
+        hydrate_from_cache(&cache_dir, &engine, &glyphs).await;
 
         tokio::spawn(run_ws_loop(
             ws_url,
@@ -151,6 +169,7 @@ impl EdgeClient {
             outbox_rx,
             engine.clone(),
             glyphs.clone(),
+            cache_dir.clone(),
             device_control.clone(),
             state_tx.clone(),
         ));
@@ -173,6 +192,7 @@ impl EdgeClient {
             state_tx,
             led_sink,
             device_control,
+            cache_dir,
         }))
     }
 
@@ -499,6 +519,7 @@ async fn run_ws_loop(
     mut outbox_rx: mpsc::Receiver<OutboundCommand>,
     engine: Arc<RoutingEngine>,
     glyphs: Arc<GlyphRegistry>,
+    cache_dir: Arc<PathBuf>,
     device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
     state_tx: broadcast::Sender<StateUpdate>,
 ) {
@@ -664,6 +685,7 @@ async fn run_ws_loop(
                                                     apply_inbound_frame(
                                                         &engine,
                                                         &glyphs,
+                                                        &cache_dir,
                                                         &device_control,
                                                         &state_tx,
                                                         other,
@@ -738,6 +760,7 @@ async fn send_frame(
 async fn apply_inbound_frame(
     engine: &RoutingEngine,
     glyphs: &GlyphRegistry,
+    cache_dir: &Path,
     device_control: &StdMutex<Option<Arc<dyn DeviceControlSink>>>,
     state_tx: &broadcast::Sender<StateUpdate>,
     frame: ServerToEdge,
@@ -756,6 +779,7 @@ async fn apply_inbound_frame(
                 cycle_count,
                 "ws/edge: config_full applied"
             );
+            persist_cache(cache_dir, engine, glyphs).await;
         }
         ServerToEdge::ConfigPatch {
             mapping_id,
@@ -765,10 +789,12 @@ async fn apply_inbound_frame(
             (PatchOp::Upsert, Some(m)) => {
                 engine.upsert_mapping(m).await;
                 tracing::info!(%mapping_id, "ws/edge: mapping upserted");
+                persist_cache(cache_dir, engine, glyphs).await;
             }
             (PatchOp::Delete, _) => {
                 engine.remove_mapping(&mapping_id).await;
                 tracing::info!(%mapping_id, "ws/edge: mapping deleted");
+                persist_cache(cache_dir, engine, glyphs).await;
             }
             (PatchOp::Upsert, None) => {
                 tracing::warn!(%mapping_id, "ws/edge: upsert without mapping payload");
@@ -788,6 +814,7 @@ async fn apply_inbound_frame(
                 let updated = m.clone();
                 engine.upsert_mapping(updated).await;
                 tracing::info!(%mapping_id, %service_target, "ws/edge: target_switch applied");
+                persist_cache(cache_dir, engine, glyphs).await;
             } else {
                 tracing::warn!(%mapping_id, "ws/edge: target_switch for unknown mapping");
             }
@@ -796,6 +823,7 @@ async fn apply_inbound_frame(
             let count = incoming.len();
             glyphs.replace_all(incoming).await;
             tracing::info!(count, "ws/edge: glyphs_update applied");
+            persist_cache(cache_dir, engine, glyphs).await;
         }
         // Device-control frames are dispatched across `device_control`
         // into Swift, which drives `BleBridge`. The slot is filled by
@@ -1058,6 +1086,7 @@ mod tests {
     use crate::adapter_ios_media::{NowPlayingInfo, PlaybackState};
     use edge_core::{InputPrimitive, Intent};
     use std::collections::BTreeMap;
+    use tempfile::TempDir;
     use uuid::Uuid;
     use weave_contracts::{EdgeConfig, Mapping, Route};
 
@@ -1147,6 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_full_replaces_engine_state() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
@@ -1160,6 +1190,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::ConfigFull { config },
@@ -1172,10 +1203,14 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].service_type, "ios_media");
         assert!(matches!(intents[0].intent, Intent::PlayPause));
+
+        // Cache file written so a fresh hydrate sees the same mapping.
+        assert!(tmp.path().join("mappings.json").exists());
     }
 
     #[tokio::test]
     async fn config_full_clears_prior_mappings() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let first = ios_media_mapping("nuimo-1");
@@ -1190,6 +1225,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::ConfigFull { config },
@@ -1207,6 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_patch_upsert_adds_mapping() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
@@ -1215,6 +1252,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::ConfigPatch {
@@ -1229,10 +1267,12 @@ mod tests {
             .route("nuimo", "nuimo-1", &InputPrimitive::Press)
             .await;
         assert_eq!(intents.len(), 1);
+        assert!(tmp.path().join("mappings.json").exists());
     }
 
     #[tokio::test]
     async fn config_patch_delete_removes_mapping() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
@@ -1242,6 +1282,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::ConfigPatch {
@@ -1260,6 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn target_switch_updates_service_target() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
@@ -1269,6 +1311,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::TargetSwitch {
@@ -1288,6 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn target_switch_for_unknown_mapping_is_noop() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let mapping = ios_media_mapping("nuimo-1");
@@ -1296,6 +1340,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &empty_device_control_slot(),
             &dummy_state_tx(),
             ServerToEdge::TargetSwitch {
@@ -1312,6 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn display_glyph_dispatches_to_registered_sink() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let recorder: Arc<RecordingDeviceControlSink> =
@@ -1323,6 +1369,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DisplayGlyph {
@@ -1349,6 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_connect_dispatches_to_registered_sink() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let recorder: Arc<RecordingDeviceControlSink> =
@@ -1360,6 +1408,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DeviceConnect {
@@ -1375,6 +1424,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_disconnect_dispatches_to_registered_sink() {
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let recorder: Arc<RecordingDeviceControlSink> =
@@ -1386,6 +1436,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DeviceDisconnect {
@@ -1403,6 +1454,7 @@ mod tests {
     async fn device_control_frames_drop_when_no_sink_registered() {
         // No-panic guarantee: WS loop continues even without a sink so the
         // connection-setup window stays clean.
+        let tmp = TempDir::new().unwrap();
         let engine = RoutingEngine::new();
         let glyphs = GlyphRegistry::new();
         let slot = empty_device_control_slot();
@@ -1410,6 +1462,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DisplayGlyph {
@@ -1425,6 +1478,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DeviceConnect {
@@ -1436,6 +1490,7 @@ mod tests {
         apply_inbound_frame(
             &engine,
             &glyphs,
+            tmp.path(),
             &slot,
             &dummy_state_tx(),
             ServerToEdge::DeviceDisconnect {
