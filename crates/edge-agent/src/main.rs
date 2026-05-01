@@ -223,7 +223,8 @@ async fn main() -> anyhow::Result<()> {
                 let macos_cfg = macos_cfg.clone();
                 let outbox = ws_outbox.clone();
                 let resync = ws_resync.clone();
-                tokio::spawn(run_macos_bootstrap(macos_cfg, tx, outbox, resync));
+                let engine = engine.clone();
+                tokio::spawn(run_macos_bootstrap(macos_cfg, tx, outbox, resync, engine));
             }
             None => {
                 tracing::info!("no [macos] section in config — macos adapter disabled");
@@ -251,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         roon_adapter.subscribe_state(),
         ws_outbox.clone(),
         ws_resync.subscribe(),
+        engine.clone(),
     );
 
     #[cfg(feature = "macos_music")]
@@ -258,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         macos_music_adapter.subscribe_state(),
         ws_outbox.clone(),
         ws_resync.subscribe(),
+        engine.clone(),
     );
 
     tokio::spawn(run_dispatcher(
@@ -902,16 +905,33 @@ async fn run_nuimo_event_loop(
                                 .into_iter()
                                 .find(|m| m.mapping_id == active_mapping_id)
                             {
-                                let label = mapping
+                                // Lookup chain for the optimistic letter:
+                                //   1. engine display_name cache (Roon
+                                //      `Qutest`, Hue `Jin`) — populated
+                                //      from observed state and from the
+                                //      server's prior `SwitchActiveConnection`
+                                //      echoes
+                                //   2. mapping's target_candidates label
+                                //      (legacy path)
+                                //   3. `?` — never expose the raw UUID
+                                //      `service_target` as user-visible
+                                //      text, even briefly
+                                let cached = engine
+                                    .display_name_for(
+                                        &mapping.service_type,
+                                        &mapping.service_target,
+                                    )
+                                    .await;
+                                let candidate_label = mapping
                                     .target_candidates
                                     .iter()
                                     .find(|c| c.target == mapping.service_target)
-                                    .map(|c| c.label.as_str())
-                                    .filter(|l| !l.is_empty())
-                                    .unwrap_or(mapping.service_target.as_str());
+                                    .map(|c| c.label.clone())
+                                    .filter(|l| !l.is_empty());
+                                let label = cached.or(candidate_label);
                                 let letter = label
-                                    .chars()
-                                    .find(|c| c.is_ascii_alphanumeric())
+                                    .as_deref()
+                                    .and_then(|l| l.chars().find(|c| c.is_ascii_alphanumeric()))
                                     .map(|c| c.to_ascii_uppercase())
                                     .unwrap_or('?');
                                 let _ = device
@@ -1012,6 +1032,7 @@ async fn run_hue_bootstrap(
                     adapter.subscribe_state(),
                     outbox.clone(),
                     resync.subscribe(),
+                    engine.clone(),
                 );
 
                 // Bring up Tap Dial input supervisors before publishing
@@ -1215,6 +1236,7 @@ async fn run_macos_bootstrap(
     tx: tokio::sync::watch::Sender<Option<Arc<dyn ServiceAdapter>>>,
     outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     resync: tokio::sync::broadcast::Sender<()>,
+    engine: Arc<RoutingEngine>,
 ) {
     let mut delay = Duration::from_secs(0);
     let cap = Duration::from_secs(300);
@@ -1228,7 +1250,12 @@ async fn run_macos_bootstrap(
             Ok(adapter) => {
                 let arc: Arc<dyn ServiceAdapter> = Arc::new(adapter);
                 tracing::info!(attempt, "macos adapter online");
-                spawn_state_pump(arc.subscribe_state(), outbox.clone(), resync.subscribe());
+                spawn_state_pump(
+                    arc.subscribe_state(),
+                    outbox.clone(),
+                    resync.subscribe(),
+                    engine.clone(),
+                );
                 let _ = tx.send(Some(arc));
                 return;
             }
@@ -1483,10 +1510,25 @@ async fn run_feedback_pump(
     }
 }
 
+/// Pull a `display_name` string out of an adapter's published value
+/// shape. Roon publishes `property: "zone"` with `value: { display_name,
+/// state }`; Hue publishes `property: "light"` with `value: { brightness,
+/// display_name, on }`. Both have the name at the top level. Returns
+/// `None` for any other shape — payloads without a top-level
+/// `display_name` field do not contribute to the cycle-switch label
+/// cache.
+fn extract_display_name(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("display_name")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+}
+
 fn spawn_state_pump(
     mut state_rx: tokio::sync::broadcast::Receiver<StateUpdate>,
     outbox: tokio::sync::mpsc::Sender<EdgeToServer>,
     mut resync_rx: tokio::sync::broadcast::Receiver<()>,
+    engine: Arc<RoutingEngine>,
 ) {
     tokio::spawn(async move {
         // Last-write-wins cache keyed by
@@ -1503,6 +1545,21 @@ fn spawn_state_pump(
             tokio::select! {
                 res = state_rx.recv() => match res {
                     Ok(update) => {
+                        // Cache the endpoint's display_name when an
+                        // adapter's value carries one — Roon's `zone`
+                        // payload, Hue's `light` payload. The cycle-switch
+                        // optimistic letter glyph reads this out so the
+                        // LED shows e.g. `Q` for Qutest instead of `1`
+                        // (the first character of a zone UUID).
+                        if let Some(name) = extract_display_name(&update.value) {
+                            engine
+                                .record_display_name(
+                                    &update.service_type,
+                                    &update.target,
+                                    name,
+                                )
+                                .await;
+                        }
                         let frame = EdgeToServer::State {
                             service_type: update.service_type.clone(),
                             target: update.target.clone(),
@@ -2675,6 +2732,31 @@ mod tests {
         assert!(
             outbox_rx.try_recv().is_err(),
             "source edge must NOT also emit a Command frame for forwarded intents",
+        );
+    }
+
+    #[test]
+    fn extract_display_name_pulls_top_level_field() {
+        let v = json!({"display_name": "Qutest", "state": "playing"});
+        assert_eq!(extract_display_name(&v), Some("Qutest"));
+    }
+
+    #[test]
+    fn extract_display_name_returns_none_for_missing_or_empty() {
+        assert_eq!(
+            extract_display_name(&json!({"state": "playing"})),
+            None,
+            "no display_name field"
+        );
+        assert_eq!(
+            extract_display_name(&json!({"display_name": ""})),
+            None,
+            "empty string is treated as absent",
+        );
+        assert_eq!(
+            extract_display_name(&json!("plain string")),
+            None,
+            "non-object value has no field to read",
         );
     }
 }
