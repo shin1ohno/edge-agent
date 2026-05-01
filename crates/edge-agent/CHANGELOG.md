@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.15.0...edge-agent-v0.16.0) - 2026-05-01
+
+### Other
+
+- refresh README to reflect 0.14 stack ([#90](https://github.com/shin1ohno/edge-agent/pull/90))
+- extract Roon now_playing title from one_line/two_line ([#88](https://github.com/shin1ohno/edge-agent/pull/88))
+
 ## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.14.0...edge-agent-v0.15.0) - 2026-04-30
 
 ### Added

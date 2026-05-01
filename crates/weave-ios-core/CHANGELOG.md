@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.15.0...weave-ios-core-v0.16.0) - 2026-05-01
+
+### Other
+
+- extract Roon now_playing title from one_line/two_line ([#88](https://github.com/shin1ohno/edge-agent/pull/88))
+- persist mappings + glyphs to Application Support cache ([#85](https://github.com/shin1ohno/edge-agent/pull/85))
+
 ## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.14.0...weave-ios-core-v0.15.0) - 2026-04-30
 
 ### Added
