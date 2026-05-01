@@ -1741,6 +1741,28 @@ fn translate_nuimo_event(event: &NuimoEvent) -> Option<InputPrimitive> {
 /// Returns `None` for other shapes so the caller can decide whether to
 /// skip or fall through to a named-glyph plan.
 #[cfg(feature = "roon")]
+fn extract_track_title(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let candidates = [
+        obj.get("title").and_then(|v| v.as_str()),
+        obj.get("one_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+        obj.get("two_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+        obj.get("three_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map(String::from)
+}
+
+#[cfg(feature = "roon")]
 fn volume_bar_from_value(value: &serde_json::Value) -> Option<(u8, glyphs::VolumeDirection)> {
     match value {
         serde_json::Value::Number(_) => {
@@ -1875,14 +1897,11 @@ impl FeedbackPlan {
                     }
                 }
                 "track_scroll" => {
-                    if let Some(title) = update
-                        .value
-                        .as_object()
-                        .and_then(|o| o.get("title"))
-                        .and_then(|v| v.as_str())
-                        .filter(|t| !t.is_empty())
-                    {
-                        return Some(Self::ScrollText(title.to_string()));
+                    // Multi-shape: iOS publishes `{title, artist, ...}`;
+                    // Roon publishes `{one_line: {line1}, two_line: {...}}`.
+                    // Try each fallback so the rule binds for any edge.
+                    if let Some(title) = extract_track_title(&update.value) {
+                        return Some(Self::ScrollText(title));
                     }
                 }
                 "playback_glyph" => {
