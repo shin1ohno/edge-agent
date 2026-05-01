@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.0...edge-agent-v0.16.1) - 2026-05-01
+
+### Other
+
+- forward unmatched intents to weave-server for cross-edge dispatch ([#92](https://github.com/shin1ohno/edge-agent/pull/92))
+
 ## [0.16.0](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.15.0...edge-agent-v0.16.0) - 2026-05-01
 
 ### Other
