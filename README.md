@@ -193,3 +193,12 @@ For Hue specifically, the bridge resolver caches the discovered IP keyed by `bri
 ## Status
 
 Production: Roon, Hue (lights + Tap Dial), macOS audio (via macos-hub), iPad (via WeaveIos + adapter_ios_media), multi-Nuimo on Linux, full upstream Nuimo gesture vocabulary (button + rotate + 4 swipes + 4 touches + 4 long-touches + 2 fly + hover proximity).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
