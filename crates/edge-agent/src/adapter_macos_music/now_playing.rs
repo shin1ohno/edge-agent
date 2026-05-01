@@ -143,10 +143,9 @@ mod tests {
 
     #[test]
     fn parse_full_track_snapshot() {
-        let line = format!(
-            "playing\u{1f}65\u{1f}42.5\u{1f}Veins\u{1f}The Chainsmokers / Daya\u{1f}Breathe\u{1f}214.0"
-        );
-        let snap = parse_snapshot(&line).expect("parse");
+        let line =
+            "playing\u{1f}65\u{1f}42.5\u{1f}Veins\u{1f}The Chainsmokers / Daya\u{1f}Breathe\u{1f}214.0";
+        let snap = parse_snapshot(line).expect("parse");
         assert_eq!(snap.state, "playing");
         assert_eq!(snap.volume, 65);
         assert_eq!(snap.position_seconds, Some(42.5));
@@ -158,8 +157,8 @@ mod tests {
 
     #[test]
     fn parse_stopped_snapshot() {
-        let line = "stopped\u{1f}50\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}".to_string();
-        let snap = parse_snapshot(&line).expect("parse");
+        let line = "stopped\u{1f}50\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}";
+        let snap = parse_snapshot(line).expect("parse");
         assert_eq!(snap.state, "stopped");
         assert_eq!(snap.volume, 50);
         assert_eq!(snap.position_seconds, None);
@@ -171,11 +170,11 @@ mod tests {
         // ASCII Unit Separator embedded mid-title would split the field.
         // Music.app doesn't allow this character in metadata in practice,
         // but the parser must not panic if it ever appears.
-        let line = format!("playing\u{1f}65\u{1f}10.0\u{1f}A\u{1f}B\u{1f}C\u{1f}\u{1f}D");
+        let line = "playing\u{1f}65\u{1f}10.0\u{1f}A\u{1f}B\u{1f}C\u{1f}\u{1f}D";
         // 8 parts now; first 7 are taken — "extra" `D` is ignored. The
         // duration_seconds field will be empty so parse_f64 fails →
         // returns None for that field.
-        let snap = parse_snapshot(&line).expect("parse");
+        let snap = parse_snapshot(line).expect("parse");
         assert_eq!(snap.state, "playing");
         // duration empty → None
         assert_eq!(snap.duration_seconds, None);
