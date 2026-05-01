@@ -403,12 +403,13 @@ impl WsClient {
                 device_type,
                 device_id,
                 active_mapping_id,
-                service_target_label: _,
+                service_target_label,
             } => {
                 tracing::info!(
                     %device_type,
                     %device_id,
                     %active_mapping_id,
+                    label = ?service_target_label,
                     "switch_active_connection from server"
                 );
                 let applied = self
@@ -420,6 +421,30 @@ impl WsClient {
                         %device_type, %device_id, %active_mapping_id,
                         "switch_active_connection: cycle missing or active not in mapping_ids — ignoring"
                     );
+                }
+                // Cache the server-resolved display_name on the active
+                // mapping's `(service_type, service_target)`. Future
+                // cycle-switch optimistic letters read this back so the
+                // LED shows the endpoint's first character (e.g. `Q`)
+                // immediately on the next swipe. Falls through silently
+                // when the server didn't ship a label (None — typically
+                // because no service_state has been observed yet).
+                if let Some(label) = service_target_label.as_deref().filter(|l| !l.is_empty()) {
+                    if let Some(mapping) = self
+                        .engine
+                        .snapshot()
+                        .await
+                        .into_iter()
+                        .find(|m| m.mapping_id == active_mapping_id)
+                    {
+                        self.engine
+                            .record_display_name(
+                                &mapping.service_type,
+                                &mapping.service_target,
+                                label,
+                            )
+                            .await;
+                    }
                 }
                 self.refresh_cache().await;
             }

@@ -146,6 +146,14 @@ pub struct RoutingEngine {
     /// `CycleSwitch` outcome that advances active locally and asks the
     /// caller to inform the server.
     cycles: RwLock<HashMap<(String, String), DeviceCycle>>,
+    /// Cached display name per `(service_type, service_target)`. Fed by
+    /// observed `StateUpdate`s whose payload contains a `display_name`
+    /// (Roon `zone.display_name`, Hue `light.display_name`) and by the
+    /// authoritative `ServerToEdge::SwitchActiveConnection` echo's
+    /// `service_target_label`. Read by the cycle-switch optimistic
+    /// letter glyph so the LED shows e.g. `Q` (Qutest) instead of the
+    /// first character of a zone UUID.
+    display_names: RwLock<HashMap<(String, String), String>>,
 }
 
 impl RoutingEngine {
@@ -287,6 +295,58 @@ impl RoutingEngine {
     pub async fn cycle_for(&self, device_type: &str, device_id: &str) -> Option<DeviceCycle> {
         let key = (device_type.to_string(), device_id.to_string());
         self.cycles.read().await.get(&key).cloned()
+    }
+
+    /// Look up a cached display name for `(service_type, service_target)`.
+    /// Used by the cycle-switch optimistic letter glyph so the LED shows
+    /// the endpoint's first character (e.g. `Q` for Qutest, `J` for the
+    /// `Jin` Hue light) instead of the first character of the raw UUID
+    /// `service_target` field.
+    pub async fn display_name_for(
+        &self,
+        service_type: &str,
+        service_target: &str,
+    ) -> Option<String> {
+        let key = (service_type.to_string(), service_target.to_string());
+        self.display_names.read().await.get(&key).cloned()
+    }
+
+    /// Record a display name for future cycle-switch lookups. Idempotent
+    /// upsert — a fresher observation overrides an older one. Drops the
+    /// entry when `name` is empty so a service that retracts its name
+    /// doesn't leave stale data.
+    pub async fn record_display_name(&self, service_type: &str, service_target: &str, name: &str) {
+        let key = (service_type.to_string(), service_target.to_string());
+        let mut guard = self.display_names.write().await;
+        if name.is_empty() {
+            guard.remove(&key);
+        } else {
+            guard.insert(key, name.to_string());
+        }
+    }
+
+    /// Bulk replace the display-name cache (used by cache hydration on
+    /// startup). Order does not matter — entries are keyed.
+    pub async fn replace_display_names(&self, entries: Vec<(String, String, String)>) {
+        let mut map: HashMap<(String, String), String> = HashMap::new();
+        for (service_type, target, name) in entries {
+            if name.is_empty() {
+                continue;
+            }
+            map.insert((service_type, target), name);
+        }
+        *self.display_names.write().await = map;
+    }
+
+    /// Snapshot the display-name cache for persistence. Returns
+    /// `(service_type, service_target, display_name)` triples.
+    pub async fn display_names_snapshot(&self) -> Vec<(String, String, String)> {
+        self.display_names
+            .read()
+            .await
+            .iter()
+            .map(|((st, t), n)| (st.clone(), t.clone(), n.clone()))
+            .collect()
     }
 
     /// Feedback rules attached to whichever mapping covers the given
@@ -1194,6 +1254,42 @@ mod tests {
         assert!(
             targets_zone2.is_empty(),
             "inactive zone-2 mapping must NOT yield feedback targets"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_name_cache_records_and_lookups_by_target_key() {
+        let engine = RoutingEngine::new();
+        engine
+            .record_display_name("roon", "1601ee91...", "Qutest")
+            .await;
+        assert_eq!(
+            engine.display_name_for("roon", "1601ee91...").await,
+            Some("Qutest".to_string())
+        );
+        // Different (service_type, target) keys are independent.
+        assert_eq!(engine.display_name_for("hue", "1601ee91...").await, None);
+    }
+
+    #[tokio::test]
+    async fn display_name_cache_drops_entry_on_empty_record() {
+        let engine = RoutingEngine::new();
+        engine.record_display_name("hue", "light-1", "Jin").await;
+        assert!(engine.display_name_for("hue", "light-1").await.is_some());
+        engine.record_display_name("hue", "light-1", "").await;
+        assert!(engine.display_name_for("hue", "light-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn display_name_cache_replace_overrides_prior_entries() {
+        let engine = RoutingEngine::new();
+        engine.record_display_name("roon", "z1", "Old").await;
+        engine
+            .replace_display_names(vec![("roon".into(), "z1".into(), "New".into())])
+            .await;
+        assert_eq!(
+            engine.display_name_for("roon", "z1").await,
+            Some("New".to_string())
         );
     }
 }
