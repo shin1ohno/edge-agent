@@ -15,6 +15,8 @@
 mod adapter_hue;
 #[cfg(feature = "macos")]
 mod adapter_macos;
+#[cfg(feature = "macos_music")]
+mod adapter_macos_music;
 #[cfg(feature = "roon")]
 mod adapter_roon;
 mod config;
@@ -38,6 +40,8 @@ use tokio::sync::RwLock;
 use adapter_hue::{HueAdapter, HueConfig};
 #[cfg(feature = "macos")]
 use adapter_macos::{MacosAdapter, MacosConfig};
+#[cfg(feature = "macos_music")]
+use adapter_macos_music::{MacosMusicAdapter, MacosMusicConfig};
 #[cfg(feature = "roon")]
 use adapter_roon::{RoonAdapter, RoonConfig};
 use edge_core::{
@@ -90,6 +94,9 @@ async fn main() -> anyhow::Result<()> {
         }
         if cfg!(feature = "macos") {
             caps.push("macos".to_string());
+        }
+        if cfg!(feature = "macos_music") {
+            caps.push("macos_music".to_string());
         }
         caps
     };
@@ -225,6 +232,16 @@ async fn main() -> anyhow::Result<()> {
         rx
     };
 
+    // macOS Music.app adapter is eager — `start` only spawns the polling
+    // task and does no I/O, so there's nothing to retry. The polling task
+    // itself tolerates Music.app being closed (the `osascript` call is
+    // logged at debug and retried on the next tick).
+    #[cfg(feature = "macos_music")]
+    let macos_music_adapter: Arc<dyn ServiceAdapter> = {
+        let adapter = MacosMusicAdapter::start(MacosMusicConfig).await?;
+        Arc::new(adapter)
+    };
+
     // Global adapter → WS state pump and intent dispatcher. Spawned before
     // the Nuimo supervisor so service state continues to flow to
     // `/ws/edge` even in WS-only mode (no allowlist entries) or while the
@@ -232,6 +249,13 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "roon")]
     spawn_state_pump(
         roon_adapter.subscribe_state(),
+        ws_outbox.clone(),
+        ws_resync.subscribe(),
+    );
+
+    #[cfg(feature = "macos_music")]
+    spawn_state_pump(
+        macos_music_adapter.subscribe_state(),
         ws_outbox.clone(),
         ws_resync.subscribe(),
     );
@@ -245,6 +269,8 @@ async fn main() -> anyhow::Result<()> {
         hue_adapter_rx.clone(),
         #[cfg(feature = "macos")]
         macos_adapter_rx.clone(),
+        #[cfg(feature = "macos_music")]
+        macos_music_adapter.clone(),
     ));
 
     // WS-only mode: only the explicit `nuimo.skip=true` opts out of BLE.
@@ -1251,6 +1277,7 @@ async fn run_dispatcher(
     #[cfg(feature = "roon")] roon: Arc<dyn ServiceAdapter>,
     #[cfg(feature = "hue")] hue: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
     #[cfg(feature = "macos")] macos: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
+    #[cfg(feature = "macos_music")] macos_music: Arc<dyn ServiceAdapter>,
 ) {
     let mut workers: HashMap<(String, String), tokio::sync::mpsc::Sender<Intent>> = HashMap::new();
 
@@ -1265,6 +1292,8 @@ async fn run_dispatcher(
                 "hue" => hue.borrow().clone(),
                 #[cfg(feature = "macos")]
                 "macos" => macos.borrow().clone(),
+                #[cfg(feature = "macos_music")]
+                "macos_music" => Some(macos_music.clone()),
                 _ => None,
             };
             let Some(adapter) = adapter else {
@@ -2596,6 +2625,8 @@ mod tests {
         let (_hue_tx, hue_rx) = watch::channel::<Option<Arc<dyn ServiceAdapter>>>(None);
         #[cfg(feature = "macos")]
         let (_macos_tx, macos_rx) = watch::channel::<Option<Arc<dyn ServiceAdapter>>>(None);
+        #[cfg(feature = "macos_music")]
+        let macos_music: Arc<dyn ServiceAdapter> = Arc::new(StubAdapter);
 
         tokio::spawn(run_dispatcher(
             intent_rx,
@@ -2606,6 +2637,8 @@ mod tests {
             hue_rx,
             #[cfg(feature = "macos")]
             macos_rx,
+            #[cfg(feature = "macos_music")]
+            macos_music,
         ));
 
         intent_tx

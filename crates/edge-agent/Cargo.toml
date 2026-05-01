@@ -42,3 +42,6 @@ default = ["roon"]
 roon = ["dep:roon-api"]
 hue = ["dep:reqwest", "dep:bytes", "dep:mdns-sd"]
 macos = ["dep:rumqttc"]
+# `macos_music` drives the local `Music.app` via `osascript`. macOS-only —
+# enable on Mac hosts only (`cargo install ... --features macos_music`).
+macos_music = []
