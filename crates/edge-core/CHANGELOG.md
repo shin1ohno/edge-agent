@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.16.1...edge-core-v0.16.2) - 2026-05-01
+
+### Other
+
+- feed cross-edge ServiceState echoes into local feedback pump ([#97](https://github.com/shin1ohno/edge-agent/pull/97))
+- cycle-switch optimistic letter reads engine display_name cache ([#96](https://github.com/shin1ohno/edge-agent/pull/96))
+
 ## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/edge-core-v0.14.0...edge-core-v0.15.0) - 2026-04-30
 
 ### Other

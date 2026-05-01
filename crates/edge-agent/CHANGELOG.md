@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.1...edge-agent-v0.16.2) - 2026-05-01
+
+### Other
+
+- feed cross-edge ServiceState echoes into local feedback pump ([#97](https://github.com/shin1ohno/edge-agent/pull/97))
+- cycle-switch optimistic letter reads engine display_name cache ([#96](https://github.com/shin1ohno/edge-agent/pull/96))
+- add macos_music adapter (local Music.app control on Mac) ([#95](https://github.com/shin1ohno/edge-agent/pull/95))
+- add dual MIT/Apache-2.0 license files
+
 ## [0.16.1](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.0...edge-agent-v0.16.1) - 2026-05-01
 
 ### Other

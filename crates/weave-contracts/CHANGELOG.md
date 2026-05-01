@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.16.1...weave-contracts-v0.16.2) - 2026-05-01
+
+### Other
+
+- add dual MIT/Apache-2.0 license files
+
 ## [0.15.0](https://github.com/shin1ohno/edge-agent/compare/weave-contracts-v0.14.0...weave-contracts-v0.15.0) - 2026-04-30
 
 ### Other
