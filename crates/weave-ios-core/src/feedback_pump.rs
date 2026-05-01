@@ -120,17 +120,17 @@ impl FeedbackPlan {
                     }
                 }
                 "track_scroll" => {
-                    // Accepts the `now_playing` composite — extract
-                    // `value.title`. Pairs with the `state == "track"`
-                    // alias above so old saved rules bind too.
-                    if let Some(title) = update
-                        .value
-                        .as_object()
-                        .and_then(|o| o.get("title"))
-                        .and_then(|v| v.as_str())
-                        .filter(|t| !t.is_empty())
-                    {
-                        return Some(Self::ScrollText(title.to_string()));
+                    // Accepts the `now_playing` composite. Different
+                    // adapters publish different shapes:
+                    //   - iOS NowPlayingObserver: flat `{title, artist, ...}`
+                    //   - Roon roon-hub: nested `{one_line: {line1: "Track - Artist"},
+                    //     two_line: {line1, line2}, three_line: {...}}`
+                    // Try each in turn so the rule binds regardless of
+                    // which edge published the update. Pairs with the
+                    // `state == "track"` alias above so old saved rules
+                    // bind too.
+                    if let Some(title) = extract_track_title(&update.value) {
+                        return Some(Self::ScrollText(title));
                     }
                 }
                 "playback_glyph" => {
@@ -256,6 +256,31 @@ impl FeedbackPlan {
         };
         Some(np::build_led_payload(&glyph, &opts).to_vec())
     }
+}
+
+/// Extract a scrollable track title from a `now_playing` value. Tries
+/// the iOS-flat shape first (`title`), then Roon's nested shape
+/// (`one_line.line1`, `two_line.line1`). Returns `None` when no
+/// non-empty string is found — caller skips the scroll.
+fn extract_track_title(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let candidates = [
+        obj.get("title").and_then(|v| v.as_str()),
+        obj.get("one_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+        obj.get("two_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+        obj.get("three_line")
+            .and_then(|l| l.get("line1"))
+            .and_then(|v| v.as_str()),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// Project a state-update value into a 9-bar fill + direction.
@@ -799,6 +824,63 @@ mod tests {
                 "pulse should match property={property}"
             );
         }
+    }
+
+    #[test]
+    fn extract_track_title_prefers_flat_title_field() {
+        let v = serde_json::json!({"title": "Lateralus", "artist": "Tool"});
+        assert_eq!(extract_track_title(&v), Some("Lateralus".into()));
+    }
+
+    #[test]
+    fn extract_track_title_falls_back_to_one_line() {
+        // Roon publishes nested lines, no flat title.
+        let v = serde_json::json!({
+            "one_line": {"line1": "White Wine & Adderall - The Chainsmokers / Beau Nox"},
+            "two_line": {"line1": "White Wine & Adderall", "line2": "The Chainsmokers / Beau Nox"},
+        });
+        assert_eq!(
+            extract_track_title(&v),
+            Some("White Wine & Adderall - The Chainsmokers / Beau Nox".into())
+        );
+    }
+
+    #[test]
+    fn extract_track_title_falls_back_to_two_line_when_one_line_missing() {
+        let v = serde_json::json!({"two_line": {"line1": "Just Title", "line2": "Artist"}});
+        assert_eq!(extract_track_title(&v), Some("Just Title".into()));
+    }
+
+    #[test]
+    fn extract_track_title_returns_none_when_no_known_field() {
+        let v = serde_json::json!({"image_key": "abc", "length": 178.0});
+        assert_eq!(extract_track_title(&v), None);
+    }
+
+    #[test]
+    fn extract_track_title_skips_empty_strings() {
+        let v = serde_json::json!({"title": "", "one_line": {"line1": "fallback"}});
+        assert_eq!(extract_track_title(&v), Some("fallback".into()));
+    }
+
+    #[test]
+    fn from_rules_track_scroll_roon_shape_extracts_one_line() {
+        let rules = vec![track_scroll_rule_legacy_state()];
+        let update = StateUpdate {
+            service_type: "roon".into(),
+            target: "1601ee91722a".into(),
+            property: "now_playing".into(),
+            value: serde_json::json!({
+                "one_line": {"line1": "Happy Now (Duke & Jones Remix) - Zedd / Elley Duhé"},
+                "image_key": "abc",
+            }),
+        };
+        assert_eq!(
+            FeedbackPlan::from_rules(&update, &rules),
+            Some(FeedbackPlan::ScrollText(
+                "Happy Now (Duke & Jones Remix) - Zedd / Elley Duhé".into()
+            ))
+        );
     }
 
     #[test]
