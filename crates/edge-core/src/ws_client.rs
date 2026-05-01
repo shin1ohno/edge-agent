@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use weave_contracts::{EdgeConfig, EdgeToServer, PatchOp, ServerToEdge};
 
+use super::adapter::StateUpdate;
 use super::cache;
 use super::device_control::{DeviceControlHook, NoopDeviceControl};
 use super::intent::Intent;
@@ -45,6 +46,13 @@ pub struct WsClient {
     /// dropped — appropriate for hosts that don't have any service
     /// adapter the server might forward into.
     dispatch_tx: Option<mpsc::Sender<RoutedIntent>>,
+    /// Optional broadcast for `ServerToEdge::ServiceState` frames
+    /// echoed from peer edges. Set via `with_imported_state_sender`
+    /// when the host's feedback pumps should react to cross-edge
+    /// dispatched state (e.g. an iPad's Apple Music `now_playing`
+    /// driving an LED on the Mac whose Nuimo sourced the intent).
+    /// `None` causes echoed state to be logged at debug and dropped.
+    imported_state_tx: Option<broadcast::Sender<StateUpdate>>,
 }
 
 impl WsClient {
@@ -97,6 +105,7 @@ impl WsClient {
             resync_tx,
             device_control,
             dispatch_tx: None,
+            imported_state_tx: None,
         }
     }
 
@@ -109,6 +118,15 @@ impl WsClient {
     #[must_use]
     pub fn with_intent_dispatcher(mut self, tx: mpsc::Sender<RoutedIntent>) -> Self {
         self.dispatch_tx = Some(tx);
+        self
+    }
+
+    /// Wire a broadcast for `ServerToEdge::ServiceState` echoes so the
+    /// host's feedback pumps can react to cross-edge dispatched state.
+    /// Without this hook, echoes are logged at debug and dropped.
+    #[must_use]
+    pub fn with_imported_state_sender(mut self, tx: broadcast::Sender<StateUpdate>) -> Self {
+        self.imported_state_tx = Some(tx);
         self
     }
 
@@ -204,7 +222,7 @@ impl WsClient {
         }
     }
 
-    async fn handle_server_frame(&self, text: &str) -> anyhow::Result<()> {
+    pub(crate) async fn handle_server_frame(&self, text: &str) -> anyhow::Result<()> {
         let frame: ServerToEdge = serde_json::from_str(text)?;
         match frame {
             ServerToEdge::ConfigFull { config } => {
@@ -453,22 +471,31 @@ impl WsClient {
                 service_type,
                 target,
                 property,
-                ..
+                value,
+                output_id,
             } => {
-                // Cross-edge feedback echo from a peer edge. Linux/Mac
-                // edge-agent's feedback pumps are wired per-adapter
-                // (each adapter publishes into its own broadcast
-                // channel), so plumbing imported state into a feedback
-                // pump here would require a refactor that's out of
-                // scope for the iOS-first echo work. Log for diagnosis;
-                // wire up in a follow-up.
                 tracing::debug!(
                     %source_edge,
                     %service_type,
                     %target,
                     %property,
-                    "service_state echo from peer edge (Linux/Mac feedback echo deferred)"
+                    "service_state echo from peer edge"
                 );
+                if let Some(tx) = self.imported_state_tx.as_ref() {
+                    let update = StateUpdate {
+                        service_type,
+                        target,
+                        property,
+                        output_id,
+                        value,
+                    };
+                    if let Err(e) = tx.send(update) {
+                        tracing::debug!(
+                            error = %e,
+                            "no imported_state subscribers — drop"
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -505,5 +532,78 @@ impl WsClient {
         if let Err(e) = cache::save(&self.cache_path, &cfg).await {
             tracing::warn!(error = %e, "failed to persist cache after patch");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_client() -> (WsClient, broadcast::Receiver<StateUpdate>) {
+        let engine = Arc::new(RoutingEngine::new());
+        let glyphs = Arc::new(GlyphRegistry::new());
+        let (tx, rx) = broadcast::channel::<StateUpdate>(8);
+        let client = WsClient::new(
+            "ws://localhost:0".into(),
+            "test-edge".into(),
+            "0.0.0".into(),
+            vec![],
+            engine,
+            glyphs,
+        )
+        .with_imported_state_sender(tx);
+        (client, rx)
+    }
+
+    #[tokio::test]
+    async fn service_state_echo_publishes_imported_state_update() {
+        let (client, mut rx) = test_client();
+        let frame = serde_json::to_string(&ServerToEdge::ServiceState {
+            edge_id: "iPad".into(),
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            output_id: None,
+            value: json!({"title": "Veins", "state": "playing"}),
+        })
+        .unwrap();
+        client
+            .handle_server_frame(&frame)
+            .await
+            .expect("frame parses + dispatches");
+        let update = rx.try_recv().expect("update received");
+        assert_eq!(update.service_type, "ios_media");
+        assert_eq!(update.target, "apple_music");
+        assert_eq!(update.property, "now_playing");
+        assert_eq!(update.output_id, None);
+        assert_eq!(update.value, json!({"title": "Veins", "state": "playing"}));
+    }
+
+    #[tokio::test]
+    async fn service_state_echo_drops_silently_when_no_subscriber() {
+        let engine = Arc::new(RoutingEngine::new());
+        let glyphs = Arc::new(GlyphRegistry::new());
+        // Construct a client WITHOUT `with_imported_state_sender`; the
+        // echo path should log + drop without erroring.
+        let client = WsClient::new(
+            "ws://localhost:0".into(),
+            "test-edge".into(),
+            "0.0.0".into(),
+            vec![],
+            engine,
+            glyphs,
+        );
+        let frame = serde_json::to_string(&ServerToEdge::ServiceState {
+            edge_id: "iPad".into(),
+            service_type: "ios_media".into(),
+            target: "apple_music".into(),
+            property: "now_playing".into(),
+            output_id: None,
+            value: json!({"title": "X"}),
+        })
+        .unwrap();
+        // Must NOT panic / error.
+        client.handle_server_frame(&frame).await.unwrap();
     }
 }

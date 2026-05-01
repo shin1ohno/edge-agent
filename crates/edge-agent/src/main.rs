@@ -111,6 +111,14 @@ async fn main() -> anyhow::Result<()> {
     // identical between paths.
     let (intent_tx, intent_rx) = tokio::sync::mpsc::channel::<RoutedIntent>(256);
 
+    // Broadcast for `ServerToEdge::ServiceState` echoes — cross-edge
+    // dispatched state from a peer that owns the adapter. Per-Nuimo
+    // feedback pumps subscribe so e.g. an iPad's Apple Music
+    // `now_playing` lights up the LED on the Mac whose Nuimo press
+    // sourced the intent. No subscriber is fine — the broadcast just
+    // drops echoed state.
+    let (imported_state_tx, _) = tokio::sync::broadcast::channel::<StateUpdate>(256);
+
     let ws_client = WsClient::with_device_control(
         cfg.config_server_url.clone(),
         cfg.edge_id.clone(),
@@ -120,7 +128,8 @@ async fn main() -> anyhow::Result<()> {
         glyphs.clone(),
         device_control,
     )
-    .with_intent_dispatcher(intent_tx.clone());
+    .with_intent_dispatcher(intent_tx.clone())
+    .with_imported_state_sender(imported_state_tx.clone());
     let ws_outbox = ws_client.outbox();
     let ws_resync = ws_client.resync_sender();
 
@@ -307,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
         roon_adapter: roon_adapter.clone(),
         #[cfg(feature = "hue")]
         hue_adapter_rx: hue_adapter_rx.clone(),
+        imported_state_tx: imported_state_tx.clone(),
     };
 
     run_nuimo_supervisor(cfg.nuimo.ble_addresses, deps).await
@@ -357,6 +367,11 @@ struct NuimoDeps {
     roon_adapter: Arc<dyn ServiceAdapter>,
     #[cfg(feature = "hue")]
     hue_adapter_rx: tokio::sync::watch::Receiver<Option<Arc<dyn ServiceAdapter>>>,
+    /// Broadcast for cross-edge `ServiceState` echoes. Per-Nuimo
+    /// feedback pumps subscribe so an LED on this edge can render
+    /// state for a service that is dispatched on a peer edge (e.g.
+    /// the Mac's Nuimo press → iPad's Apple Music → Mac's LED scroll).
+    imported_state_tx: tokio::sync::broadcast::Sender<StateUpdate>,
 }
 
 /// Long-running task that consumes `nuimo::discover()` forever and brings
@@ -709,6 +724,18 @@ async fn connect_and_spawn(
             deps.engine.clone(),
         )));
     }
+
+    // Cross-edge feedback echo: per-Nuimo pump subscribed to imported
+    // state from `ServerToEdge::ServiceState`. Drives LED feedback for
+    // services dispatched on a peer edge (e.g. an iPad's Apple Music
+    // when the Nuimo press was forwarded out of this Mac).
+    handles.push(tokio::spawn(run_feedback_pump(
+        deps.imported_state_tx.subscribe(),
+        device.clone(),
+        device_id.clone(),
+        deps.glyphs.clone(),
+        deps.engine.clone(),
+    )));
 
     #[cfg(all(feature = "roon", feature = "hue"))]
     {
