@@ -1268,7 +1268,28 @@ async fn run_dispatcher(
                 _ => None,
             };
             let Some(adapter) = adapter else {
-                tracing::warn!(service_type = %key.0, "no adapter for service_type; dropping intent");
+                // No local adapter: forward to weave-server so it can hand
+                // the intent to a peer edge whose capabilities include
+                // this service_type. Mirrors `weave-ios-core::edge_client`
+                // line 288-313 — the executing edge emits the `Command`
+                // telemetry frame after running the adapter, so the source
+                // edge MUST NOT also emit one for the forwarded intent.
+                let (intent_name, params) = r.intent.split();
+                let frame = EdgeToServer::DispatchIntent {
+                    service_type: key.0.clone(),
+                    service_target: key.1.clone(),
+                    intent: intent_name,
+                    params,
+                    output_id: None,
+                };
+                if let Err(e) = outbox.send(frame).await {
+                    tracing::warn!(
+                        error = %e,
+                        service_type = %key.0,
+                        target = %key.1,
+                        "failed to enqueue dispatch_intent for forwarding",
+                    );
+                }
                 continue;
             };
             let (tx, worker_rx) = tokio::sync::mpsc::channel::<Intent>(64);
@@ -2172,7 +2193,7 @@ fn resolve_config_path(cli: Option<&str>) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, watch};
 
     fn drain(outbox: &mut mpsc::Receiver<EdgeToServer>) -> Vec<EdgeToServer> {
         let mut out = Vec::new();
@@ -2541,5 +2562,86 @@ mod tests {
             SupervisorDecision::Ignore,
         );
         assert_eq!(tracked.len(), 2);
+    }
+
+    /// Cross-edge forwarding: when an intent's `service_type` has no local
+    /// adapter, the dispatcher must hand it to the outbox as
+    /// `EdgeToServer::DispatchIntent` so weave-server can route it to a
+    /// peer edge whose capabilities match. Mirrors the iOS port behaviour
+    /// in `weave-ios-core::edge_client`.
+    #[cfg(feature = "roon")]
+    #[tokio::test]
+    async fn run_dispatcher_forwards_unmatched_service_type() {
+        struct StubAdapter;
+
+        #[async_trait]
+        impl ServiceAdapter for StubAdapter {
+            fn service_type(&self) -> &'static str {
+                "roon"
+            }
+            async fn send_intent(&self, _: &str, _: &Intent) -> anyhow::Result<()> {
+                panic!("local adapter must not be invoked for forwarded intents");
+            }
+            fn subscribe_state(&self) -> broadcast::Receiver<StateUpdate> {
+                broadcast::channel(8).1
+            }
+        }
+
+        let (intent_tx, intent_rx) = mpsc::channel::<RoutedIntent>(8);
+        let (outbox_tx, mut outbox_rx) = mpsc::channel::<EdgeToServer>(8);
+
+        #[cfg(feature = "roon")]
+        let roon: Arc<dyn ServiceAdapter> = Arc::new(StubAdapter);
+        #[cfg(feature = "hue")]
+        let (_hue_tx, hue_rx) = watch::channel::<Option<Arc<dyn ServiceAdapter>>>(None);
+        #[cfg(feature = "macos")]
+        let (_macos_tx, macos_rx) = watch::channel::<Option<Arc<dyn ServiceAdapter>>>(None);
+
+        tokio::spawn(run_dispatcher(
+            intent_rx,
+            outbox_tx,
+            #[cfg(feature = "roon")]
+            roon,
+            #[cfg(feature = "hue")]
+            hue_rx,
+            #[cfg(feature = "macos")]
+            macos_rx,
+        ));
+
+        intent_tx
+            .send(RoutedIntent {
+                service_type: "ios_media".into(),
+                service_target: "apple_music".into(),
+                intent: Intent::PlayPause,
+            })
+            .await
+            .expect("send routed intent");
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), outbox_rx.recv())
+            .await
+            .expect("frame within 1s")
+            .expect("outbox channel still open");
+
+        match frame {
+            EdgeToServer::DispatchIntent {
+                service_type,
+                service_target,
+                intent,
+                params,
+                output_id,
+            } => {
+                assert_eq!(service_type, "ios_media");
+                assert_eq!(service_target, "apple_music");
+                assert_eq!(intent, "play_pause");
+                assert_eq!(params, json!({}));
+                assert_eq!(output_id, None);
+            }
+            other => panic!("expected DispatchIntent, got {:?}", other),
+        }
+
+        assert!(
+            outbox_rx.try_recv().is_err(),
+            "source edge must NOT also emit a Command frame for forwarded intents",
+        );
     }
 }
