@@ -25,6 +25,7 @@ mod glyphs;
 mod hue_token;
 #[cfg(feature = "hue")]
 mod pair_hue;
+mod telemetry;
 mod wifi;
 
 use std::collections::HashMap;
@@ -55,12 +56,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    telemetry::init()?;
 
     let mut args = std::env::args().skip(1);
     let first = args.next();
@@ -302,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down");
+        telemetry::shutdown();
         return Ok(());
     }
 
@@ -319,7 +316,9 @@ async fn main() -> anyhow::Result<()> {
         imported_state_tx: imported_state_tx.clone(),
     };
 
-    run_nuimo_supervisor(cfg.nuimo.ble_addresses, deps).await
+    let result = run_nuimo_supervisor(cfg.nuimo.ble_addresses, deps).await;
+    telemetry::shutdown();
+    result
 }
 
 /// Periodically publish `EdgeToServer::EdgeStatus` so the server can
