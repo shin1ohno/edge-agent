@@ -4,24 +4,33 @@ import WeaveDesign
 
 /// Devices tab — Paired Nuimo inset list + "Pair a new Nuimo…" entry
 /// + Edge agents section. Mirrors the hi-fi mockup `IOSDevicesList`
-/// (`#ios-tab-devices`). Phase 3 uses placeholder data and routes row
-/// taps to Phase 4 stub detail views.
+/// (`#ios-tab-devices`). Phase 4 routes row taps to `DeviceDetailView`
+/// and "Pair a new Nuimo…" to `PairNuimoSheet`.
 public struct DevicesRootView: View {
+    @State private var showPairSheet: Bool = false
+
     public init() {}
 
     public var body: some View {
-        Form {
-            pairedSection
-            pairNewSection
-            edgeAgentsSection
-        }
-        .navigationDestination(for: DevicesRoute.self) { route in
-            switch route {
-            case .device(let id):
-                Text("Device detail (\(id.uuidString.prefix(8))…) — Phase 4")
-                    .foregroundStyle(.secondary)
-                    .navigationTitle("Device")
+        Group {
+            if PlaceholderData.devices.isEmpty {
+                DevicesEmptyState(onPair: { showPairSheet = true })
+            } else {
+                Form {
+                    pairedSection
+                    pairNewSection
+                    edgeAgentsSection
+                }
+                .navigationDestination(for: DevicesRoute.self) { route in
+                    switch route {
+                    case .device(let id):
+                        DeviceDetailView(deviceId: id)
+                    }
+                }
             }
+        }
+        .sheet(isPresented: $showPairSheet) {
+            PairNuimoSheet()
         }
     }
 
@@ -52,7 +61,7 @@ public struct DevicesRootView: View {
     private var pairNewSection: some View {
         Section {
             Button {
-                // TODO(Phase 4): present Pair-new-Nuimo sheet.
+                showPairSheet = true
             } label: {
                 IOSInsetRow(
                     title: "Pair a new Nuimo…",

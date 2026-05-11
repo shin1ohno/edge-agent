@@ -26,9 +26,7 @@ public struct ServicesRootView: View {
         .navigationDestination(for: ServicesRoute.self) { route in
             switch route {
             case .service(let id):
-                Text("Service detail (\(id)) — Phase 4")
-                    .foregroundStyle(.secondary)
-                    .navigationTitle("Service")
+                ServiceDetailView(serviceId: id)
             }
         }
     }
