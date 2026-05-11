@@ -26,6 +26,15 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
+
+# OpenTelemetry — OTLP gRPC export to apm-server.home.local:8200 when
+# OTEL_EXPORTER_OTLP_ENDPOINT is set in env. Same shape as the
+# weave-server / roon-mcp companions.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "tls", "tls-roots"] }
+tracing-opentelemetry = "0.28"
+tonic = { version = "0.12", default-features = false }
 uuid = { workspace = true }
 toml = "0.8"
 # Feature-gated: roon adapter
