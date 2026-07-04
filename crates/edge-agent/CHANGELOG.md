@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.3...edge-agent-v0.16.4) - 2026-05-11
+
+### Other
+
+- OTel OTLP export to apm-server.home.local:8200 ([#101](https://github.com/shin1ohno/edge-agent/pull/101))
+
 ## [0.16.3](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.2...edge-agent-v0.16.3) - 2026-05-01
 
 ### Other
