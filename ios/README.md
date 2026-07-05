@@ -19,8 +19,8 @@ xcodegen --spec weave.project.yml       # → weave.xcodeproj
 ## Phase 1 progress (Universal app)
 
 - [x] Phase 1 — 骨組み (Xcode project + 7 Swift packages + Domain model + FiringHeroCard + TabView)
-- [x] Phase 2 — iOS Onboarding & Settings (this PR — 4-step onboarding flow, Settings inset list, `@AppStorage` persistence)
-- [ ] Phase 3 — iOS Tab roots
+- [x] Phase 2 — iOS Onboarding & Settings (4-step onboarding flow, Settings inset list, `@AppStorage` persistence)
+- [x] Phase 3 — iOS Tab roots (this PR — Home FiringHero + Quick actions + Recent / Devices / Connections / Services lists)
 - [ ] Phase 4 — iOS Detail & sheets
 - [ ] Phase 5 — BLE 実装 (`WeaveBLE` — port from `WeaveIos/Core/`)
 - [ ] Phase 6 — iPadOS NavigationSplitView + Routes editor
