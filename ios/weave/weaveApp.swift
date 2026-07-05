@@ -2,13 +2,24 @@ import SwiftUI
 import FeatureConnections
 import FeatureDevices
 import FeatureHome
+import FeatureOnboarding
 import FeatureServices
+import FeatureSettings
+import WeaveCore
 
 @main
 struct WeaveApp: App {
+    @AppStorage(DefaultsKeys.onboardingCompleted) private var onboardingCompleted: Bool = false
+
     var body: some Scene {
         WindowGroup {
-            RootTabView()
+            if onboardingCompleted {
+                RootTabView()
+            } else {
+                OnboardingFlowView(onComplete: {
+                    onboardingCompleted = true
+                })
+            }
         }
     }
 }
@@ -22,12 +33,23 @@ struct RootTabView: View {
     }
 
     @State private var selection: Tab = .home
+    @State private var showSettings: Bool = false
 
     var body: some View {
         TabView(selection: $selection) {
             NavigationStack {
                 HomeRootView()
                     .navigationTitle("Home")
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                showSettings = true
+                            } label: {
+                                Image(systemName: "gearshape")
+                            }
+                            .accessibilityLabel("Settings")
+                        }
+                    }
             }
             .tabItem {
                 Label("Home", systemImage: "house.fill")
@@ -61,9 +83,16 @@ struct RootTabView: View {
             }
             .tag(Tab.services)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsRootView(onDismiss: { showSettings = false })
+        }
     }
 }
 
-#Preview {
+#Preview("Tab root") {
     RootTabView()
+}
+
+#Preview("Onboarding root") {
+    OnboardingFlowView(onComplete: {})
 }
