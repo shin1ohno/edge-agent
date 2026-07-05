@@ -20,8 +20,8 @@ xcodegen --spec weave.project.yml       # → weave.xcodeproj
 
 - [x] Phase 1 — 骨組み (Xcode project + 7 Swift packages + Domain model + FiringHeroCard + TabView)
 - [x] Phase 2 — iOS Onboarding & Settings (4-step onboarding flow, Settings inset list, `@AppStorage` persistence)
-- [x] Phase 3 — iOS Tab roots (this PR — Home FiringHero + Quick actions + Recent / Devices / Connections / Services lists)
-- [ ] Phase 4 — iOS Detail & sheets
+- [x] Phase 3 — iOS Tab roots (Home FiringHero + Quick actions + Recent / Devices / Connections / Services lists)
+- [x] Phase 4 — iOS Detail & sheets (this PR — Device/Connection/Service detail push, Pair-new-Nuimo sheet 4 phases, empty/error views)
 - [ ] Phase 5 — BLE 実装 (`WeaveBLE` — port from `WeaveIos/Core/`)
 - [ ] Phase 6 — iPadOS NavigationSplitView + Routes editor
 - [ ] Phase 7 — watchOS independent app

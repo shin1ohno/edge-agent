@@ -17,9 +17,7 @@ public struct ConnectionsRootView: View {
         .navigationDestination(for: ConnectionsRoute.self) { route in
             switch route {
             case .mapping(let id):
-                Text("Connection detail (\(id.uuidString.prefix(8))…) — Phase 4")
-                    .foregroundStyle(.secondary)
-                    .navigationTitle("Connection")
+                ConnectionDetailView(mappingId: id)
             }
         }
     }
