@@ -37,6 +37,8 @@ tracing-opentelemetry = "0.28"
 tonic = { version = "0.12", default-features = false }
 uuid = { workspace = true }
 toml = "0.8"
+# Jitter for the reconnect backoffs. Already in the graph via tungstenite.
+rand = "0.8"
 # Feature-gated: roon adapter
 roon-api = { version = "0.5.1", optional = true }
 # Feature-gated: hue adapter

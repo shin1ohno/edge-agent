@@ -523,8 +523,9 @@ async fn run_ws_loop(
     device_control: Arc<StdMutex<Option<Arc<dyn DeviceControlSink>>>>,
     state_tx: broadcast::Sender<StateUpdate>,
 ) {
-    let mut backoff = Duration::from_millis(500);
+    let backoff_base = Duration::from_millis(500);
     let max_backoff = Duration::from_secs(15);
+    let mut backoff_attempt: u32 = 1;
     // Last-write-wins replay cache, keyed by (device_type, device_id, property).
     let mut device_state_cache: HashMap<(String, String, String), serde_json::Value> =
         HashMap::new();
@@ -543,7 +544,7 @@ async fn run_ws_loop(
                     Ok((mut ws, _resp)) => {
                         tracing::info!(url = %url, "ws/edge connected");
                         sink.on_connection_changed(true);
-                        backoff = Duration::from_millis(500);
+                        backoff_attempt = 1;
 
                         // Hello.
                         let hello = EdgeToServer::Hello {
@@ -723,10 +724,16 @@ async fn run_ws_loop(
             }
         }
 
+        // Capped exponential backoff, jittered to [0.5, 1) of the nominal delay.
+        let exp = backoff_base.as_secs_f64()
+            * 2f64.powi(backoff_attempt.saturating_sub(1).min(30) as i32);
+        let delay = Duration::from_secs_f64(
+            exp.min(max_backoff.as_secs_f64()) * (0.5 + 0.5 * rand::random::<f64>()),
+        );
         tokio::select! {
             _ = shutdown_rx.recv() => return,
-            _ = tokio::time::sleep(backoff) => {
-                backoff = (backoff * 2).min(max_backoff);
+            _ = tokio::time::sleep(delay) => {
+                backoff_attempt = backoff_attempt.saturating_add(1);
             }
         }
     }
