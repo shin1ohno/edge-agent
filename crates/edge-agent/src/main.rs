@@ -986,18 +986,27 @@ async fn run_nuimo_event_loop(
     }
 }
 
-/// Retry `device.connect()` with exponential backoff (1s → 30s cap) until
-/// it succeeds. Called when a `NuimoEvent::Disconnected` is observed.
+/// Delay before 1-based retry `attempt`: `min(base * 2^(attempt-1), cap)`
+/// scaled by a random factor in `[0.5, 1)`, so edges that failed together
+/// do not retry in lockstep.
+fn jittered_backoff(base: Duration, cap: Duration, attempt: u32) -> Duration {
+    let exp = base.as_secs_f64() * 2f64.powi(attempt.saturating_sub(1).min(30) as i32);
+    Duration::from_secs_f64(exp.min(cap.as_secs_f64()) * (0.5 + 0.5 * rand::random::<f64>()))
+}
+
+/// Retry `device.connect()` with jittered exponential backoff (1s → 30s cap)
+/// until it succeeds. Called when a `NuimoEvent::Disconnected` is observed.
 ///
 /// The `paused` flag (shared with the WS-driven `DeviceMapControl`) is
 /// checked between every retry: while paused, the loop sleeps and rechecks
 /// rather than firing connect attempts that the user explicitly asked to
 /// suppress. When the flag clears, the next attempt fires immediately.
 async fn reconnect_nuimo(device: &Arc<NuimoDevice>, paused: &Arc<AtomicBool>) {
-    let mut delay = Duration::from_secs(1);
+    let base = Duration::from_secs(1);
     let cap = Duration::from_secs(30);
     let pause_poll = Duration::from_millis(500);
     let mut attempt: u32 = 0;
+    let mut backoff_step: u32 = 1;
     loop {
         if paused.load(Ordering::SeqCst) {
             // Suspend reconnect while paused. Polling keeps the loop alive
@@ -1006,9 +1015,10 @@ async fn reconnect_nuimo(device: &Arc<NuimoDevice>, paused: &Arc<AtomicBool>) {
             // resume so a manual reconnect doesn't inherit a long delay
             // from a previous failed sequence.
             tokio::time::sleep(pause_poll).await;
-            delay = Duration::from_secs(1);
+            backoff_step = 1;
             continue;
         }
+        let delay = jittered_backoff(base, cap, backoff_step);
         tokio::time::sleep(delay).await;
         if paused.load(Ordering::SeqCst) {
             continue;
@@ -1020,8 +1030,8 @@ async fn reconnect_nuimo(device: &Arc<NuimoDevice>, paused: &Arc<AtomicBool>) {
                 return;
             }
             Err(e) => {
-                tracing::warn!(error = %e, attempt, delay_secs = delay.as_secs(), "reconnect failed");
-                delay = (delay * 2).min(cap);
+                tracing::warn!(error = %e, attempt, delay_secs = delay.as_secs_f64(), "reconnect failed");
+                backoff_step = backoff_step.saturating_add(1);
             }
         }
     }
@@ -1077,11 +1087,7 @@ async fn run_hue_bootstrap(
                 return;
             }
             Err(e) => {
-                delay = if delay.is_zero() {
-                    Duration::from_secs(30)
-                } else {
-                    (delay * 2).min(cap)
-                };
+                delay = jittered_backoff(Duration::from_secs(30), cap, attempt);
                 tracing::warn!(
                     error = %e,
                     attempt,
@@ -1251,7 +1257,7 @@ async fn run_hue_tap_dial_loop(
     }
 }
 
-/// Bring up the macOS adapter, retrying indefinitely with exponential
+/// Bring up the macOS adapter, retrying indefinitely with jittered exponential
 /// backoff (start 30s, cap 300s) when the broker is unreachable. On
 /// success, publishes the adapter into the watch channel so the
 /// dispatcher picks it up, and spawns the state pump so macOS updates
@@ -1286,11 +1292,7 @@ async fn run_macos_bootstrap(
                 return;
             }
             Err(e) => {
-                delay = if delay.is_zero() {
-                    Duration::from_secs(30)
-                } else {
-                    (delay * 2).min(cap)
-                };
+                delay = jittered_backoff(Duration::from_secs(30), cap, attempt);
                 tracing::warn!(
                     error = %e,
                     attempt,
@@ -2317,6 +2319,32 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::sync::{broadcast, mpsc, watch};
+
+    #[test]
+    fn jittered_backoff_stays_between_half_and_full_nominal_delay() {
+        for (base, cap) in [
+            (Duration::from_secs(1), Duration::from_secs(30)),
+            (Duration::from_secs(30), Duration::from_secs(300)),
+        ] {
+            for attempt in 1..=20u32 {
+                let nominal = (base * 2u32.pow(attempt - 1)).min(cap);
+                for _ in 0..200 {
+                    let delay = jittered_backoff(base, cap, attempt);
+                    assert!(
+                        delay >= nominal / 2 && delay <= nominal,
+                        "attempt {attempt}: {delay:?} outside [{:?}, {nominal:?}]",
+                        nominal / 2
+                    );
+                    assert!(
+                        delay <= cap,
+                        "attempt {attempt}: {delay:?} exceeds cap {cap:?}"
+                    );
+                }
+            }
+            let delay = jittered_backoff(base, cap, u32::MAX);
+            assert!(delay >= cap / 2 && delay <= cap, "u32::MAX: {delay:?}");
+        }
+    }
 
     fn drain(outbox: &mut mpsc::Receiver<EdgeToServer>) -> Vec<EdgeToServer> {
         let mut out = Vec::new();
