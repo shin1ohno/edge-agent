@@ -1087,11 +1087,7 @@ async fn run_hue_bootstrap(
                 return;
             }
             Err(e) => {
-                delay = if delay.is_zero() {
-                    Duration::from_secs(30)
-                } else {
-                    (delay * 2).min(cap)
-                };
+                delay = jittered_backoff(Duration::from_secs(30), cap, attempt);
                 tracing::warn!(
                     error = %e,
                     attempt,
