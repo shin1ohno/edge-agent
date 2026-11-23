@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.5](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.4...edge-agent-v0.16.5) - 2026-11-23
+
+### Other
+
+- OS root store for Hue TLS + jittered reconnect backoffs ([#106](https://github.com/shin1ohno/edge-agent/pull/106))
+
 ## [0.16.4](https://github.com/shin1ohno/edge-agent/compare/edge-agent-v0.16.3...edge-agent-v0.16.4) - 2026-05-11
 
 ### Other
