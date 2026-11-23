@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.5](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.16.4...weave-ios-core-v0.16.5) - 2026-11-23
+
+### Other
+
+- OS root store for Hue TLS + jittered reconnect backoffs ([#106](https://github.com/shin1ohno/edge-agent/pull/106))
+
 ## [0.16.0](https://github.com/shin1ohno/edge-agent/compare/weave-ios-core-v0.15.0...weave-ios-core-v0.16.0) - 2026-05-01
 
 ### Other
